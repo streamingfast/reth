@@ -1,6 +1,6 @@
 //! Traits for execution.
 
-use crate::{ConfigureEvm, Database, OnStateHook, TxEnvFor};
+use crate::{ConfigureEvm, Database, InspectorFor, OnStateHook, TxEnvFor};
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use alloy_consensus::{BlockHeader, Header};
 use alloy_eips::eip2718::WithEncoded;
@@ -36,6 +36,19 @@ pub trait Executor<DB: Database>: Sized {
         &mut self,
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>;
+
+    /// Executes a single block like [`Self::execute_one`], optionally with tracing.
+    ///
+    /// The default implementation delegates to [`Self::execute_one`]. Implementors can override
+    /// this to inject an inspector without changing call sites — see [`TracingExecutor`] for the
+    /// explicit-inspector variant.
+    fn execute_and_trace_one(
+        &mut self,
+        block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
+    ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
+    {
+        self.execute_one(block)
+    }
 
     /// Executes the EVM with the given input and accepts a state hook closure that is invoked with
     /// the EVM state after execution.
@@ -145,6 +158,30 @@ pub trait Executor<DB: Database>: Sized {
     ///
     /// This is used to optimize DB commits depending on the size of the state.
     fn size_hint(&self) -> usize;
+}
+
+/// Extension of [`Executor`] with inspector-based tracing support.
+///
+/// Implementors provide the [`ConfigureEvm`] type via the [`Self::EvmConfig`] associated type,
+/// which is used to express the correct [`InspectorFor`] bound on the inspector generic.
+///
+/// [`BasicBlockExecutor`] implements this for any `F: ConfigureEvm`, so both Ethereum and
+/// Optimism executors automatically gain tracing support.
+pub trait TracingExecutor<DB: Database>: Executor<DB> {
+    /// The EVM configuration driving this executor.
+    type EvmConfig: ConfigureEvm<Primitives = Self::Primitives>;
+
+    /// Execute a block like [`Executor::execute_one`] but with an active inspector.
+    ///
+    /// The inspector receives callbacks for every EVM step. State changes are merged
+    /// into the bundle so subsequent blocks in a batch see the correct state.
+    fn execute_and_trace_one<I>(
+        &mut self,
+        block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
+        inspector: I,
+    ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
+    where
+        I: for<'a> InspectorFor<Self::EvmConfig, &'a mut State<DB>>;
 }
 
 /// Input for block building. Consumed by [`BlockAssembler`].
@@ -538,6 +575,44 @@ impl<F, DB: Database> BasicBlockExecutor<F, DB> {
     pub fn new(strategy_factory: F, db: DB) -> Self {
         let db = State::builder().with_database(db).with_bundle_update().build();
         Self { strategy_factory, db }
+    }
+}
+
+impl<F, DB> TracingExecutor<DB> for BasicBlockExecutor<F, DB>
+where
+    F: ConfigureEvm,
+    DB: Database,
+{
+    type EvmConfig = F;
+
+    fn execute_and_trace_one<I>(
+        &mut self,
+        block: &RecoveredBlock<<F::Primitives as NodePrimitives>::Block>,
+        inspector: I,
+    ) -> Result<BlockExecutionResult<<F::Primitives as NodePrimitives>::Receipt>, BlockExecutionError>
+    where
+        I: for<'a> InspectorFor<F, &'a mut State<DB>>,
+    {
+        let evm_env =
+            self.strategy_factory.evm_env(block.header()).map_err(BlockExecutionError::other)?;
+        let evm =
+            self.strategy_factory.evm_with_env_and_inspector(&mut self.db, evm_env, inspector);
+        let ctx =
+            self.strategy_factory.context_for_block(block).map_err(BlockExecutionError::other)?;
+
+        let mut executor = self.strategy_factory.create_executor(evm, ctx);
+
+        executor.apply_pre_execution_changes()?;
+
+        for tx in block.transactions_recovered() {
+            executor.execute_transaction(tx)?;
+        }
+
+        let result = executor.apply_post_execution_changes()?;
+
+        self.db.merge_transitions(BundleRetention::Reverts);
+
+        Ok(result)
     }
 }
 
