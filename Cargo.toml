@@ -729,5 +729,5 @@ vergen-git2 = "9.1.0"
 ipnet = "2.11"
 
 # Firehose
-firehose-tracer = { path = "../evm-firehose-tracer-rs/firehose-tracer" }
+firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "main" }
 reth-firehose = { path = "crates/firehose" }

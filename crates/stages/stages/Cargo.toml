@@ -67,6 +67,9 @@ tempfile = { workspace = true, optional = true }
 reqwest.workspace = true
 eyre.workspace = true
 
+# Firehose
+reth-firehose.workspace = true
+
 [dev-dependencies]
 # reth
 reth-chainspec.workspace = true

@@ -1,20 +1,19 @@
-use crate::{inspector, mapper, prelude::*};
+use crate::{inspector, mapper, mapper::SignatureFields as _, prelude::*};
 use alloy_consensus::transaction::TxHashRef as _;
 use alloy_primitives::Bytes;
 use eyre::Context;
+use futures::StreamExt;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_forks::EthereumHardforks;
-use reth_evm::block::TxResult as _;
-use reth_evm::execute::BlockExecutor;
-use reth_exex::ExExContext;
-use reth_provider::{BlockIdReader, StateProviderBox};
-use reth_revm::database::StateProviderDatabase;
-use reth_revm::revm::Database as _;
-use reth_revm::State;
+use reth_evm::{block::TxResult as _, execute::BlockExecutor};
+use reth_exex::{ExExContext, ExExEvent};
+use reth_provider::{BlockIdReader, BlockReader, StateProviderBox, StateProviderFactory};
+use reth_revm::{database::StateProviderDatabase, revm::Database as _, State};
 
 /// Executes EVM transactions in a block one by one, firing tracer hooks at the appropriate times.
 ///
-/// This is a re-implementation for usage within ExEx and compatible with Firehose Geth Live Tracing.
+/// This is a re-implementation for usage within ExEx and compatible with Firehose Geth Live
+/// Tracing.
 pub fn trace_block<Node: FullNodeComponents, F>(
     ctx: &ExExContext<Node>,
     evm_config: &Node::Evm,
@@ -61,7 +60,7 @@ where
     // Inspector borrows tracer mutably for the duration of the block execution.
     // All tracer lifecycle calls (on_tx_start, on_tx_end, etc.) go through
     // executor.evm_mut().inspector_mut().tracer_mut() while the inspector is live.
-    let inspector = inspector::FirehoseInspector::<Node>::new(tracer);
+    let inspector = inspector::FirehoseInspector::new(tracer);
     // The EVM borrows `shared_state` mutably for the duration of this block. Bundle updates
     // from prior blocks in the same ChainCommitted notification are already reflected in its
     // cache via earlier `commit_transaction` calls, so nonce / balance reads here see the
@@ -202,6 +201,62 @@ where
     tracer.on_system_call_end();
 
     tracer.on_block_end(None);
+
+    Ok(())
+}
+
+/// ExEx entry point for Firehose live-block tracing.
+///
+/// Loops over `ChainCommitted` notifications, re-executes each block with `trace_block`, and
+/// signals `FinishedHeight` after each block so the WAL can be pruned.
+pub async fn run_exex<Node>(mut ctx: ExExContext<Node>) -> eyre::Result<()>
+where
+    Node: FullNodeComponents,
+    Node::Provider: BlockReader + StateProviderFactory,
+    ChainSpec<Node>: EthereumHardforks + EthChainSpec,
+    SignedTx<Node>: mapper::SignatureFields,
+{
+    let chain_id = ctx.config.chain.chain().id();
+    crate::tracer().on_blockchain_init(
+        "reth",
+        env!("CARGO_PKG_VERSION"),
+        firehose_tracer::config::ChainConfig::new(chain_id),
+    );
+
+    while let Some(notification) = ctx.notifications.next().await {
+        let notification = notification?;
+
+        if let Some(committed) = notification.committed_chain() {
+            info!(chain = ?committed.range(), "Chain committed, tracing {} blocks", committed.len());
+            let first_block = committed.first();
+            let parent_hash = first_block.parent_hash();
+
+            let state_provider =
+                ctx.provider().state_by_block_hash(parent_hash).wrap_err_with(|| {
+                    format!("Failed to get state provider for parent block {}", parent_hash)
+                })?;
+
+            let mut shared_state = State::builder()
+                .with_database(StateProviderDatabase::new(state_provider))
+                .with_bundle_update()
+                .build();
+
+            let evm_config = ctx.evm_config().clone();
+
+            for (block, receipts) in committed.blocks_and_receipts() {
+                // trace_block(
+                //     &ctx,
+                //     &evm_config,
+                //     block,
+                //     receipts,
+                //     &|tx: &SignedTx<Node>| tx.signature_fields(),
+                //     &mut shared_state,
+                // )?;
+
+                ctx.events.send(ExExEvent::FinishedHeight(block.num_hash()))?;
+            }
+        }
+    }
 
     Ok(())
 }

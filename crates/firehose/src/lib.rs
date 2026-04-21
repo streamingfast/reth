@@ -2,6 +2,8 @@
 //!
 //! This crate contains modules for inspection, mapping, prelude utilities, and running tasks.
 
+/// Executor module with Firehose-aware block executors and EVM configs.
+pub mod executor;
 /// Inspector module for analyzing blockchain data.
 pub mod inspector;
 /// Mapper module for transforming blockchain data.
@@ -11,6 +13,9 @@ pub mod prelude;
 /// Runner module for executing processing tasks.
 pub mod runner;
 
+pub use executor::FirehoseEvmConfig;
+pub use runner::run_exex;
+
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 static GLOBAL_TRACER: OnceLock<Arc<Mutex<firehose_tracer::Tracer>>> = OnceLock::new();
@@ -19,10 +24,7 @@ static GLOBAL_TRACER: OnceLock<Arc<Mutex<firehose_tracer::Tracer>>> = OnceLock::
 ///
 /// Must be called exactly once before any call to [`tracer`]. Panics if called more than once.
 pub fn init_tracer(t: firehose_tracer::Tracer) {
-    GLOBAL_TRACER
-        .set(Arc::new(Mutex::new(t)))
-        .ok()
-        .expect("init_tracer called more than once");
+    GLOBAL_TRACER.set(Arc::new(Mutex::new(t))).ok().expect("init_tracer called more than once");
 }
 
 /// Acquire exclusive access to the process-wide tracer.

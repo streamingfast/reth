@@ -82,8 +82,10 @@ aquamarine.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 
 # Firehose
+alloy-evm.workspace = true
 firehose-tracer.workspace = true
 reth-firehose.workspace = true
+reth-ethereum-forks.workspace = true
 
 [dev-dependencies]
 alloy-node-bindings = "2.0.0"

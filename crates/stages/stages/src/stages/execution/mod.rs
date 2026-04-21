@@ -350,6 +350,8 @@ where
             // Execute the block
             let execute_start = Instant::now();
 
+            info!("Executing block {} within execution stage", block.number());
+
             let result = self.metrics.metered_one(&block, |input| {
                 executor.execute_and_trace_one(input).map_err(|error| StageError::Block {
                     block: Box::new(block.block_with_parent()),

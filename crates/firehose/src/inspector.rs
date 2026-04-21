@@ -3,14 +3,15 @@ use firehose_tracer::{
     pb,
     types::{Opcode, StringError},
 };
-use reth_node_api::FullNodeComponents;
-use reth_revm::revm::context_interface::{ContextTr, JournalTr};
-use reth_revm::revm::inspector::{Inspector, JournalExt};
-use reth_revm::revm::interpreter::{
-    interpreter::EthInterpreter, interpreter_types::Jumps, CallInputs, CallOutcome, CreateInputs,
-    CreateOutcome, Interpreter,
+use reth_revm::revm::{
+    context_interface::{ContextTr, JournalTr},
+    inspector::{Inspector, JournalExt},
+    interpreter::{
+        interpreter::EthInterpreter, interpreter_types::Jumps, CallInputs, CallOutcome,
+        CreateInputs, CreateOutcome, Interpreter,
+    },
+    primitives::KECCAK_EMPTY,
 };
-use reth_revm::revm::primitives::KECCAK_EMPTY;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
@@ -23,11 +24,11 @@ struct StepContext {
 
 /// FirehoseInspector captures execution traces for the Firehose format
 /// It hooks into EVM execution via the Inspector trait to build a complete call tree
-pub struct FirehoseInspector<'a, Node: FullNodeComponents> {
+pub struct FirehoseInspector<'a> {
     tracer: &'a mut firehose_tracer::Tracer,
-    _phantom: std::marker::PhantomData<Node>,
 
-    /// The last opcode executed in `step`, used to detect SSTORE for storage change tracking in `step_end`.
+    /// The last opcode executed in `step`, used to detect SSTORE for storage change tracking in
+    /// `step_end`.
     last_step: Option<StepContext>,
 
     /// Index into the journal up to which balance/nonce/code changes have already been processed.
@@ -55,7 +56,7 @@ pub struct FirehoseInspector<'a, Node: FullNodeComponents> {
     pending_selfdestruct_cleanups: Vec<SelfdestructCleanupEntry>,
 }
 
-impl<'a, Node: FullNodeComponents> Debug for FirehoseInspector<'a, Node> {
+impl<'a> Debug for FirehoseInspector<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FirehoseInspector")
             .field("last_step", &self.last_step.as_ref().map(|s| s.opcode))
@@ -75,12 +76,11 @@ struct SelfdestructCleanupEntry {
     code: Bytes,
 }
 
-impl<'a, Node: FullNodeComponents> FirehoseInspector<'a, Node> {
+impl<'a> FirehoseInspector<'a> {
     /// Create a new FirehoseInspector with a mutable reference to the tracer.
     pub fn new(tracer: &'a mut firehose_tracer::Tracer) -> Self {
         Self {
             tracer,
-            _phantom: std::marker::PhantomData,
             last_step: None,
             journal_processed_up_to: 0,
             balance_tracker: HashMap::new(),
@@ -163,7 +163,8 @@ impl<'a, Node: FullNodeComponents> FirehoseInspector<'a, Node> {
             return;
         }
 
-        // Collect the entries we need to process (clone to avoid borrow conflicts when reading state)
+        // Collect the entries we need to process (clone to avoid borrow conflicts when reading
+        // state)
         let entries: Vec<_> = context.journal().journal()
             [self.journal_processed_up_to..journal_len]
             .iter()
@@ -236,7 +237,8 @@ impl<'a, Node: FullNodeComponents> FirehoseInspector<'a, Node> {
                             .as_ref()
                             .map(|b| b.original_bytes())
                             .unwrap_or_default();
-                        // CodeChange is always from empty code to new code (revert restores to KECCAK_EMPTY)
+                        // CodeChange is always from empty code to new code (revert restores to
+                        // KECCAK_EMPTY)
                         self.tracer.on_code_change(
                             address,
                             KECCAK_EMPTY,
@@ -388,8 +390,10 @@ impl<'a, Node: FullNodeComponents> FirehoseInspector<'a, Node> {
         CTX: ContextTr,
         CTX::Journal: JournalExt,
     {
-        use reth_revm::revm::context_interface::{transaction::AuthorizationTr, Cfg, Transaction};
-        use reth_revm::revm::Database as _;
+        use reth_revm::revm::{
+            context_interface::{transaction::AuthorizationTr, Cfg, Transaction},
+            Database as _,
+        };
 
         if context.tx().authorization_list_len() == 0 {
             return;
@@ -467,8 +471,8 @@ impl<'a, Node: FullNodeComponents> FirehoseInspector<'a, Node> {
                 auth_tracker.get_mut(&authority).unwrap();
 
             // 4. Code must be empty or an EIP-7702 delegation designator.
-            let code_eligible = *tracked_code_hash == KECCAK_EMPTY
-                || (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
+            let code_eligible = *tracked_code_hash == KECCAK_EMPTY ||
+                (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
             if !code_eligible {
                 continue;
             }
@@ -654,17 +658,17 @@ impl<'a, Node: FullNodeComponents> FirehoseInspector<'a, Node> {
             InstructionResult::Revert => "execution reverted".to_string(),
             InstructionResult::CallTooDeep => "max call depth exceeded".to_string(),
             InstructionResult::OutOfFunds => "insufficient balance for transfer".to_string(),
-            InstructionResult::CreateInitCodeStartingEF00
-            | InstructionResult::InvalidEOFInitCode
-            | InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
+            InstructionResult::CreateInitCodeStartingEF00 |
+            InstructionResult::InvalidEOFInitCode |
+            InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
 
             // Out-of-gas variants — Geth distinguishes CREATE vs CALL context
-            InstructionResult::OutOfGas
-            | InstructionResult::MemoryOOG
-            | InstructionResult::MemoryLimitOOG
-            | InstructionResult::PrecompileOOG
-            | InstructionResult::InvalidOperandOOG
-            | InstructionResult::ReentrancySentryOOG => {
+            InstructionResult::OutOfGas |
+            InstructionResult::MemoryOOG |
+            InstructionResult::MemoryLimitOOG |
+            InstructionResult::PrecompileOOG |
+            InstructionResult::InvalidOperandOOG |
+            InstructionResult::ReentrancySentryOOG => {
                 if is_create {
                     "contract creation code storage out of gas".to_string()
                 } else {
@@ -677,8 +681,8 @@ impl<'a, Node: FullNodeComponents> FirehoseInspector<'a, Node> {
             InstructionResult::InvalidJump => "invalid jump destination".to_string(),
             InstructionResult::StackOverflow => "stack limit reached 1024 (1023)".to_string(),
             InstructionResult::StackUnderflow => "stack underflow".to_string(),
-            InstructionResult::CallNotAllowedInsideStatic
-            | InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
+            InstructionResult::CallNotAllowedInsideStatic |
+            InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
             InstructionResult::CreateCollision => "contract address collision".to_string(),
             InstructionResult::CreateContractSizeLimit => "max code size exceeded".to_string(),
             InstructionResult::CreateContractStartingWithEF => {
@@ -712,8 +716,7 @@ fn humanize_instruction_result(result: reth_revm::revm::interpreter::Instruction
     words
 }
 
-impl<'a, Node: FullNodeComponents, CTX> Inspector<CTX, EthInterpreter>
-    for FirehoseInspector<'a, Node>
+impl<'a, CTX> Inspector<CTX, EthInterpreter> for FirehoseInspector<'a>
 where
     CTX: ContextTr,
     CTX::Journal: JournalExt,
@@ -1033,8 +1036,9 @@ where
 
         log_journal("create_exit", context);
 
-        // Scan journal entries accumulated during this create's execution (including code deployment)
-        // BEFORE popping the call, so changes are attributed to the CREATE call.
+        // Scan journal entries accumulated during this create's execution (including code
+        // deployment) BEFORE popping the call, so changes are attributed to the CREATE
+        // call.
         self.process_journal_changes(context);
 
         // Clear pending flag: if the CREATE failed before executing any opcode (e.g.
@@ -1052,10 +1056,10 @@ where
         // - CreateCollision / OverflowPayment: create_account_checkpoint itself failed
         let skip_created_nonce = matches!(
             outcome.result.result,
-            InstructionResult::CallTooDeep
-                | InstructionResult::OutOfFunds
-                | InstructionResult::CreateCollision
-                | InstructionResult::OverflowPayment
+            InstructionResult::CallTooDeep |
+                InstructionResult::OutOfFunds |
+                InstructionResult::CreateCollision |
+                InstructionResult::OverflowPayment
         );
         if !skip_created_nonce {
             if let Some(address) = outcome.address {

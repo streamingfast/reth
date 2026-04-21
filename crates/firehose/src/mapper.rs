@@ -9,13 +9,13 @@ use alloy_consensus::{
     BlockHeader as ConsensusBlockHeader, EthereumTxEnvelope,
 };
 use alloy_genesis::Genesis;
-use alloy_primitives::{Address, Bytes, Sealable, U256};
+use alloy_primitives::{Address, Bytes, Sealable, B256, U256};
 use alloy_rlp::Encodable;
 use firehose_tracer::types::{
     AccessTuple, BlockData, GenesisAlloc, SetCodeAuthorization, TxEvent, UncleData, WithdrawalData,
 };
 use reth_node_api::FullNodeComponents;
-use reth_primitives_traits::BlockBody;
+use reth_primitives_traits::{Block as BlockTrait, BlockBody, NodePrimitives};
 use reth_provider::{AccountReader, ProviderResult};
 
 pub(crate) fn to_genesis_alloc(genesis: &Genesis) -> GenesisAlloc {
@@ -77,6 +77,109 @@ pub(crate) fn to_block_data<Node: FullNodeComponents>(block: &RecoveredBlock<Nod
         // EIP-7843: Amsterdam slot number — not yet exposed by reth Header trait
         slot_number: None,
     }
+}
+
+/// Returns block data from a `RecoveredBlock<B>` where `B` satisfies the
+/// `reth_primitives_traits::Block` trait bounds. This is the non-`Node`-specific version used in
+/// `FirehoseBlockExecutor`.
+pub(crate) fn to_block_data_generic<B>(
+    block: &reth_primitives_traits::RecoveredBlock<B>,
+) -> BlockData
+where
+    B: BlockTrait,
+    B::Header: ConsensusBlockHeader + Sealable,
+    B::Body: BlockBody,
+    <<B as BlockTrait>::Body as BlockBody>::OmmerHeader: ConsensusBlockHeader + Sealable,
+{
+    let header = block.header();
+
+    BlockData {
+        number: header.number(),
+        hash: block.hash(),
+        parent_hash: header.parent_hash(),
+        uncle_hash: header.ommers_hash(),
+        coinbase: header.beneficiary(),
+        root: header.state_root(),
+        tx_hash: header.transactions_root(),
+        receipt_hash: header.receipts_root(),
+        bloom: header.logs_bloom(),
+        difficulty: header.difficulty(),
+        gas_limit: header.gas_limit(),
+        gas_used: header.gas_used(),
+        time: header.timestamp(),
+        extra: header.extra_data().clone(),
+        mix_digest: header.mix_hash().unwrap_or_default(),
+        nonce: header.nonce().map(|n| u64::from_be_bytes(n.into())).unwrap_or_default(),
+        base_fee: header.base_fee_per_gas().map(U256::from),
+        size: block.sealed_block().length() as u64,
+        uncles: map_uncles_generic(block),
+        withdrawals: map_withdrawals_generic(block),
+        withdrawals_root: header.withdrawals_root(),
+        blob_gas_used: header.blob_gas_used(),
+        excess_blob_gas: header.excess_blob_gas(),
+        parent_beacon_root: header.parent_beacon_block_root(),
+        requests_hash: header.requests_hash(),
+        tx_dependency: None,
+        slot_number: None,
+    }
+}
+
+/// Convenience wrapper: produces [`BlockData`] for any `NodePrimitives`-based block
+/// (the typical use-case for the execution-stage executor).
+pub(crate) fn to_block_data_eth<P>(
+    block: &reth_primitives_traits::RecoveredBlock<<P as NodePrimitives>::Block>,
+) -> BlockData
+where
+    P: NodePrimitives,
+    P::Block: BlockTrait,
+    <P::Block as BlockTrait>::Header: ConsensusBlockHeader + Sealable,
+    <P::Block as BlockTrait>::Body: BlockBody,
+    <<P::Block as BlockTrait>::Body as BlockBody>::OmmerHeader: ConsensusBlockHeader + Sealable,
+{
+    to_block_data_generic(block)
+}
+
+fn map_uncles_generic<B>(block: &reth_primitives_traits::RecoveredBlock<B>) -> Vec<UncleData>
+where
+    B: BlockTrait,
+    B::Body: BlockBody,
+    <<B as BlockTrait>::Body as BlockBody>::OmmerHeader: ConsensusBlockHeader + Sealable,
+{
+    let Some(ommers) = block.body().ommers() else {
+        return Vec::new();
+    };
+    ommers.iter().map(to_uncle_data).collect()
+}
+
+fn map_withdrawals_generic<B>(
+    block: &reth_primitives_traits::RecoveredBlock<B>,
+) -> Vec<WithdrawalData>
+where
+    B: BlockTrait,
+    B::Body: BlockBody,
+{
+    block
+        .body()
+        .withdrawals()
+        .map(|ws| ws.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|w| WithdrawalData {
+            index: w.index,
+            validator_index: w.validator_index,
+            address: w.address,
+            amount: w.amount,
+        })
+        .collect()
+}
+
+/// Returns zero-value (r, s, v) signature fields.
+///
+/// Used by `FirehoseBlockExecutor::execute_and_trace_one` which does not have access to the
+/// raw-encoded transaction bytes needed to recover the true signature.  The ExEx runner path
+/// (`runner::trace_block`) uses the real signature instead.
+pub(crate) fn zero_signature() -> (B256, B256, Bytes) {
+    (B256::ZERO, B256::ZERO, Bytes::new())
 }
 
 pub(crate) fn to_finalized_ref(

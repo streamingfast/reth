@@ -29,20 +29,24 @@ firehose-tracer.workspace = true
 reth-chainspec.workspace = true
 reth-ethereum-forks.workspace = true
 reth-evm.workspace = true
+reth-execution-types.workspace = true
 reth-exex.workspace = true
+reth-node-api.workspace = true
+reth-ethereum-primitives.workspace = true
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
 reth-revm.workspace = true
-reth-node-api.workspace = true
 reth-tracing.workspace = true
 
 # alloy
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
+alloy-evm.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 
 # std
 eyre.workspace = true
+futures.workspace = true
 rayon = { workspace = true, optional = true }
