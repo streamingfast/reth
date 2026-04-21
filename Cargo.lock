@@ -338,9 +338,8 @@ dependencies = [
 
 [[package]]
 name = "alloy-evm"
-version = "0.33.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd3e12b99b0c8f7298ffd3604c58310cba310203c5f6cd5e024f3b2bd9c3b09c"
+version = "0.33.0"
+source = "git+https://github.com/streamingfast/evm.git?branch=sf%2Fv0.33.0#04d63ee59a9a1c8566838a8d7c9a23866dc70e2f"
 dependencies = [
  "alloy-consensus 2.0.0",
  "alloy-eips 2.0.0",
@@ -8295,6 +8294,7 @@ dependencies = [
  "reth-execution-cache",
  "reth-execution-types",
  "reth-exex-types",
+ "reth-firehose",
  "reth-metrics",
  "reth-network-p2p",
  "reth-node-ethereum",
@@ -9213,6 +9213,7 @@ dependencies = [
  "reth-evm",
  "reth-evm-ethereum",
  "reth-exex",
+ "reth-firehose",
  "reth-fs-util",
  "reth-invalid-block-hooks",
  "reth-network",

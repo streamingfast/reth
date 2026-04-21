@@ -2,10 +2,10 @@
 
 use std::fmt::Debug;
 
-use crate::{inspector::FirehoseInspector, mapper};
-use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction};
+use crate::{inspector::FirehoseInspector, mapper, mapper::SignatureFields};
+use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction, TxReceipt};
 use alloy_evm::block::BlockExecutor as _;
-use alloy_primitives::{Sealable, U256};
+use alloy_primitives::{Log, Sealable, U256};
 use reth_evm::{
     execute::{BlockExecutionError, Executor},
     ConfigureEvm, Evm as _, OnStateHook,
@@ -116,7 +116,7 @@ where
 /// `on_block_start` / `on_genesis_block`, per-tx `on_tx_start` / `on_tx_end`,
 /// and `on_block_end`. Mirrors the pattern in `runner::trace_block` but operates
 /// on an arbitrary `DB` without requiring an `ExExContext`.
-fn trace_block_with_inspector<F, DB>(
+pub fn trace_block_with_inspector<F, DB>(
     evm_config: &F,
     db: &mut State<DB>,
     block: &RecoveredBlock<<F::Primitives as NodePrimitives>::Block>,
@@ -244,6 +244,135 @@ where
 
     db.merge_transitions(BundleRetention::Reverts);
     Ok(result)
+}
+
+/// Like [`trace_block_with_inspector`] but also accepts the receipts produced by the first
+/// (validation) execution so that `on_tx_end` receives accurate gas-used, log, and status
+/// data.  Additionally uses actual transaction signatures via [`SignatureFields`].
+///
+/// This is the entry-point for **live-block** tracing from the engine payload validator,
+/// where both the `RecoveredBlock` (with real signatures) and the execution receipts are
+/// already available from the preceding validation pass.
+pub fn trace_live_block<F, DB, R>(
+    evm_config: &F,
+    db: &mut State<DB>,
+    block: &RecoveredBlock<<F::Primitives as NodePrimitives>::Block>,
+    receipts: &[R],
+) -> Result<(), BlockExecutionError>
+where
+    F: ConfigureEvm,
+    DB: reth_evm::Database,
+    BlockTy<F::Primitives>: BlockTrait,
+    <BlockTy<F::Primitives> as BlockTrait>::Header: BlockHeader + Sealable,
+    <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,
+    <<BlockTy<F::Primitives> as BlockTrait>::Body as BlockBody>::OmmerHeader:
+        BlockHeader + Sealable,
+    TxTy<F::Primitives>: Transaction + TxHashRef + SignatureFields,
+    R: TxReceipt<Log = Log>,
+{
+    let tracer = &mut *crate::tracer();
+
+    if block.number() == 1 {
+        tracer.on_genesis_block(
+            firehose_tracer::types::BlockEvent {
+                block: mapper::to_block_data_eth::<F::Primitives>(block),
+                finalized: None,
+                flash_block: None,
+            },
+            Default::default(),
+        );
+        return Ok(());
+    }
+
+    tracer.on_block_start(firehose_tracer::types::BlockEvent {
+        block: mapper::to_block_data_eth::<F::Primitives>(block),
+        finalized: None,
+        flash_block: None,
+    });
+
+    let evm_env = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?;
+    let exec_ctx =
+        evm_config.context_for_block(block.sealed_block()).map_err(BlockExecutionError::other)?;
+
+    let inspector = FirehoseInspector::new(tracer);
+    let evm = evm_config.evm_with_env_and_inspector(&mut *db, evm_env, inspector);
+    let mut executor = evm_config.create_executor(evm, exec_ctx);
+
+    executor.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
+    executor.apply_pre_execution_changes().map_err(BlockExecutionError::from)?;
+    executor.evm_mut().inspector_mut().tracer_mut().on_system_call_end();
+
+    let mut prev_cumulative_gas: u64 = 0;
+    let mut log_index: u32 = 0;
+
+    for (tx_index, (recovered_tx, receipt)) in
+        block.transactions_recovered().zip(receipts.iter()).enumerate()
+    {
+        let tx: &TxTy<F::Primitives> = &**recovered_tx;
+        let (r, s, v) = tx.signature_fields();
+        let tx_event = mapper::signed_tx_to_tx_event(tx, recovered_tx.signer(), tx_index, r, s, v);
+        executor.evm_mut().inspector_mut().tracer_mut().on_tx_start(tx_event, None);
+
+        let tx_result = executor.execute_transaction_without_commit(recovered_tx).map_err(|e| {
+            BlockExecutionError::msg(format!("transaction execution failed: {e:?}"))
+        })?;
+
+        {
+            let result_gas_used = {
+                use reth_evm::block::TxResult as _;
+                tx_result.result().result.tx_gas_used()
+            };
+            let sender = recovered_tx.signer();
+            let coinbase = block.header().beneficiary();
+            let gas_limit = tx.gas_limit();
+            let base_fee = block.header().base_fee_per_gas().unwrap_or(0);
+            let effective_gas_price: u128 = if tx.is_dynamic_fee() {
+                std::cmp::min(
+                    tx.max_fee_per_gas(),
+                    base_fee as u128 + tx.max_priority_fee_per_gas().unwrap_or(0),
+                )
+            } else {
+                tx.gas_price().unwrap_or(0)
+            };
+
+            let (evm_db, inspector, _) = executor.evm_mut().components_mut();
+            inspector.process_post_tx_balance_changes(
+                sender,
+                coinbase,
+                gas_limit,
+                result_gas_used,
+                effective_gas_price,
+                base_fee,
+                |addr| {
+                    evm_db.basic(addr).ok().flatten().map(|info| info.balance).unwrap_or(U256::ZERO)
+                },
+            );
+        }
+
+        executor
+            .commit_transaction(tx_result)
+            .map_err(|e| BlockExecutionError::msg(format!("transaction commit failed: {e:?}")))?;
+
+        let cumulative_gas = receipt.cumulative_gas_used();
+        let gas_used = cumulative_gas - prev_cumulative_gas;
+        let log_count = receipt.logs().len() as u32;
+        let receipt_data =
+            mapper::to_receipt_data(receipt, tx_index as u32, gas_used, log_index);
+        prev_cumulative_gas = cumulative_gas;
+        log_index += log_count;
+
+        executor.evm_mut().inspector_mut().tracer_mut().on_tx_end(Some(&receipt_data), None);
+    }
+
+    executor.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
+
+    executor.apply_post_execution_changes().map_err(BlockExecutionError::from)?;
+
+    tracer.on_system_call_end();
+    tracer.on_block_end(None);
+
+    db.merge_transitions(BundleRetention::Reverts);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

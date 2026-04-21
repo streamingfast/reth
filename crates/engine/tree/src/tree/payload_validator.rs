@@ -74,7 +74,7 @@ use reth_payload_primitives::{
 };
 use reth_primitives_traits::{
     AlloyBlockHeader, BlockBody, BlockTy, FastInstant as Instant, GotExpected, NodePrimitives,
-    RecoveredBlock, SealedBlock, SealedHeader, SignerRecoverable,
+    RecoveredBlock, SealedBlock, SealedHeader, SignerRecoverable, TxTy,
 };
 use reth_provider::{
     providers::OverlayStateProviderFactory, BlockExecutionOutput, BlockNumReader, BlockReader,
@@ -390,6 +390,7 @@ where
     where
         V: PayloadValidator<T, Block = N::Block> + Clone,
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
+        TxTy<N>: reth_firehose::mapper::SignatureFields,
     {
         // Spawn payload conversion on a background thread so it runs concurrently with the
         // rest of the function (setup + execution). For payloads this overlaps the cost of
@@ -612,6 +613,39 @@ where
             })
         });
         let block = block.with_senders(senders);
+
+        // Firehose: re-execute the block with FirehoseInspector for live block tracing.
+        // This is a second execution purely for tracing; the first execution above handles
+        // validation. The runtime check ensures zero overhead when Firehose is not active.
+        if reth_firehose::is_tracer_initialized() {
+            match self.provider.state_by_block_hash(parent_block.hash()) {
+                Ok(state_provider) => {
+                    let mut db = reth_revm::db::State::builder()
+                        .with_database(StateProviderDatabase::new(state_provider))
+                        .with_bundle_update()
+                        .build();
+                    if let Err(err) = reth_firehose::executor::trace_live_block(
+                        &self.evm_config,
+                        &mut db,
+                        &block,
+                        &output.result.receipts,
+                    ) {
+                        warn!(
+                            target: "engine::tree::payload_validator",
+                            %err,
+                            "Firehose live block tracing failed"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        target: "engine::tree::payload_validator",
+                        %err,
+                        "Failed to get parent state for Firehose live block tracing"
+                    );
+                }
+            }
+        }
 
         // Wait for the receipt root computation to complete.
         let receipt_root_bloom = {
@@ -1975,6 +2009,7 @@ where
     V: PayloadValidator<Types, Block = N::Block> + Clone,
     Evm: ConfigureEngineEvm<Types::ExecutionData, Primitives = N> + 'static,
     Types: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
+    TxTy<N>: reth_firehose::mapper::SignatureFields,
 {
     fn validate_payload_attributes_against_header(
         &self,

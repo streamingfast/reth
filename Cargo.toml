@@ -731,3 +731,9 @@ ipnet = "2.11"
 # Firehose
 firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "main" }
 reth-firehose = { path = "crates/firehose" }
+
+[patch.crates-io]
+# Patch alloy-evm to route system calls (EIP-4788, EIP-2935, etc.) through the
+# Inspector when inspect mode is enabled, matching what transact_raw already does.
+# See https://github.com/alloy-rs/evm/pull/323 for the upstream PR.
+alloy-evm = { git = "https://github.com/streamingfast/evm.git", branch = "sf/v0.33.0" }

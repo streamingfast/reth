@@ -32,26 +32,30 @@ Reth is a high-performance Ethereum execution client written in Rust, focusing o
 ### Code Style and Standards
 
 1. **Formatting**: Always use nightly rustfmt
-   ```bash
-   cargo +nightly fmt --all
-   ```
+
+    ```bash
+    cargo +nightly fmt --all
+    ```
 
 2. **Linting**: Run clippy with all features
-   ```bash
-   cargo +nightly clippy --workspace --lib --examples --tests --benches --all-features 
-   ```
+
+    ```bash
+    cargo +nightly clippy --workspace --lib --examples --tests --benches --all-features
+    ```
 
 3. **Testing**: Use nextest for faster test execution
-   ```bash
-   cargo nextest run --workspace
-   ```
+    ```bash
+    cargo nextest run --workspace
+    ```
 
 ### Common Contribution Types
 
 Based on actual recent PRs, here are typical contribution patterns:
 
 #### 1. Small Bug Fixes (1-10 lines)
+
 Real example: Fixing beacon block root handling ([#16767](https://github.com/paradigmxyz/reth/pull/16767))
+
 ```rust
 // Changed a single line to fix logic error
 - parent_beacon_block_root: parent.parent_beacon_block_root(),
@@ -59,7 +63,9 @@ Real example: Fixing beacon block root handling ([#16767](https://github.com/par
 ```
 
 #### 2. Integration with Upstream Changes
+
 Real example: Integrating revm updates ([#16752](https://github.com/paradigmxyz/reth/pull/16752))
+
 ```rust
 // Update code to use new APIs from dependencies
 - if self.fork_tracker.is_shanghai_activated() {
@@ -69,7 +75,9 @@ Real example: Integrating revm updates ([#16752](https://github.com/paradigmxyz/
 ```
 
 #### 3. Adding Comprehensive Tests
+
 Real example: ETH69 protocol tests ([#16759](https://github.com/paradigmxyz/reth/pull/16759))
+
 ```rust
 #[tokio::test(flavor = "multi_thread")]
 async fn test_eth69_peers_can_connect() {
@@ -80,7 +88,9 @@ async fn test_eth69_peers_can_connect() {
 ```
 
 #### 4. Making Components Generic
+
 Real example: Making EthEvmConfig generic over chainspec ([#16758](https://github.com/paradigmxyz/reth/pull/16758))
+
 ```rust
 // Before: Hardcoded to ChainSpec
 - pub struct EthEvmConfig<EvmFactory = EthEvmFactory> {
@@ -95,7 +105,9 @@ Real example: Making EthEvmConfig generic over chainspec ([#16758](https://githu
 ```
 
 #### 5. Resource Management Improvements
+
 Real example: ETL directory cleanup ([#16770](https://github.com/paradigmxyz/reth/pull/16770))
+
 ```rust
 // Add cleanup logic on startup
 + if let Err(err) = fs::remove_dir_all(&etl_path) {
@@ -104,7 +116,9 @@ Real example: ETL directory cleanup ([#16770](https://github.com/paradigmxyz/ret
 ```
 
 #### 6. Feature Additions
+
 Real example: Sharded mempool support ([#16756](https://github.com/paradigmxyz/reth/pull/16756))
+
 ```rust
 // Add new filtering policies for transaction announcements
 pub struct ShardedMempoolAnnouncementFilter<T> {
@@ -123,19 +137,20 @@ pub struct ShardedMempoolAnnouncementFilter<T> {
 5. **Property Tests**: For checking component correctness on a wide variety of inputs
 
 Example test structure:
+
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_component_behavior() {
         // Arrange
         let component = Component::new();
-        
+
         // Act
         let result = component.operation();
-        
+
         // Assert
         assert_eq!(result, expected);
     }
@@ -204,6 +219,7 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) with an optiona
 **Scope** (optional): crate or area, e.g. `evm`, `trie`, `rpc`, `engine`, `net`
 
 Examples:
+
 - `fix(rpc): correct gas estimation for ERC-20 transfers`
 - `perf: batch trie updates to reduce cursor overhead`
 - `feat(engine): add new_payload_interval metric`
@@ -213,12 +229,14 @@ Examples:
 Keep it short. Say what changed and why — nothing more.
 
 **Do:**
+
 - Write 1–3 sentences summarizing the change
 - Explain _why_ if the diff doesn't make it obvious
 - Link related issues or EIPs
 - Include benchmark numbers for perf changes
 
 **Don't:**
+
 - List every file changed — that's what the diff is for
 - Repeat the title in the body
 - Add "Files changed" or "Changes" sections
@@ -264,24 +282,27 @@ This PR introduces comprehensive improvements to the IP resolution system.
 #### Labels and CI
 
 Label PRs appropriately, first check the available labels and then apply the relevant ones:
-* when changes are RPC related, add A-rpc label
-* when changes are docs related, add C-docs label
-* ... and so on, check the available labels for more options.
-* if being tasked to open a pr, ensure that all changes are properly formatted: `cargo +nightly fmt --all`
+
+- when changes are RPC related, add A-rpc label
+- when changes are docs related, add C-docs label
+- ... and so on, check the available labels for more options.
+- if being tasked to open a pr, ensure that all changes are properly formatted: `cargo +nightly fmt --all`
 
 If changes in reth include changes to dependencies, run commands `zepter` and `make lint-toml` before finalizing the pr. Assume `zepter` binary is installed.
 
 ### Debugging Tips
 
 1. **Logging**: Use `tracing` crate with appropriate levels
-   ```rust
-   tracing::debug!(target: "reth::component", ?value, "description");
-   ```
+
+    ```rust
+    tracing::debug!(target: "reth::component", ?value, "description");
+    ```
 
 2. **Metrics**: Add metrics for monitoring
-   ```rust
-   metrics::counter!("reth_component_operations").increment(1);
-   ```
+
+    ```rust
+    metrics::counter!("reth_component_operations").increment(1);
+    ```
 
 3. **Test Isolation**: Use separate test databases/directories
 
@@ -296,27 +317,35 @@ If changes in reth include changes to dependencies, run commands `zepter` and `m
 ### Common PR Patterns
 
 #### Small, Focused Changes
+
 Most PRs change only 1-5 files. Examples:
+
 - Single-line bug fixes
 - Adding a missing trait implementation
 - Updating error messages
 - Adding test cases for edge conditions
 
 #### Integration Work
+
 When dependencies update (especially revm), code needs updating:
+
 - Check for breaking API changes
 - Update to use new features (like EIP implementations)
 - Ensure compatibility with new versions
 
 #### Test Improvements
+
 Tests often need expansion for:
+
 - New protocol versions (ETH68, ETH69)
 - Edge cases in state transitions
 - Network behavior under specific conditions
 - Concurrent operations
 
 #### Making Code More Generic
+
 Common refactoring pattern:
+
 - Replace concrete types with generics
 - Add trait bounds for flexibility
 - Enable reuse across different chain types
@@ -328,6 +357,7 @@ Write comments that remain valuable after the PR is merged. Future readers won't
 ##### ✅ DO: Add Value
 
 **Explain WHY and non-obvious behavior:**
+
 ```rust
 // Process must handle allocations atomically to prevent race conditions
 // between dealloc on drop and concurrent limit checks
@@ -341,15 +371,17 @@ const TRACER_TIMEOUT: Duration = Duration::from_secs(5);
 ```
 
 **Document constraints and assumptions:**
+
 ```rust
 /// Returns heap size estimate.
-/// 
+///
 /// Note: May undercount shared references (Rc/Arc). For precise
 /// accounting, combine with an allocator-based approach.
 fn deep_size_of(&self) -> usize
 ```
 
 **Explain complex logic:**
+
 ```rust
 // We reset limits at task start because tokio reuses threads in
 // spawn_blocking pool. Without reset, second task inherits first
@@ -358,6 +390,7 @@ THREAD_ALLOCATED.with(|allocated| allocated.set(0));
 ```
 
 ##### ❌ DON'T: Describe Changes
+
 ```rust
 // ❌ BAD - Describes the change, not the code
 // Changed from Vec to HashMap for O(1) lookups
@@ -365,6 +398,7 @@ THREAD_ALLOCATED.with(|allocated| allocated.set(0));
 // ✅ GOOD - Explains the decision
 // HashMap provides O(1) symbol lookups during trace replay
 ```
+
 ```rust
 // ❌ BAD - PR-specific context
 // Fix for issue #234 where memory wasn't freed
@@ -373,6 +407,7 @@ THREAD_ALLOCATED.with(|allocated| allocated.set(0));
 // Explicitly drop allocations before limit check to ensure
 // accurate accounting
 ```
+
 ```rust
 // ❌ BAD - States the obvious
 // Increment counter
@@ -384,6 +419,7 @@ GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst);
 ```
 
 ✅ **Comment when:**
+
 - Non-obvious behavior or edge cases
 - Performance trade-offs
 - Safety requirements (unsafe blocks must always be documented)
@@ -391,6 +427,7 @@ GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst);
 - Why simpler alternatives don't work
 
 ❌ **Don't comment when:**
+
 - Code is self-explanatory
 - Just restating the code in English
 - Describing what changed in this PR
@@ -398,7 +435,6 @@ GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst);
 ##### The Test: "Will this make sense in 6 months?"
 
 Before adding a comment, ask: Would someone reading just the current code (no PR, no history) find this helpful?
-
 
 #### Rust Style Guides
 
@@ -443,7 +479,7 @@ use ...;
 // ❌ BAD - new auxiliary struct added before the file's main type
 pub struct CacheWaitDurations { ... }
 
-// ❌ BAD - new trait added before the file's main type  
+// ❌ BAD - new trait added before the file's main type
 pub trait WaitForCaches { ... }
 
 // The file's primary type is buried below unrelated additions
@@ -473,50 +509,56 @@ impl WaitForCaches for PayloadProcessor { ... }
 Let's say you want to fix a bug where external IP resolution fails on startup:
 
 1. **Create a branch**:
-   ```bash
-   git checkout -b fix-external-ip-resolution
-   ```
+
+    ```bash
+    git checkout -b fix-external-ip-resolution
+    ```
 
 2. **Find the relevant code**:
-   ```bash
-   # Search for IP resolution code
-   rg "external.*ip" --type rust
-   ```
+
+    ```bash
+    # Search for IP resolution code
+    rg "external.*ip" --type rust
+    ```
 
 3. **Reason about the problem, when the problem is identified, make the fix**:
-   ```rust
-   // In crates/net/discv4/src/lib.rs
-   pub fn resolve_external_ip() -> Option<IpAddr> {
-       // Add fallback mechanism
-       nat::external_ip()
-           .or_else(|| nat::external_ip_from_stun())
-           .or_else(|| Some(DEFAULT_IP))
-   }
-   ```
+
+    ```rust
+    // In crates/net/discv4/src/lib.rs
+    pub fn resolve_external_ip() -> Option<IpAddr> {
+        // Add fallback mechanism
+        nat::external_ip()
+            .or_else(|| nat::external_ip_from_stun())
+            .or_else(|| Some(DEFAULT_IP))
+    }
+    ```
 
 4. **Add a test**:
-   ```rust
-   #[test]
-   fn test_external_ip_fallback() {
-       // Test that resolution has proper fallbacks
-   }
-   ```
+
+    ```rust
+    #[test]
+    fn test_external_ip_fallback() {
+        // Test that resolution has proper fallbacks
+    }
+    ```
 
 5. **Run checks** (IMPORTANT!):
-   ```bash
-   cargo +nightly fmt --all
-   cargo clippy --workspace --all-features # Make sure WHOLE WORKSPACE compiles!
-   cargo nextest run -p reth-discv4
-   ```
+
+    ```bash
+    cargo +nightly fmt --all
+    cargo clippy --workspace --all-features # Make sure WHOLE WORKSPACE compiles!
+    cargo nextest run -p reth-discv4
+    ```
 
 6. **Commit with clear message**:
-   ```bash
-   git commit -m "fix: add fallback for external IP resolution
 
-   Previously, node startup could fail if external IP resolution
-   failed. This adds fallback mechanisms to ensure the node can
-   always start with a reasonable default."
-   ```
+    ```bash
+    git commit -m "fix: add fallback for external IP resolution
+
+    Previously, node startup could fail if external IP resolution
+    failed. This adds fallback mechanisms to ensure the node can
+    always start with a reasonable default."
+    ```
 
 ## Quick Reference
 
@@ -547,3 +589,113 @@ cargo docs --document-private-items
 # Regenerate CLI reference docs (after CLI changes)
 make update-book-cli
 ```
+
+## Firehose
+
+We maintain a fork of Reth with some additional tracing so that blocks are traced using StreamingFast Firehose Ethereum block model and tracing.
+
+### Debug vs Release builds
+
+As an agent, always compile in debug mode so we don't waste time on heavy compilation optimizations that are not needed for correctness of the program.
+
+### Battlefield Integration Tests
+
+The [battlefield-ethereum](https://github.com/streamingfast/battlefield-ethereum) repository contains integration tests that compare Firehose trace output against known-good snapshots. These tests are critical after any inspector or tracer changes.
+
+#### Prerequisites
+
+- `fireeth` binary in PATH (from [firehose-ethereum](https://github.com/streamingfast/firehose-ethereum))
+- `reth` binary (built from this repo: `cargo build -p reth`)
+  _DO NOT_ build in `--release` mode as it takes too much time, debug is fine for development & testing purposes
+- Node.js + pnpm
+
+#### Setup
+
+```bash
+git clone https://github.com/streamingfast/battlefield-ethereum /tmp/battlefield-ethereum
+cd /tmp/battlefield-ethereum
+pnpm install
+pnpm compile
+```
+
+#### Running tests
+
+The test framework expects a running Firehose-instrumented Reth node. Start it in a separate terminal:
+
+```bash
+cd /tmp/battlefield-ethereum
+RETH_BINARY=/path/to/target/debug/reth bash scripts/run_firehose_reth_dev.sh
+```
+
+**Note** The `reth` node is configured to mine block on demand, as soon as the you launch the `run_firehose_reth_dev`, you can run the PNPM tests, the PNPM tests global setup phase launches transactions and waits until Firehose is ready so you can't wait for Firehose to be active and don't need to.
+
+Then run tests (in another terminal):
+
+```bash
+cd /tmp/battlefield-ethereum
+pnpm test:fh3.0:reth-dev                   # all tests
+pnpm test:fh3.0:reth-dev --grep suicide    # specific test group
+pnpm test:fh3.0:reth-dev --grep 'created in trx'  # single test
+```
+
+#### Important notes
+
+- The reth node persists between test runs. After rebuilding the binary, **kill all `fireeth` processes** before re-running tests, otherwise the old binary will be used (`fireeth` will correctly kill `reth` execution client process).
+- Snapshots live in `test/snapshots/<test>/fh3.0/v5/reth-dev/`. The `.expected.json` files are the ground truth (generated by Geth). The `.actual.normalized.json` files are the test output.
+- Ordinal normalization: the test framework subtracts the transaction's `beginOrdinal` from all ordinals, making them 0-based relative. Diffs on ordinals indicate an event was added/removed/reordered.
+- **Never** use `SNAPSHOTS_UPDATE=true` without explicitly requesting user's approval, and always update a single test or series of tests and never using `true` to update them all. Even better is to change the diff manually for affected snapshots files.
+
+## Firehose
+
+We maintain a fork of Reth with some additional tracing so that blocks are traced using StreamingFast Firehose Ethereum block model and tracing.
+
+### Debug vs Release builds
+
+As an agent, always compile in debug mode so we don't waste time on heavy compilation optimizations that are not needed for correctness of the program.
+
+### Battlefield Integration Tests
+
+The [battlefield-ethereum](https://github.com/streamingfast/battlefield-ethereum) repository contains integration tests that compare Firehose trace output against known-good snapshots. These tests are critical after any inspector or tracer changes.
+
+#### Prerequisites
+
+- `fireeth` binary in PATH (from [firehose-ethereum](https://github.com/streamingfast/firehose-ethereum))
+- `reth` binary (built from this repo: `cargo build -p reth`)
+  _DO NOT_ build in `--release` mode as it takes too much time, debug is fine for development & testing purposes
+- Node.js + pnpm
+
+#### Setup
+
+```bash
+git clone https://github.com/streamingfast/battlefield-ethereum /tmp/battlefield-ethereum
+cd /tmp/battlefield-ethereum
+pnpm install
+pnpm compile
+```
+
+#### Running tests
+
+The test framework expects a running Firehose-instrumented Reth node. Start it in a separate terminal:
+
+```bash
+cd /tmp/battlefield-ethereum
+RETH_BINARY=/path/to/target/debug/reth bash scripts/run_firehose_reth_dev.sh
+```
+
+**Note** The `reth` node is configured to mine block on demand, as soon as the you launch the `run_firehose_reth_dev`, you can run the PNPM tests, the PNPM tests global setup phase launches transactions and waits until Firehose is ready so you can't wait for Firehose to be active and don't need to.
+
+Then run tests (in another terminal):
+
+```bash
+cd /tmp/battlefield-ethereum
+pnpm test:fh3.0:reth-dev                   # all tests
+pnpm test:fh3.0:reth-dev --grep suicide    # specific test group
+pnpm test:fh3.0:reth-dev --grep 'created in trx'  # single test
+```
+
+#### Important notes
+
+- The reth node persists between test runs. After rebuilding the binary, **kill all `fireeth` processes** before re-running tests, otherwise the old binary will be used (`fireeth` will correctly kill `reth` execution client process).
+- Snapshots live in `test/snapshots/<test>/fh3.0/v5/reth-dev/`. The `.expected.json` files are the ground truth (generated by Geth). The `.actual.normalized.json` files are the test output.
+- Ordinal normalization: the test framework subtracts the transaction's `beginOrdinal` from all ordinals, making them 0-based relative. Diffs on ordinals indicate an event was added/removed/reordered.
+- **Never** use `SNAPSHOTS_UPDATE=true` without explicitly requesting user's approval, and always update a single test or series of tests and never using `true` to update them all. Even better is to change the diff manually for affected snapshots files.

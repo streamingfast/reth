@@ -1,4 +1,4 @@
-use crate::{inspector, mapper, mapper::SignatureFields as _, prelude::*};
+use crate::{inspector, mapper, prelude::*};
 use alloy_consensus::transaction::TxHashRef as _;
 use alloy_primitives::Bytes;
 use eyre::Context;
@@ -236,14 +236,14 @@ where
                     format!("Failed to get state provider for parent block {}", parent_hash)
                 })?;
 
-            let mut shared_state = State::builder()
+            let mut _shared_state = State::builder()
                 .with_database(StateProviderDatabase::new(state_provider))
                 .with_bundle_update()
                 .build();
 
-            let evm_config = ctx.evm_config().clone();
+            let _evm_config = ctx.evm_config().clone();
 
-            for (block, receipts) in committed.blocks_and_receipts() {
+            for (block, _receipts) in committed.blocks_and_receipts() {
                 // trace_block(
                 //     &ctx,
                 //     &evm_config,

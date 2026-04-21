@@ -20,6 +20,13 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 static GLOBAL_TRACER: OnceLock<Arc<Mutex<firehose_tracer::Tracer>>> = OnceLock::new();
 
+/// Returns `true` if the process-wide tracer has been initialized via [`init_tracer`].
+///
+/// Use this for zero-cost checks at call sites that should only run when Firehose is active.
+pub fn is_tracer_initialized() -> bool {
+    GLOBAL_TRACER.get().is_some()
+}
+
 /// Initialize the process-wide tracer instance.
 ///
 /// Must be called exactly once before any call to [`tracer`]. Panics if called more than once.
