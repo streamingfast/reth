@@ -14,7 +14,6 @@ use reth_execution_types::BlockExecutionResult;
 use reth_node_api::NodePrimitives;
 use reth_primitives_traits::{Block as BlockTrait, BlockBody, BlockTy, RecoveredBlock, TxTy};
 use reth_revm::{db::states::bundle_state::BundleRetention, Database as _, State};
-use reth_tracing::tracing::info;
 
 /// A block executor that wraps a [`ConfigureEvm`] and fires Firehose tracer lifecycle
 /// hooks (on_block_start, on_tx_start, on_tx_end, on_block_end) around every block
@@ -53,7 +52,7 @@ where
     <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,
     <<BlockTy<F::Primitives> as BlockTrait>::Body as BlockBody>::OmmerHeader:
         BlockHeader + Sealable,
-    TxTy<F::Primitives>: Transaction + TxHashRef,
+    TxTy<F::Primitives>: Transaction + TxHashRef + SignatureFields,
 {
     type Primitives = F::Primitives;
     type Error = BlockExecutionError;
@@ -77,9 +76,10 @@ where
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
-        info!("Executing block {} with FirehoseBlockExecutor", block.number());
         if crate::GLOBAL_TRACER.get().is_none() {
-            return self.execute_one(block);
+            return Err(BlockExecutionError::msg(
+                "FirehoseBlockExecutor requires the global tracer to be initialized for execute_and_trace_one",
+            ));
         }
 
         trace_block_with_inspector(&self.strategy_factory, &mut self.db, block)
@@ -129,7 +129,7 @@ where
     <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,
     <<BlockTy<F::Primitives> as BlockTrait>::Body as BlockBody>::OmmerHeader:
         BlockHeader + Sealable,
-    TxTy<F::Primitives>: Transaction + TxHashRef,
+    TxTy<F::Primitives>: Transaction + TxHashRef + SignatureFields,
 {
     let tracer = &mut *crate::tracer();
 
@@ -175,14 +175,13 @@ where
     executor.apply_pre_execution_changes().map_err(BlockExecutionError::from)?;
     executor.evm_mut().inspector_mut().tracer_mut().on_system_call_end();
 
+    let mut prev_cumulative_gas: u64 = 0;
+    let mut log_index: u32 = 0;
+
     for (tx_index, recovered_tx) in block.transactions_recovered().enumerate() {
         let tx: &TxTy<F::Primitives> = &**recovered_tx;
 
-        // Build a minimal TxEvent — signature bytes are left as zero/empty because we
-        // don't have the raw-encoded signature available here.  For full fidelity the
-        // caller should use the ExEx path (`runner::trace_block`) which can supply the
-        // real signature.
-        let (r, s, v) = crate::mapper::zero_signature();
+        let (r, s, v) = tx.signature_fields();
         let tx_event = mapper::signed_tx_to_tx_event(tx, recovered_tx.signer(), tx_index, r, s, v);
         executor.evm_mut().inspector_mut().tracer_mut().on_tx_start(tx_event, None);
 
@@ -190,15 +189,14 @@ where
             BlockExecutionError::msg(format!("transaction execution failed: {e:?}"))
         })?;
 
-        // Post-execution balance changes (gas refund to sender, miner fee to coinbase).
-        {
-            let result_gas_used = {
-                use reth_evm::block::TxResult as _;
-                tx_result.result().result.tx_gas_used()
-            };
+        let receipt_data = {
+            use reth_evm::block::TxResult as _;
+            let result = &tx_result.result().result;
+            let gas_used = result.tx_gas_used();
+            let cumulative_gas = prev_cumulative_gas + gas_used;
+
             let sender = recovered_tx.signer();
             let coinbase = block.header().beneficiary();
-            let gas_limit = tx.gas_limit();
             let base_fee = block.header().base_fee_per_gas().unwrap_or(0);
             let effective_gas_price: u128 = if tx.is_dynamic_fee() {
                 std::cmp::min(
@@ -213,23 +211,34 @@ where
             inspector.process_post_tx_balance_changes(
                 sender,
                 coinbase,
-                gas_limit,
-                result_gas_used,
+                tx.gas_limit(),
+                gas_used,
                 effective_gas_price,
                 base_fee,
                 |addr| {
                     evm_db.basic(addr).ok().flatten().map(|info| info.balance).unwrap_or(U256::ZERO)
                 },
             );
-        }
+
+            let rd = mapper::receipt_data_from_parts(
+                tx_index as u32,
+                gas_used,
+                cumulative_gas,
+                result.is_success() as u64,
+                result.logs(),
+                log_index,
+            );
+            let log_count = result.logs().len() as u32;
+            prev_cumulative_gas = cumulative_gas;
+            log_index += log_count;
+            rd
+        };
 
         executor
             .commit_transaction(tx_result)
             .map_err(|e| BlockExecutionError::msg(format!("transaction commit failed: {e:?}")))?;
 
-        // Emit on_tx_end without receipt data; the ExEx runner supplies receipts from
-        // the committed notification, but in the execution stage we don't have them yet.
-        executor.evm_mut().inspector_mut().tracer_mut().on_tx_end(None, None);
+        executor.evm_mut().inspector_mut().tracer_mut().on_tx_end(Some(&receipt_data), None);
     }
 
     executor.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
@@ -356,8 +365,7 @@ where
         let cumulative_gas = receipt.cumulative_gas_used();
         let gas_used = cumulative_gas - prev_cumulative_gas;
         let log_count = receipt.logs().len() as u32;
-        let receipt_data =
-            mapper::to_receipt_data(receipt, tx_index as u32, gas_used, log_index);
+        let receipt_data = mapper::to_receipt_data(receipt, tx_index as u32, gas_used, log_index);
         prev_cumulative_gas = cumulative_gas;
         log_index += log_count;
 
@@ -404,7 +412,7 @@ where
     <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,
     <<BlockTy<F::Primitives> as BlockTrait>::Body as BlockBody>::OmmerHeader:
         BlockHeader + Sealable,
-    TxTy<F::Primitives>: Transaction + TxHashRef,
+    TxTy<F::Primitives>: Transaction + TxHashRef + SignatureFields,
 {
     type Primitives = F::Primitives;
     type Error = F::Error;
@@ -470,7 +478,7 @@ where
     <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,
     <<BlockTy<F::Primitives> as BlockTrait>::Body as BlockBody>::OmmerHeader:
         BlockHeader + Sealable,
-    TxTy<F::Primitives>: Transaction + TxHashRef,
+    TxTy<F::Primitives>: Transaction + TxHashRef + SignatureFields,
 {
     fn evm_env_for_payload(
         &self,

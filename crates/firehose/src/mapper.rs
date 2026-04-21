@@ -372,6 +372,36 @@ impl firehose_tracer::types::StateReader for StateReaderAdapter {
     }
 }
 
+/// Builds a [`firehose_tracer::types::ReceiptData`] from raw execution components,
+/// for use in the historical execution path where a `TxReceipt` is not yet available.
+///
+/// - `tx_index`: 0-based index of this transaction in the block
+/// - `gas_used`: gas consumed by this transaction alone
+/// - `cumulative_gas`: running total of gas used up to and including this tx
+/// - `status`: 1 = success, 0 = failure/revert
+/// - `logs`: logs emitted by this transaction
+/// - `log_index_start`: block-wide log index of the first log in this receipt
+pub fn receipt_data_from_parts(
+    tx_index: u32,
+    gas_used: u64,
+    cumulative_gas: u64,
+    status: u64,
+    logs: &[alloy_primitives::Log],
+    log_index_start: u32,
+) -> firehose_tracer::types::ReceiptData {
+    let mut receipt_data =
+        firehose_tracer::types::ReceiptData::new(tx_index, gas_used, status, cumulative_gas);
+    for (i, log) in logs.iter().enumerate() {
+        receipt_data.add_log(firehose_tracer::types::LogData::new(
+            log.address,
+            log.data.topics().to_vec(),
+            log.data.data.clone(),
+            log_index_start + i as u32,
+        ));
+    }
+    receipt_data
+}
+
 /// Converts a receipt to a firehose ReceiptData.
 ///
 /// - `tx_index`: 0-based index of this transaction in the block
