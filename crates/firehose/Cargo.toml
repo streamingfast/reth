@@ -10,18 +10,6 @@ repository.workspace = true
 [lints]
 workspace = true
 
-#[patch.crates-io]
-## Patch alloy-evm to inspect system calls (EIP-4788, EIP-2935, etc.) through the
-## Inspector when inspect mode is enabled, matching what transact_raw already does.
-## See https://github.com/alloy-rs/evm/pull/323 for tentative of upstreaming this change.
-#alloy-evm = { git = "https://github.com/streamingfast/evm.git", branch = "sf/v0.27.3" }
-
-## This is needed otherwise we get flooding of debug logs around a problem that seems to happen in Reth directly.
-## This is about wrong execution pool and cool be related to ExEx in general (not just our version). We will
-## need to investigate to ensure we are not doing wrong thing that could hinder threading in production.
-#[profile.dev.package.reth-chain-state]
-#debug-assertions = false
-
 [dependencies]
 firehose-tracer.workspace = true
 

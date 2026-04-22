@@ -458,7 +458,7 @@ alloy-sol-types = { version = "1.5.6", default-features = false }
 alloy-chains = { version = "0.2.5", default-features = false }
 alloy-eip2124 = { version = "0.2.0", default-features = false }
 alloy-eip7928 = { version = "0.3.0", default-features = false }
-alloy-evm = { version = "0.27.2", default-features = false }
+alloy-evm = { version = "0.27.3", default-features = false }
 alloy-rlp = { version = "0.3.13", default-features = false, features = [
     "core-net",
 ] }
@@ -738,7 +738,7 @@ vergen-git2 = "9.1.0"
 # networking
 ipnet = "2.11"
 
-# Firehose
+## Firehose Additions
 firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "main" }
 reth-firehose = { path = "crates/firehose" }
 
@@ -792,3 +792,16 @@ reth-firehose = { path = "crates/firehose" }
 
 # alloy-evm = { git = "https://github.com/alloy-rs/evm", rev = "072c248" }
 # alloy-op-evm = { git = "https://github.com/alloy-rs/evm", rev = "072c248" }
+
+## Firehose additions
+# Patch alloy-evm to route system calls (EIP-4788, EIP-2935, etc.) through the
+# Inspector when inspect mode is enabled, matching what transact_raw already does.
+# See https://github.com/alloy-rs/evm/pull/323 for the upstream PR.
+alloy-evm = { git = "https://github.com/streamingfast/evm.git", branch = "sf/v0.27.3" }
+
+## Firehose additions
+# This is needed otherwise we get flooding of debug logs around a problem that seems to happen in Reth directly.
+# This is about wrong execution pool and cool be related to ExEx in general (not just our version). We will
+# need to investigate to ensure we are not doing wrong thing that could hinder threading in production.
+[profile.dev.package.reth-chain-state]
+debug-assertions = false
