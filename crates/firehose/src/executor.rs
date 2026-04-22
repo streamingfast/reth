@@ -112,7 +112,14 @@ where
             prev.mark_verified();
         }
 
-        let mut tracer = FirehoseBlockTracer::start::<F::Primitives>(block);
+        // In the pipeline / staged sync path, the block we're about to trace is by
+        // definition already finalized — staged sync only replays blocks up to the
+        // finalized head — so advertise it as the finalized ref in the block event.
+        let finalized = Some(firehose_tracer::types::FinalizedBlockRef {
+            number: block.number(),
+            hash: Some(block.hash()),
+        });
+        let mut tracer = FirehoseBlockTracer::start::<F::Primitives>(block, finalized);
         match trace_block::<F, DB, <F::Primitives as NodePrimitives>::Receipt>(
             &self.strategy_factory,
             &mut self.db,

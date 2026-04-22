@@ -628,7 +628,7 @@ where
                             .with_bundle_update()
                             .build();
                         let mut guard =
-                            reth_firehose::FirehoseBlockTracer::start::<N>(&block);
+                            reth_firehose::FirehoseBlockTracer::start::<N>(&block, None);
                         match reth_firehose::executor::trace_block(
                             &self.evm_config,
                             &mut db,
