@@ -171,10 +171,12 @@ where
     match block_result {
         Ok(result) => {
             // Tracer borrow released — safe to call directly.
-            // Emit withdrawal balance changes before closing the system-call window so
-            // their ordinals are sequenced inside it, matching Geth's behaviour.
-            emit_withdrawal_balance_changes(tracer, db, block.body().withdrawals());
+            // Close the post-execution system-call window FIRST so that
+            // self.transaction is None, then emit withdrawal balance changes so
+            // on_balance_change routes them to block.balance_changes (not
+            // deferred_call_state, which would be discarded by reset_transaction).
             tracer.on_system_call_end();
+            emit_withdrawal_balance_changes(tracer, db, block.body().withdrawals());
             tracer.on_block_end(None);
             db.merge_transitions(BundleRetention::Reverts);
             Ok(result)
@@ -345,10 +347,12 @@ where
     match block_result {
         Ok(()) => {
             // Tracer borrow released — safe to call directly.
-            // Emit withdrawal balance changes before closing the system-call window so
-            // their ordinals are sequenced inside it, matching Geth's behaviour.
-            emit_withdrawal_balance_changes(tracer, db, block.body().withdrawals());
+            // Close the post-execution system-call window FIRST so that
+            // self.transaction is None, then emit withdrawal balance changes so
+            // on_balance_change routes them to block.balance_changes (not
+            // deferred_call_state, which would be discarded by reset_transaction).
             tracer.on_system_call_end();
+            emit_withdrawal_balance_changes(tracer, db, block.body().withdrawals());
             tracer.on_block_end(None);
             db.merge_transitions(BundleRetention::Reverts);
             Ok(())
@@ -464,14 +468,19 @@ where
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Emits withdrawal balance changes to the tracer after `apply_post_execution_changes` has run.
+/// Emits withdrawal balance changes to the tracer after the post-execution system-call window
+/// has been closed (i.e. after `on_system_call_end` has been called).
 ///
 /// EIP-4895 validator withdrawals are applied via `db.increment_balances()` inside the executor's
 /// `finish()` call, bypassing the EVM journal entirely. The `FirehoseInspector` never sees them.
 /// This function bridges the gap: it reads the post-withdrawal balance for each withdrawal address
-/// directly from the DB (the borrow is released once the executor is dropped) and emits the
-/// corresponding `on_balance_change` events with `Reason::Withdrawal` before the system-call
-/// window closes, matching Geth's ordinal ordering.
+/// directly from the DB and reconstructs the pre-balance by subtracting the known withdrawal
+/// amount (`pre = post - withdrawal_wei`).
+///
+/// Must be called with `tracer.transaction == None` (i.e. outside any system-call window) so
+/// that `on_balance_change` routes the events to `block.balance_changes` directly. Calling it
+/// inside the system-call window causes the changes to land in `deferred_call_state`, which is
+/// discarded by `on_system_call_end`.
 fn emit_withdrawal_balance_changes<DB>(
     tracer: &mut firehose_tracer::Tracer,
     db: &mut State<DB>,
