@@ -228,20 +228,20 @@ where
 
         if let Some(committed) = notification.committed_chain() {
             info!(chain = ?committed.range(), "Chain committed, tracing {} blocks", committed.len());
-            let first_block = committed.first();
-            let parent_hash = first_block.parent_hash();
+            //let first_block = committed.first();
+            //let parent_hash = first_block.parent_hash();
 
-            let state_provider =
-                ctx.provider().state_by_block_hash(parent_hash).wrap_err_with(|| {
-                    format!("Failed to get state provider for parent block {}", parent_hash)
-                })?;
+            //let state_provider =
+            //    ctx.provider().state_by_block_hash(parent_hash).wrap_err_with(|| {
+            //        format!("Failed to get state provider for parent block {}", parent_hash)
+            //    })?;
 
-            let mut _shared_state = State::builder()
-                .with_database(StateProviderDatabase::new(state_provider))
-                .with_bundle_update()
-                .build();
+            //let mut _shared_state = State::builder()
+            //    .with_database(StateProviderDatabase::new(state_provider))
+            //    .with_bundle_update()
+            //    .build();
 
-            let _evm_config = ctx.evm_config().clone();
+            //let _evm_config = ctx.evm_config().clone();
 
             for (block, _receipts) in committed.blocks_and_receipts() {
                 // trace_block(

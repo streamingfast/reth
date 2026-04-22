@@ -54,6 +54,12 @@ pub struct FirehoseInspector<'a> {
     /// balance changes (gas refund, reward). This matches Geth 1.17.x's Finalise timing
     /// where nonce resets and code clears happen after gas accounting.
     pending_selfdestruct_cleanups: Vec<SelfdestructCleanupEntry>,
+
+    // increments at the end of each transaction, to get proper block index for logs
+    log_block_index: u32,
+
+    // last seen number of logs in a given transaction
+    trx_logs_count: u32,
 }
 
 impl<'a> Debug for FirehoseInspector<'a> {
@@ -87,6 +93,8 @@ impl<'a> FirehoseInspector<'a> {
             pending_value_transfer_check: false,
             selfdestruct_addresses: HashSet::new(),
             pending_selfdestruct_cleanups: Vec::new(),
+            log_block_index: 0,
+            trx_logs_count: 0,
         }
     }
 
@@ -471,8 +479,8 @@ impl<'a> FirehoseInspector<'a> {
                 auth_tracker.get_mut(&authority).unwrap();
 
             // 4. Code must be empty or an EIP-7702 delegation designator.
-            let code_eligible = *tracked_code_hash == KECCAK_EMPTY ||
-                (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
+            let code_eligible = *tracked_code_hash == KECCAK_EMPTY
+                || (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
             if !code_eligible {
                 continue;
             }
@@ -629,6 +637,9 @@ impl<'a> FirehoseInspector<'a> {
         self.balance_tracker.clear();
         self.selfdestruct_addresses.clear();
         self.journal_processed_up_to = 0;
+
+        self.log_block_index += self.trx_logs_count;
+        self.trx_logs_count = 0;
     }
 
     /// Map EVM call scheme to Firehose call type opcode
@@ -658,17 +669,17 @@ impl<'a> FirehoseInspector<'a> {
             InstructionResult::Revert => "execution reverted".to_string(),
             InstructionResult::CallTooDeep => "max call depth exceeded".to_string(),
             InstructionResult::OutOfFunds => "insufficient balance for transfer".to_string(),
-            InstructionResult::CreateInitCodeStartingEF00 |
-            InstructionResult::InvalidEOFInitCode |
-            InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
+            InstructionResult::CreateInitCodeStartingEF00
+            | InstructionResult::InvalidEOFInitCode
+            | InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
 
             // Out-of-gas variants — Geth distinguishes CREATE vs CALL context
-            InstructionResult::OutOfGas |
-            InstructionResult::MemoryOOG |
-            InstructionResult::MemoryLimitOOG |
-            InstructionResult::PrecompileOOG |
-            InstructionResult::InvalidOperandOOG |
-            InstructionResult::ReentrancySentryOOG => {
+            InstructionResult::OutOfGas
+            | InstructionResult::MemoryOOG
+            | InstructionResult::MemoryLimitOOG
+            | InstructionResult::PrecompileOOG
+            | InstructionResult::InvalidOperandOOG
+            | InstructionResult::ReentrancySentryOOG => {
                 if is_create {
                     "contract creation code storage out of gas".to_string()
                 } else {
@@ -681,8 +692,8 @@ impl<'a> FirehoseInspector<'a> {
             InstructionResult::InvalidJump => "invalid jump destination".to_string(),
             InstructionResult::StackOverflow => "stack limit reached 1024 (1023)".to_string(),
             InstructionResult::StackUnderflow => "stack underflow".to_string(),
-            InstructionResult::CallNotAllowedInsideStatic |
-            InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
+            InstructionResult::CallNotAllowedInsideStatic
+            | InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
             InstructionResult::CreateCollision => "contract address collision".to_string(),
             InstructionResult::CreateContractSizeLimit => "max code size exceeded".to_string(),
             InstructionResult::CreateContractStartingWithEF => {
@@ -1056,10 +1067,10 @@ where
         // - CreateCollision / OverflowPayment: create_account_checkpoint itself failed
         let skip_created_nonce = matches!(
             outcome.result.result,
-            InstructionResult::CallTooDeep |
-                InstructionResult::OutOfFunds |
-                InstructionResult::CreateCollision |
-                InstructionResult::OverflowPayment
+            InstructionResult::CallTooDeep
+                | InstructionResult::OutOfFunds
+                | InstructionResult::CreateCollision
+                | InstructionResult::OverflowPayment
         );
         if !skip_created_nonce {
             if let Some(address) = outcome.address {
@@ -1102,10 +1113,12 @@ where
         log: AlloyLog,
     ) {
         // The journal tracks all non-reverted logs. log_full fires after the
-        // log is appended, so logs().len() - 1 is this log's block-wide index.
+        // log is appended, so logs().len() - 1 is this log's index in the transaction.
         // On revert, the journal truncates logs back, so subsequent logs after
         // a revert get correct indices automatically.
-        let block_index = (context.journal().logs().len() as u32).saturating_sub(1);
+        //
+        self.trx_logs_count = (context.journal().logs().len() as u32);
+        let block_index = self.trx_logs_count.saturating_sub(1) + self.log_block_index;
         self.tracer.on_log(log.address, log.topics(), &log.data.data, block_index);
     }
 

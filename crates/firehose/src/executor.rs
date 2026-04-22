@@ -362,9 +362,7 @@ where
 ///
 /// EIP-4895 validator withdrawals are applied via `db.increment_balances()` inside the executor's
 /// `finish()` call, bypassing the EVM journal entirely. The `FirehoseInspector` never sees them.
-/// This function bridges the gap: it reads the post-withdrawal balance for each withdrawal address
-/// directly from the DB and reconstructs the pre-balance by subtracting the known withdrawal
-/// amount (`pre = post - withdrawal_wei`).
+/// This function bridges the gap by replaying withdrawals in order against the final DB state.
 ///
 /// Must be called with `tracer.transaction == None` (i.e. outside any system-call window) so
 /// that `on_balance_change` routes the events to `block.balance_changes` directly. Calling it
@@ -380,20 +378,164 @@ fn emit_withdrawal_balance_changes<DB>(
     use firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason;
 
     let Some(withdrawals) = withdrawals else { return };
+    let withdrawals = withdrawals.as_slice();
+    if withdrawals.is_empty() {
+        return;
+    }
 
-    // Aggregate per-address in case a single block contains multiple withdrawals to the same
-    // validator address (rare but valid per the spec).
-    let mut per_addr: HashMap<Address, u128> = HashMap::new();
-    for w in withdrawals.as_slice() {
+    let events = withdrawal_balance_events(withdrawals, |addr| {
+        db.basic(addr).ok().flatten().map(|i| i.balance).unwrap_or_default()
+    });
+
+    for (addr, pre, post) in events {
+        tracer.on_balance_change(addr, pre, post, Reason::Withdrawal);
+    }
+}
+
+/// Computes per-withdrawal balance change events in forward order by replaying backwards
+/// from the known final balances.
+///
+/// Starting from the post-all-withdrawals balance for each address (fetched via
+/// `get_final_balance`), the function walks the withdrawal list in reverse to reconstruct
+/// the pre/post values for each individual withdrawal, then returns the events in the
+/// original forward order so callers emit them with monotonically increasing ordinals.
+///
+/// Withdrawals with `amount == 0` are skipped (they produce no balance change).
+fn withdrawal_balance_events(
+    withdrawals: &[alloy_eips::eip4895::Withdrawal],
+    mut get_final_balance: impl FnMut(Address) -> U256,
+) -> Vec<(Address, U256, U256)> {
+    // Seed the running balance map with the final DB value for every address that appears.
+    let mut current: HashMap<Address, U256> = HashMap::new();
+    for w in withdrawals {
         if w.amount > 0 {
-            *per_addr.entry(w.address).or_default() += w.amount_wei().to::<u128>();
+            current.entry(w.address).or_insert_with(|| get_final_balance(w.address));
         }
     }
 
-    for (addr, total_wei) in per_addr {
-        let post = db.basic(addr).ok().flatten().map(|i| i.balance).unwrap_or_default();
-        let pre = post.saturating_sub(U256::from(total_wei));
-        tracer.on_balance_change(addr, pre, post, Reason::Withdrawal);
+    // Walk backwards, peeling off each withdrawal to recover the per-step pre/post pair.
+    let mut events: Vec<(Address, U256, U256)> = Vec::with_capacity(withdrawals.len());
+    for w in withdrawals.iter().rev() {
+        if w.amount == 0 {
+            continue;
+        }
+        let post = *current.get(&w.address).unwrap_or(&U256::ZERO);
+        let pre = post.saturating_sub(w.amount_wei());
+        events.push((w.address, pre, post));
+        current.insert(w.address, pre);
+    }
+
+    events.reverse();
+    events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_eips::eip4895::Withdrawal;
+    use alloy_primitives::Address;
+
+    fn addr(byte: u8) -> Address {
+        Address::repeat_byte(byte)
+    }
+
+    fn gwei(n: u64) -> u64 {
+        n
+    }
+
+    fn wei(gwei: u64) -> U256 {
+        U256::from(gwei) * U256::from(1_000_000_000u64)
+    }
+
+    fn make_withdrawal(index: u64, validator: u64, address: Address, amount_gwei: u64) -> Withdrawal {
+        Withdrawal { index, validator_index: validator, address, amount: amount_gwei }
+    }
+
+    /// Calls `withdrawal_balance_events` with a fixed balance map.
+    fn events_with_balances(
+        withdrawals: &[Withdrawal],
+        final_balances: &HashMap<Address, U256>,
+    ) -> Vec<(Address, U256, U256)> {
+        withdrawal_balance_events(withdrawals, |addr| {
+            final_balances.get(&addr).copied().unwrap_or_default()
+        })
+    }
+
+    #[test]
+    fn test_single_withdrawal() {
+        let a = addr(0xAA);
+        let ws = [make_withdrawal(0, 0, a, gwei(100))];
+        let mut finals = HashMap::new();
+        finals.insert(a, wei(1100)); // started at 1000, received 100 gwei
+
+        let events = events_with_balances(&ws, &finals);
+
+        assert_eq!(events, vec![(a, wei(1000), wei(1100))]);
+    }
+
+    #[test]
+    fn test_two_withdrawals_same_address_ordering() {
+        // W1: A +50 gwei, W2: A +150 gwei → final A = 1200
+        let a = addr(0xAA);
+        let ws = [
+            make_withdrawal(0, 0, a, gwei(50)),
+            make_withdrawal(1, 0, a, gwei(150)),
+        ];
+        let mut finals = HashMap::new();
+        finals.insert(a, wei(1200)); // started at 1000
+
+        let events = events_with_balances(&ws, &finals);
+
+        assert_eq!(events.len(), 2);
+        // W1: pre=1000, post=1050
+        assert_eq!(events[0], (a, wei(1000), wei(1050)));
+        // W2: pre=1050, post=1200
+        assert_eq!(events[1], (a, wei(1050), wei(1200)));
+    }
+
+    #[test]
+    fn test_interleaved_different_addresses() {
+        // W1: A +50, W2: B +20, W3: A +150
+        // Final: A=1200, B=220
+        let a = addr(0xAA);
+        let b = addr(0xBB);
+        let ws = [
+            make_withdrawal(0, 0, a, gwei(50)),
+            make_withdrawal(1, 1, b, gwei(20)),
+            make_withdrawal(2, 0, a, gwei(150)),
+        ];
+        let mut finals = HashMap::new();
+        finals.insert(a, wei(1200)); // started at 1000
+        finals.insert(b, wei(220));  // started at 200
+
+        let events = events_with_balances(&ws, &finals);
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], (a, wei(1000), wei(1050))); // W1
+        assert_eq!(events[1], (b, wei(200),  wei(220)));  // W2
+        assert_eq!(events[2], (a, wei(1050), wei(1200))); // W3
+    }
+
+    #[test]
+    fn test_zero_amount_withdrawals_skipped() {
+        let a = addr(0xAA);
+        let ws = [
+            make_withdrawal(0, 0, a, 0),        // skipped
+            make_withdrawal(1, 0, a, gwei(100)),
+        ];
+        let mut finals = HashMap::new();
+        finals.insert(a, wei(1100));
+
+        let events = events_with_balances(&ws, &finals);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], (a, wei(1000), wei(1100)));
+    }
+
+    #[test]
+    fn test_empty_withdrawals() {
+        let events = withdrawal_balance_events(&[], |_| U256::ZERO);
+        assert!(events.is_empty());
     }
 }
 
