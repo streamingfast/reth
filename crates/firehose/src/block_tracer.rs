@@ -36,7 +36,15 @@ impl FirehoseBlockTracer {
     /// For block 1 this emits `on_genesis_block` (with an empty genesis alloc — the caller
     /// is expected not to rely on it for historical sync). For all other blocks it emits
     /// `on_block_start`.
-    pub fn start<N>(block: &RecoveredBlock<N::Block>) -> Self
+    ///
+    /// `finalized` is the finalized block ref to advertise in the emitted `BlockEvent`. In
+    /// the pipeline / staged sync path, the currently executing block is by definition
+    /// already finalized, so callers should pass `Some(block_ref)`. Live engine callers
+    /// that do not yet know the finalized head should pass `None`.
+    pub fn start<N>(
+        block: &RecoveredBlock<N::Block>,
+        finalized: Option<firehose_tracer::types::FinalizedBlockRef>,
+    ) -> Self
     where
         N: NodePrimitives,
         N::Block: BlockTrait,
@@ -50,7 +58,7 @@ impl FirehoseBlockTracer {
             guard.on_genesis_block(
                 firehose_tracer::types::BlockEvent {
                     block: mapper::to_block_data_eth::<N>(block),
-                    finalized: None,
+                    finalized,
                     flash_block: None,
                 },
                 Default::default(),
@@ -58,7 +66,7 @@ impl FirehoseBlockTracer {
         } else {
             guard.on_block_start(firehose_tracer::types::BlockEvent {
                 block: mapper::to_block_data_eth::<N>(block),
-                finalized: None,
+                finalized,
                 flash_block: None,
             });
         }
