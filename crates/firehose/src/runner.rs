@@ -160,6 +160,11 @@ where
                 tx.gas_price().unwrap_or(0)
             };
 
+            // Committed log count from the ExecutionResult (empty on Revert/Halt).
+            let committed_log_count = {
+                use alloy_evm::block::TxResult as _;
+                tx_result.result().result.logs().len() as u32
+            };
             let (db, inspector, _) = executor.evm_mut().components_mut();
             inspector.process_post_tx_balance_changes(
                 sender,
@@ -168,6 +173,7 @@ where
                 result_gas_used,
                 effective_gas_price,
                 base_fee,
+                committed_log_count,
                 |addr| db.basic(addr).ok().flatten().map(|info| info.balance).unwrap_or(U256::ZERO),
             );
         }

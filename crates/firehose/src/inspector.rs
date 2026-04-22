@@ -575,6 +575,7 @@ impl<'a> FirehoseInspector<'a> {
         gas_used: u64,
         effective_gas_price: u128,
         base_fee: u64,
+        committed_log_count: u32,
         mut get_pre_tx_balance: F,
     ) where
         F: FnMut(Address) -> U256,
@@ -638,7 +639,13 @@ impl<'a> FirehoseInspector<'a> {
         self.selfdestruct_addresses.clear();
         self.journal_processed_up_to = 0;
 
-        self.log_block_index += self.trx_logs_count;
+        // Advance the block-wide log counter by the COMMITTED log count, not by the
+        // cached `trx_logs_count` which reflects `journal.logs().len()` at the last log
+        // emission. If the last log emitted in this tx sat inside a frame that later
+        // reverted, `trx_logs_count` overcounts. `committed_log_count` is read by the
+        // caller from `ExecutionResult::logs().len()` after `execute_transaction_without_commit`
+        // returned, so it only counts logs that survived revert.
+        self.log_block_index += committed_log_count;
         self.trx_logs_count = 0;
     }
 
