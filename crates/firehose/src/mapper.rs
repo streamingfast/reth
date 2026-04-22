@@ -126,7 +126,7 @@ where
 
 /// Convenience wrapper: produces [`BlockData`] for any `NodePrimitives`-based block
 /// (the typical use-case for the execution-stage executor).
-pub(crate) fn to_block_data_eth<P>(
+pub fn to_block_data_eth<P>(
     block: &reth_primitives_traits::RecoveredBlock<<P as NodePrimitives>::Block>,
 ) -> BlockData
 where

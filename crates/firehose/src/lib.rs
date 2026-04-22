@@ -2,6 +2,8 @@
 //!
 //! This crate contains modules for inspection, mapping, prelude utilities, and running tasks.
 
+/// Block-level drop guard that manages the Firehose tracer lifecycle across validation.
+pub mod block_tracer;
 /// Executor module with Firehose-aware block executors and EVM configs.
 pub mod executor;
 /// Inspector module for analyzing blockchain data.
@@ -13,6 +15,7 @@ pub mod prelude;
 /// Runner module for executing processing tasks.
 pub mod runner;
 
+pub use block_tracer::FirehoseBlockTracer;
 pub use executor::FirehoseEvmConfig;
 pub use runner::run_exex;
 
