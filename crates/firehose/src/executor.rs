@@ -273,6 +273,13 @@ where
     let mut prev_cumulative_gas: u64 = 0;
     let mut log_index: u32 = 0;
 
+    // EIP-4844: blob gas price is a block-level property derived from excess_blob_gas.
+    // None for pre-Cancun blocks that don't have this field.
+    let blob_gas_price: Option<U256> = block
+        .header()
+        .excess_blob_gas()
+        .map(|excess| U256::from(alloy_eips::eip4844::calc_blob_gasprice(excess)));
+
     for (tx_index, recovered_tx) in block.transactions_recovered().enumerate() {
         let tx: &TxTy<F::Primitives> = &**recovered_tx;
 
@@ -326,7 +333,7 @@ where
         // Build receipt_data for on_tx_end. If the caller supplied receipts (live path), use
         // them for accurate cumulative gas and log data; otherwise reconstruct from the
         // tx_result we just observed (pipeline path).
-        let receipt_data = if let Some(receipts) = receipts {
+        let mut receipt_data = if let Some(receipts) = receipts {
             let receipt = &receipts[tx_index];
             let cumulative_gas = receipt.cumulative_gas_used();
             let actual_gas_used = cumulative_gas - prev_cumulative_gas;
@@ -342,6 +349,12 @@ where
             prev_cumulative_gas += gas_used;
             rd
         };
+
+        // EIP-4844: populate blob gas fields for type-3 transactions.
+        if let Some(blob_gas_used) = tx.blob_gas_used() {
+            receipt_data.blob_gas_used = blob_gas_used;
+            receipt_data.blob_gas_price = blob_gas_price;
+        }
 
         executor.evm_mut().inspector_mut().tracer_mut().on_tx_end(Some(&receipt_data), None);
     }
