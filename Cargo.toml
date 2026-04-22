@@ -50,6 +50,7 @@ members = [
     "crates/exex/exex/",
     "crates/exex/test-utils/",
     "crates/exex/types/",
+    "crates/firehose",
     "crates/metrics/",
     "crates/net/banlist/",
     "crates/net/discv4/",
@@ -736,6 +737,10 @@ vergen-git2 = "9.1.0"
 
 # networking
 ipnet = "2.11"
+
+# Firehose
+firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "main" }
+reth-firehose = { path = "crates/firehose" }
 
 [patch.crates-io]
 # alloy-consensus = { git = "https://github.com/alloy-rs/alloy", rev = "3049f232fbb44d1909883e154eb38ec5962f53a3" }
