@@ -1,11 +1,12 @@
 //! Firehose block executor that traces EVM execution and emits FIRE lines.
 
-use std::fmt::Debug;
+use std::{collections::HashMap, fmt::Debug};
 
 use crate::{inspector::FirehoseInspector, mapper, mapper::SignatureFields};
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction, TxReceipt};
+use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::block::BlockExecutor as _;
-use alloy_primitives::{Log, Sealable, U256};
+use alloy_primitives::{Address, Log, Sealable, U256};
 use reth_evm::{
     execute::{BlockExecutionError, Executor},
     ConfigureEvm, Evm as _, OnStateHook,
@@ -161,13 +162,58 @@ where
         flash_block: None,
     });
 
+    // Run all executor logic inside a helper function. When the helper returns (whether
+    // Ok or Err), its locals — including the executor and the FirehoseInspector that
+    // mutably borrows the tracer — are dropped. The tracer borrow is released before
+    // we reach the match below, so we can call on_block_end on every code path.
+    let block_result = execute_staged_block(tracer, evm_config, db, block);
+
+    match block_result {
+        Ok(result) => {
+            // Tracer borrow released — safe to call directly.
+            // Emit withdrawal balance changes before closing the system-call window so
+            // their ordinals are sequenced inside it, matching Geth's behaviour.
+            emit_withdrawal_balance_changes(tracer, db, block.body().withdrawals());
+            tracer.on_system_call_end();
+            tracer.on_block_end(None);
+            db.merge_transitions(BundleRetention::Reverts);
+            Ok(result)
+        }
+        Err(e) => {
+            tracer.on_block_end(Some(&e));
+            Err(e)
+        }
+    }
+}
+
+/// Inner executor for [`trace_block_with_inspector`].
+///
+/// All locals (executor, FirehoseInspector) are dropped when this function returns,
+/// ensuring the mutable borrow on `tracer` is released before the caller calls
+/// `on_block_end`. Do NOT call `on_system_call_end` or `on_block_end` here; the
+/// caller owns those calls so it can route them correctly on both Ok and Err paths.
+fn execute_staged_block<F, DB>(
+    tracer: &mut firehose_tracer::Tracer,
+    evm_config: &F,
+    db: &mut State<DB>,
+    block: &RecoveredBlock<<F::Primitives as NodePrimitives>::Block>,
+) -> Result<BlockExecutionResult<<F::Primitives as NodePrimitives>::Receipt>, BlockExecutionError>
+where
+    F: ConfigureEvm,
+    DB: reth_evm::Database,
+    BlockTy<F::Primitives>: BlockTrait,
+    <BlockTy<F::Primitives> as BlockTrait>::Header: BlockHeader + Sealable,
+    <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,
+    <<BlockTy<F::Primitives> as BlockTrait>::Body as BlockBody>::OmmerHeader:
+        BlockHeader + Sealable,
+    TxTy<F::Primitives>: Transaction + TxHashRef + SignatureFields,
+{
     let evm_env = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?;
     let exec_ctx =
         evm_config.context_for_block(block.sealed_block()).map_err(BlockExecutionError::other)?;
 
-    // Inspector borrows tracer mutably for the duration of the block execution.
     let inspector = FirehoseInspector::new(tracer);
-    let evm = evm_config.evm_with_env_and_inspector(&mut *db, evm_env, inspector);
+    let evm = evm_config.evm_with_env_and_inspector(db, evm_env, inspector);
     let mut executor = evm_config.create_executor(evm, exec_ctx);
 
     // System calls (EIP-4788, EIP-2935, etc.)
@@ -243,16 +289,9 @@ where
 
     executor.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
 
-    // apply_post_execution_changes consumes the executor, dropping the inspector and
-    // releasing the mutable borrow on the tracer.
-    let result = executor.apply_post_execution_changes().map_err(BlockExecutionError::from)?;
-
-    // Tracer borrow released — safe to call directly.
-    tracer.on_system_call_end();
-    tracer.on_block_end(None);
-
-    db.merge_transitions(BundleRetention::Reverts);
-    Ok(result)
+    // apply_post_execution_changes takes self, consuming the executor and dropping the
+    // inspector. The tracer borrow is released when this function returns.
+    executor.apply_post_execution_changes().map_err(BlockExecutionError::from)
 }
 
 /// Like [`trace_block_with_inspector`] but also accepts the receipts produced by the first
@@ -299,12 +338,54 @@ where
         flash_block: None,
     });
 
+    // Run all executor logic inside a helper function so the tracer borrow is released
+    // before we call on_block_end (see execute_staged_block for the pattern rationale).
+    let block_result = execute_live_block(tracer, evm_config, db, block, receipts);
+
+    match block_result {
+        Ok(()) => {
+            // Tracer borrow released — safe to call directly.
+            // Emit withdrawal balance changes before closing the system-call window so
+            // their ordinals are sequenced inside it, matching Geth's behaviour.
+            emit_withdrawal_balance_changes(tracer, db, block.body().withdrawals());
+            tracer.on_system_call_end();
+            tracer.on_block_end(None);
+            db.merge_transitions(BundleRetention::Reverts);
+            Ok(())
+        }
+        Err(e) => {
+            tracer.on_block_end(Some(&e));
+            Err(e)
+        }
+    }
+}
+
+/// Inner executor for [`trace_live_block`]. See [`execute_staged_block`] for the
+/// rationale behind the helper-function pattern.
+fn execute_live_block<F, DB, R>(
+    tracer: &mut firehose_tracer::Tracer,
+    evm_config: &F,
+    db: &mut State<DB>,
+    block: &RecoveredBlock<<F::Primitives as NodePrimitives>::Block>,
+    receipts: &[R],
+) -> Result<(), BlockExecutionError>
+where
+    F: ConfigureEvm,
+    DB: reth_evm::Database,
+    BlockTy<F::Primitives>: BlockTrait,
+    <BlockTy<F::Primitives> as BlockTrait>::Header: BlockHeader + Sealable,
+    <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,
+    <<BlockTy<F::Primitives> as BlockTrait>::Body as BlockBody>::OmmerHeader:
+        BlockHeader + Sealable,
+    TxTy<F::Primitives>: Transaction + TxHashRef + SignatureFields,
+    R: TxReceipt<Log = Log>,
+{
     let evm_env = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?;
     let exec_ctx =
         evm_config.context_for_block(block.sealed_block()).map_err(BlockExecutionError::other)?;
 
     let inspector = FirehoseInspector::new(tracer);
-    let evm = evm_config.evm_with_env_and_inspector(&mut *db, evm_env, inspector);
+    let evm = evm_config.evm_with_env_and_inspector(db, evm_env, inspector);
     let mut executor = evm_config.create_executor(evm, exec_ctx);
 
     executor.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
@@ -374,13 +455,48 @@ where
 
     executor.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
 
-    executor.apply_post_execution_changes().map_err(BlockExecutionError::from)?;
+    // apply_post_execution_changes takes self, consuming the executor and dropping the
+    // inspector. The tracer borrow is released when this function returns.
+    executor.apply_post_execution_changes().map(|_| ()).map_err(BlockExecutionError::from)
+}
 
-    tracer.on_system_call_end();
-    tracer.on_block_end(None);
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-    db.merge_transitions(BundleRetention::Reverts);
-    Ok(())
+/// Emits withdrawal balance changes to the tracer after `apply_post_execution_changes` has run.
+///
+/// EIP-4895 validator withdrawals are applied via `db.increment_balances()` inside the executor's
+/// `finish()` call, bypassing the EVM journal entirely. The `FirehoseInspector` never sees them.
+/// This function bridges the gap: it reads the post-withdrawal balance for each withdrawal address
+/// directly from the DB (the borrow is released once the executor is dropped) and emits the
+/// corresponding `on_balance_change` events with `Reason::Withdrawal` before the system-call
+/// window closes, matching Geth's ordinal ordering.
+fn emit_withdrawal_balance_changes<DB>(
+    tracer: &mut firehose_tracer::Tracer,
+    db: &mut State<DB>,
+    withdrawals: Option<&Withdrawals>,
+) where
+    DB: reth_evm::Database,
+{
+    use firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason;
+
+    let Some(withdrawals) = withdrawals else { return };
+
+    // Aggregate per-address in case a single block contains multiple withdrawals to the same
+    // validator address (rare but valid per the spec).
+    let mut per_addr: HashMap<Address, u128> = HashMap::new();
+    for w in withdrawals.as_slice() {
+        if w.amount > 0 {
+            *per_addr.entry(w.address).or_default() += w.amount_wei().to::<u128>();
+        }
+    }
+
+    for (addr, total_wei) in per_addr {
+        let post = db.basic(addr).ok().flatten().map(|i| i.balance).unwrap_or_default();
+        let pre = post.saturating_sub(U256::from(total_wei));
+        tracer.on_balance_change(addr, pre, post, Reason::Withdrawal);
+    }
 }
 
 // ---------------------------------------------------------------------------
