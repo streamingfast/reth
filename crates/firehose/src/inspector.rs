@@ -488,8 +488,8 @@ impl<'a> FirehoseInspector<'a> {
                 auth_tracker.get_mut(&authority).unwrap();
 
             // 4. Code must be empty or an EIP-7702 delegation designator.
-            let code_eligible = *tracked_code_hash == KECCAK_EMPTY
-                || (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
+            let code_eligible = *tracked_code_hash == KECCAK_EMPTY ||
+                (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
             if !code_eligible {
                 continue;
             }
@@ -756,17 +756,17 @@ impl<'a> FirehoseInspector<'a> {
             InstructionResult::Revert => "execution reverted".to_string(),
             InstructionResult::CallTooDeep => "max call depth exceeded".to_string(),
             InstructionResult::OutOfFunds => "insufficient balance for transfer".to_string(),
-            InstructionResult::CreateInitCodeStartingEF00
-            | InstructionResult::InvalidEOFInitCode
-            | InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
+            InstructionResult::CreateInitCodeStartingEF00 |
+            InstructionResult::InvalidEOFInitCode |
+            InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
 
             // Out-of-gas variants — Geth distinguishes CREATE vs CALL context
-            InstructionResult::OutOfGas
-            | InstructionResult::MemoryOOG
-            | InstructionResult::MemoryLimitOOG
-            | InstructionResult::PrecompileOOG
-            | InstructionResult::InvalidOperandOOG
-            | InstructionResult::ReentrancySentryOOG => {
+            InstructionResult::OutOfGas |
+            InstructionResult::MemoryOOG |
+            InstructionResult::MemoryLimitOOG |
+            InstructionResult::PrecompileOOG |
+            InstructionResult::InvalidOperandOOG |
+            InstructionResult::ReentrancySentryOOG => {
                 if is_create {
                     "contract creation code storage out of gas".to_string()
                 } else {
@@ -779,8 +779,8 @@ impl<'a> FirehoseInspector<'a> {
             InstructionResult::InvalidJump => "invalid jump destination".to_string(),
             InstructionResult::StackOverflow => "stack limit reached 1024 (1023)".to_string(),
             InstructionResult::StackUnderflow => "stack underflow".to_string(),
-            InstructionResult::CallNotAllowedInsideStatic
-            | InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
+            InstructionResult::CallNotAllowedInsideStatic |
+            InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
             InstructionResult::CreateCollision => "contract address collision".to_string(),
             InstructionResult::CreateContractSizeLimit => "max code size exceeded".to_string(),
             InstructionResult::CreateContractStartingWithEF => {
@@ -1159,10 +1159,10 @@ where
         // - CreateCollision / OverflowPayment: create_account_checkpoint itself failed
         let skip_created_nonce = matches!(
             outcome.result.result,
-            InstructionResult::CallTooDeep
-                | InstructionResult::OutOfFunds
-                | InstructionResult::CreateCollision
-                | InstructionResult::OverflowPayment
+            InstructionResult::CallTooDeep |
+                InstructionResult::OutOfFunds |
+                InstructionResult::CreateCollision |
+                InstructionResult::OverflowPayment
         );
         if !skip_created_nonce {
             if let Some(address) = outcome.address {
@@ -1215,7 +1215,7 @@ where
         // On revert, the journal truncates logs back, so subsequent logs after
         // a revert get correct indices automatically.
         //
-        self.trx_logs_count = (context.journal().logs().len() as u32);
+        self.trx_logs_count = context.journal().logs().len() as u32;
         let block_index = self.trx_logs_count.saturating_sub(1) + self.log_block_index;
         self.tracer.on_log(log.address, log.topics(), &log.data.data, block_index);
     }
@@ -1232,6 +1232,68 @@ where
         // Depth doesn't affect SELFDESTRUCT handling so we use 1 (any non-zero value).
         self.tracer.on_call_enter(1, Opcode::SelfDestruct as u8, contract, target, &[], 0, value);
         self.tracer.on_call_exit(1, &[], 0, None, false);
+    }
+}
+
+/// Type-erased interface to a Firehose inspector, used by
+/// [`crate::executor::FirehoseWrappedExecutor`] to drive tracer hooks through the inspector that
+/// was installed into the EVM.
+///
+/// This trait exists because [`crate::executor::FirehoseWrappedExecutor`] parameterizes over an
+/// inner [`alloy_evm::block::BlockExecutor`] whose EVM's `Inspector` associated type is not the
+/// concrete [`FirehoseInspector`] directly — it is whatever type was plugged in through
+/// `evm_with_env_and_inspector`. This trait lets the wrapper bound `Inspector:
+/// FirehoseInspectorApi` to reach the tracer and the post-tx balance accounting without naming the
+/// concrete type.
+pub trait FirehoseInspectorApi {
+    /// Returns a mutable reference to the Firehose tracer, for direct event emission from the
+    /// executor wrapper (`on_system_call_start/end`, `on_tx_start/end`).
+    fn tracer_mut(&mut self) -> &mut firehose_tracer::Tracer;
+
+    /// Type-erased version of [`FirehoseInspector::process_post_tx_balance_changes`].
+    ///
+    /// `get_pre_tx_balance` is passed as a trait object so the call site does not need to be
+    /// generic over `F`, keeping the wrapper's signature free of extra type parameters.
+    #[allow(clippy::too_many_arguments)]
+    fn process_post_tx_balance_changes_erased(
+        &mut self,
+        sender: Address,
+        coinbase: Address,
+        gas_limit: u64,
+        gas_used: u64,
+        effective_gas_price: u128,
+        base_fee: u64,
+        committed_log_count: u32,
+        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
+    );
+}
+
+impl<'a> FirehoseInspectorApi for FirehoseInspector<'a> {
+    fn tracer_mut(&mut self) -> &mut firehose_tracer::Tracer {
+        self.tracer
+    }
+
+    fn process_post_tx_balance_changes_erased(
+        &mut self,
+        sender: Address,
+        coinbase: Address,
+        gas_limit: u64,
+        gas_used: u64,
+        effective_gas_price: u128,
+        base_fee: u64,
+        committed_log_count: u32,
+        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
+    ) {
+        self.process_post_tx_balance_changes(
+            sender,
+            coinbase,
+            gas_limit,
+            gas_used,
+            effective_gas_price,
+            base_fee,
+            committed_log_count,
+            |addr| get_pre_tx_balance(addr),
+        );
     }
 }
 

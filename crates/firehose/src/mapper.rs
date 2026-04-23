@@ -79,12 +79,12 @@ pub(crate) fn to_block_data<Node: FullNodeComponents>(block: &RecoveredBlock<Nod
     }
 }
 
-/// Returns block data from a `RecoveredBlock<B>` where `B` satisfies the
-/// `reth_primitives_traits::Block` trait bounds. This is the non-`Node`-specific version used in
-/// `FirehoseBlockExecutor`.
-pub(crate) fn to_block_data_generic<B>(
-    block: &reth_primitives_traits::RecoveredBlock<B>,
-) -> BlockData
+/// Returns block data from a `SealedBlock<B>`.
+///
+/// Signer-free — reads header fields, ommers, withdrawals, and RLP-encoded length only. Used by
+/// [`crate::block_tracer::FirehoseBlockTracer::start`] to emit `on_block_start` before
+/// transaction senders are recovered.
+pub(crate) fn to_block_data_sealed<B>(block: &reth_primitives_traits::SealedBlock<B>) -> BlockData
 where
     B: BlockTrait,
     B::Header: ConsensusBlockHeader + Sealable,
@@ -111,9 +111,9 @@ where
         mix_digest: header.mix_hash().unwrap_or_default(),
         nonce: header.nonce().map(|n| u64::from_be_bytes(n.into())).unwrap_or_default(),
         base_fee: header.base_fee_per_gas().map(U256::from),
-        size: block.sealed_block().length() as u64,
-        uncles: map_uncles_generic(block),
-        withdrawals: map_withdrawals_generic(block),
+        size: block.length() as u64,
+        uncles: map_uncles_sealed(block),
+        withdrawals: map_withdrawals_sealed(block),
         withdrawals_root: header.withdrawals_root(),
         blob_gas_used: header.blob_gas_used(),
         excess_blob_gas: header.excess_blob_gas(),
@@ -124,10 +124,9 @@ where
     }
 }
 
-/// Convenience wrapper: produces [`BlockData`] for any `NodePrimitives`-based block
-/// (the typical use-case for the execution-stage executor).
-pub fn to_block_data_eth<P>(
-    block: &reth_primitives_traits::RecoveredBlock<<P as NodePrimitives>::Block>,
+/// Convenience wrapper: produces [`BlockData`] for any `NodePrimitives`-based sealed block.
+pub fn to_block_data_eth_sealed<P>(
+    block: &reth_primitives_traits::SealedBlock<<P as NodePrimitives>::Block>,
 ) -> BlockData
 where
     P: NodePrimitives,
@@ -136,10 +135,10 @@ where
     <P::Block as BlockTrait>::Body: BlockBody,
     <<P::Block as BlockTrait>::Body as BlockBody>::OmmerHeader: ConsensusBlockHeader + Sealable,
 {
-    to_block_data_generic(block)
+    to_block_data_sealed(block)
 }
 
-fn map_uncles_generic<B>(block: &reth_primitives_traits::RecoveredBlock<B>) -> Vec<UncleData>
+fn map_uncles_sealed<B>(block: &reth_primitives_traits::SealedBlock<B>) -> Vec<UncleData>
 where
     B: BlockTrait,
     B::Body: BlockBody,
@@ -151,9 +150,7 @@ where
     ommers.iter().map(to_uncle_data).collect()
 }
 
-fn map_withdrawals_generic<B>(
-    block: &reth_primitives_traits::RecoveredBlock<B>,
-) -> Vec<WithdrawalData>
+fn map_withdrawals_sealed<B>(block: &reth_primitives_traits::SealedBlock<B>) -> Vec<WithdrawalData>
 where
     B: BlockTrait,
     B::Body: BlockBody,
@@ -171,15 +168,6 @@ where
             amount: w.amount,
         })
         .collect()
-}
-
-/// Returns zero-value (r, s, v) signature fields.
-///
-/// Used by `FirehoseBlockExecutor::execute_and_trace_one` which does not have access to the
-/// raw-encoded transaction bytes needed to recover the true signature.  The ExEx runner path
-/// (`runner::trace_block`) uses the real signature instead.
-pub(crate) fn zero_signature() -> (B256, B256, Bytes) {
-    (B256::ZERO, B256::ZERO, Bytes::new())
 }
 
 pub(crate) fn to_finalized_ref(

@@ -1,11 +1,43 @@
-//! Firehose block executor that traces EVM execution and emits FIRE lines.
+//! Firehose block executor wrappers and EVM config.
+//!
+//! This module provides:
+//!
+//! * [`FirehoseWrappedExecutor`] — a thin [`BlockExecutor`] wrapper that fires Firehose tracer
+//!   hooks (`on_system_call_start/end`, `on_tx_start/end`, post-tx balance changes, withdrawal
+//!   balance changes) around a delegate executor. The inner executor's EVM must carry a
+//!   [`FirehoseInspectorApi`]-capable inspector (i.e. a [`crate::inspector::FirehoseInspector`]).
+//!
+//! * [`FirehoseBlockExecutor`] — the pipeline [`Executor`] used by staged sync. It constructs a
+//!   [`FirehoseWrappedExecutor`] per block and defers the end-of-block flush until the caller
+//!   confirms post-execution validation succeeded.
+//!
+//! * [`FirehoseEvmConfig`] — a [`ConfigureEvm`] wrapper that routes `batch_executor` through
+//!   [`FirehoseBlockExecutor`] while leaving every other method untouched (live path wraps the
+//!   executor explicitly at its call site).
+//!
+//! ## Post-validation flush deferral (pipeline path)
+//!
+//! [`FirehoseBlockExecutor::execute_and_trace_one`] emits `on_block_start` and all mid-block
+//! events, but **does not flush** (`on_block_end(None)`) until one of:
+//!  * The next call to `execute_and_trace_one` — the previous block's validation already succeeded,
+//!    since an error between calls would have short-circuited the batch.
+//!  * [`Executor::into_state`] — the batch completed without error, so the last block is safe.
+//!
+//! If the executor is dropped before either, the stashed [`FirehoseBlockTracer`] is dropped,
+//! which emits `on_block_end(Some(err))` and discards the block.
 
 use std::{collections::HashMap, fmt::Debug};
 
-use crate::{block_tracer::FirehoseBlockTracer, mapper, mapper::SignatureFields};
+use crate::{
+    block_tracer::FirehoseBlockTracer, inspector::FirehoseInspectorApi, mapper,
+    mapper::SignatureFields,
+};
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction, TxReceipt};
 use alloy_eips::eip4895::Withdrawals;
-use alloy_evm::block::BlockExecutor as _;
+use alloy_evm::{
+    block::{BlockExecutor, CommitChanges, ExecutableTx},
+    RecoveredTx,
+};
 use alloy_primitives::{Address, Log, Sealable, U256};
 use reth_evm::{
     execute::{BlockExecutionError, Executor},
@@ -14,33 +46,237 @@ use reth_evm::{
 use reth_execution_types::BlockExecutionResult;
 use reth_node_api::NodePrimitives;
 use reth_primitives_traits::{Block as BlockTrait, BlockBody, BlockTy, RecoveredBlock, TxTy};
-use reth_revm::{db::states::bundle_state::BundleRetention, Database as _, State};
+use reth_revm::{
+    db::states::bundle_state::BundleRetention, revm::context::Block as RevmBlock, Database as _,
+    State,
+};
 
-/// A block executor that wraps a [`ConfigureEvm`] and, when the global tracer is
-/// initialized, fires Firehose tracer hooks around every block execution.
+/// A [`BlockExecutor`] wrapper that fires Firehose tracer hooks around a delegate executor.
 ///
-/// ## Post-validation flush deferral (pipeline path)
+/// The inner executor's EVM must have been configured with a [`FirehoseInspectorApi`]-capable
+/// inspector (see [`crate::inspector::FirehoseInspector`]) via `evm_with_env_and_inspector`. The
+/// wrapper drives the tracer through the inspector's `tracer_mut()` handle at the following
+/// points:
 ///
-/// [`Self::execute_and_trace_one`] emits `on_block_start` and all mid-block events for
-/// a block, but **does not flush** (`on_block_end(None)`) until one of:
+/// | Hook                               | When                                               |
+/// |------------------------------------|----------------------------------------------------|
+/// | `on_system_call_start/end`         | Around [`Self::apply_pre_execution_changes`] and   |
+/// |                                    | around the post-execution window inside            |
+/// |                                    | [`Self::finish`].                                  |
+/// | `on_tx_start`                      | Before executing each transaction (in              |
+/// |                                    | [`Self::execute_transaction_with_commit_condition`]).|
+/// | `process_post_tx_balance_changes`  | After `execute_transaction_without_commit`,        |
+/// |                                    | before `commit_transaction`.                       |
+/// | `on_tx_end(Some(receipt_data))`    | After `commit_transaction`.                        |
+/// | withdrawal balance changes         | After `finish()` returns, inside the wrapper's     |
+/// |                                    | `finish`, so they land in `block.balance_changes`. |
 ///
-/// * The next call to `execute_and_trace_one` on the same executor — which means the
-///   previous block's `validate_block_post_execution` (called by the caller between
-///   the two invocations) succeeded, since an error there aborts the batch.
-/// * [`Executor::into_state`] — which means the batch completed without any validation
-///   error, so the last block is also safe to flush.
-///
-/// If the executor is dropped without reaching either point (e.g. validation error
-/// short-circuits the caller), the stashed [`FirehoseBlockTracer`] is dropped instead,
-/// which emits `on_block_end(Some(err))` and discards the block so invalid blocks are
-/// never flushed downstream.
+/// The wrapper does **not** emit `on_block_start` / `on_block_end`; those are owned by the caller
+/// via [`FirehoseBlockTracer::start`] / [`FirehoseBlockTracer::mark_verified`] /
+/// [`FirehoseBlockTracer::mark_failed`] so they can be deferred past post-execution validation.
+pub struct FirehoseWrappedExecutor<Inner> {
+    inner: Inner,
+    withdrawals: Option<Withdrawals>,
+    /// Running count of logs emitted so far in this block, used to derive each receipt's
+    /// block-wide `log_index_start` when building `on_tx_end` receipt data.
+    log_index: u32,
+}
+
+impl Debug for FirehoseWrappedExecutor<()> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FirehoseWrappedExecutor").finish()
+    }
+}
+
+impl<Inner> FirehoseWrappedExecutor<Inner> {
+    /// Wraps `inner` with Firehose tracer hooks. `withdrawals` is consumed inside
+    /// [`Self::finish`] to emit per-address balance changes for EIP-4895 validator withdrawals.
+    pub const fn new(inner: Inner, withdrawals: Option<Withdrawals>) -> Self {
+        Self { inner, withdrawals, log_index: 0 }
+    }
+}
+
+impl<Inner> BlockExecutor for FirehoseWrappedExecutor<Inner>
+where
+    Inner: BlockExecutor,
+    Inner::Transaction: Transaction + TxHashRef + SignatureFields,
+    <Inner::Evm as reth_evm::Evm>::Inspector: FirehoseInspectorApi,
+    <Inner::Evm as reth_evm::Evm>::DB: reth_revm::Database,
+    Inner::Receipt: TxReceipt<Log = Log>,
+{
+    type Transaction = Inner::Transaction;
+    type Receipt = Inner::Receipt;
+    type Evm = Inner::Evm;
+    type Result = Inner::Result;
+
+    fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
+        self.inner.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
+        let res = self.inner.apply_pre_execution_changes();
+        self.inner.evm_mut().inspector_mut().tracer_mut().on_system_call_end();
+        res
+    }
+
+    fn execute_transaction_with_commit_condition(
+        &mut self,
+        tx: impl ExecutableTx<Self>,
+        f: impl FnOnce(
+            &reth_revm::revm::context::result::ExecutionResult<
+                <Self::Evm as reth_evm::Evm>::HaltReason,
+            >,
+        ) -> CommitChanges,
+    ) -> Result<Option<u64>, BlockExecutionError> {
+        use alloy_evm::block::TxResult as _;
+
+        let (tx_env, recovered) = tx.into_parts();
+
+        let sender: Address = *recovered.signer();
+        let tx_index = self.inner.receipts().len();
+
+        let (
+            is_dynamic_fee,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+            gas_price_opt,
+            gas_limit,
+            tx_event,
+        ) = {
+            let inner_tx: &Inner::Transaction = recovered.tx();
+            let (r, s, v) = inner_tx.signature_fields();
+            let tx_event = mapper::signed_tx_to_tx_event(inner_tx, sender, tx_index, r, s, v);
+            (
+                inner_tx.is_dynamic_fee(),
+                inner_tx.max_fee_per_gas(),
+                inner_tx.max_priority_fee_per_gas().unwrap_or(0),
+                inner_tx.gas_price(),
+                inner_tx.gas_limit(),
+                tx_event,
+            )
+        };
+
+        let base_fee = self.inner.evm().block().basefee();
+        let coinbase = self.inner.evm().block().beneficiary();
+
+        self.inner.evm_mut().inspector_mut().tracer_mut().on_tx_start(tx_event, None);
+
+        // Split execute_transaction into without_commit + commit so post-tx balance accounting
+        // can run in between.
+        let result = self.inner.execute_transaction_without_commit((tx_env, recovered))?;
+
+        let gas_used = result.result().result.gas_used();
+        // Committed log count: logs that survived after revert rollback; used to advance
+        // the block-wide log counter inside `process_post_tx_balance_changes`.
+        let committed_log_count = result.result().result.logs().len() as u32;
+
+        let effective_gas_price: u128 = if is_dynamic_fee {
+            std::cmp::min(max_fee_per_gas, base_fee as u128 + max_priority_fee_per_gas)
+        } else {
+            gas_price_opt.unwrap_or(0)
+        };
+
+        // Post-tx balance changes (gas refund to sender, priority fee to coinbase). The DB at
+        // this point reflects state up to but not including this transaction's commit, so
+        // db.basic(addr) reads the pre-tx balance.
+        {
+            let (evm_db, inspector, _) = self.inner.evm_mut().components_mut();
+            let mut get_pre = |addr: Address| -> U256 {
+                evm_db.basic(addr).ok().flatten().map(|i| i.balance).unwrap_or(U256::ZERO)
+            };
+            inspector.process_post_tx_balance_changes_erased(
+                sender,
+                coinbase,
+                gas_limit,
+                gas_used,
+                effective_gas_price,
+                base_fee,
+                committed_log_count,
+                &mut get_pre,
+            );
+        }
+
+        if !f(&result.result().result).should_commit() {
+            // Preserve the invariant that every on_tx_start is paired with on_tx_end.
+            let err = std::io::Error::other("transaction not committed");
+            self.inner.evm_mut().inspector_mut().tracer_mut().on_tx_end(None, Some(&err));
+            return Ok(None);
+        }
+
+        let gas_used_u64 = self.inner.commit_transaction(result)?;
+
+        let log_index_start = self.log_index;
+        let receipt_data = {
+            let committed =
+                self.inner.receipts().last().expect("commit_transaction pushed a receipt");
+            self.log_index += committed.logs().len() as u32;
+            mapper::to_receipt_data(committed, tx_index as u32, gas_used, log_index_start)
+        };
+        self.inner.evm_mut().inspector_mut().tracer_mut().on_tx_end(Some(&receipt_data), None);
+
+        Ok(Some(gas_used_u64))
+    }
+
+    fn execute_transaction_without_commit(
+        &mut self,
+        tx: impl ExecutableTx<Self>,
+    ) -> Result<Self::Result, BlockExecutionError> {
+        self.inner.execute_transaction_without_commit(tx)
+    }
+
+    fn commit_transaction(&mut self, output: Self::Result) -> Result<u64, BlockExecutionError> {
+        self.inner.commit_transaction(output)
+    }
+
+    fn finish(
+        mut self,
+    ) -> Result<(Self::Evm, BlockExecutionResult<Self::Receipt>), BlockExecutionError> {
+        // Open the post-execution system-call window (EIP-4895 withdrawals, EIP-7251 consolidation
+        // requests, etc.). Close it AFTER the inner finish so inner post-execution work lands
+        // inside the window.
+        self.inner.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
+
+        let (mut evm, exec_result) = self.inner.finish()?;
+
+        // Close the window before emitting withdrawal balance changes so that on_balance_change
+        // routes them to `block.balance_changes` (not `deferred_call_state`, which would be
+        // discarded).
+        evm.inspector_mut().tracer_mut().on_system_call_end();
+
+        // EIP-4895 validator withdrawals are applied via db.increment_balances() inside the
+        // inner finish(), bypassing the EVM journal — the inspector never sees them.
+        emit_withdrawal_balance_changes(&mut evm, self.withdrawals.as_ref());
+
+        Ok((evm, exec_result))
+    }
+
+    fn set_state_hook(&mut self, hook: Option<Box<dyn OnStateHook>>) {
+        self.inner.set_state_hook(hook);
+    }
+
+    fn evm_mut(&mut self) -> &mut Self::Evm {
+        self.inner.evm_mut()
+    }
+
+    fn evm(&self) -> &Self::Evm {
+        self.inner.evm()
+    }
+
+    fn receipts(&self) -> &[Self::Receipt] {
+        self.inner.receipts()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FirehoseBlockExecutor (pipeline Executor)
+// ---------------------------------------------------------------------------
+
+/// Pipeline [`Executor`] that runs each block through a [`FirehoseWrappedExecutor`] and defers
+/// the end-of-block flush until the caller confirms post-execution validation succeeded.
 pub struct FirehoseBlockExecutor<F, DB> {
     /// The underlying EVM configuration used to create block executors.
     pub strategy_factory: F,
     /// Revm state holding all accumulated changes across the batch.
     pub db: State<DB>,
     /// Tracer guard for the most recently executed block. Finalized by the next
-    /// `execute_and_trace_one` call or by `into_state` — see the struct-level docs.
+    /// `execute_and_trace_one` call or by `into_state` — see the module-level docs.
     pending_tracer: Option<FirehoseBlockTracer>,
 }
 
@@ -86,48 +322,67 @@ where
         Ok(result)
     }
 
-    /// Traces a block and defers `on_block_end(None)` until the caller has validated
-    /// the result.
-    ///
-    /// Reaching this call means the previous block (if any) passed its validation —
-    /// otherwise the caller would have returned an error rather than looping back in —
-    /// so we flush the previous block's `on_block_end(None)` here before starting the
-    /// next one. The new block's guard is stashed in `self.pending_tracer` and finalized
-    /// either by the next call to this method or by [`Self::into_state`]. If the caller
-    /// drops this executor without reaching either point (e.g. post-execution validation
-    /// fails), the stashed guard is dropped, which emits `on_block_end(Some(err))` and
-    /// discards the block.
+    /// Traces a block with Firehose hooks and defers `on_block_end(None)` until the caller has
+    /// validated the result. See the module-level docs for the deferral contract.
     fn execute_and_trace_one(
         &mut self,
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
-        if crate::GLOBAL_TRACER.get().is_none() {
+        if !crate::is_tracer_initialized() {
             return Err(BlockExecutionError::msg(
                 "FirehoseBlockExecutor requires the global tracer to be initialized for execute_and_trace_one",
             ));
         }
 
+        // The previous block has reached a point where the caller would have returned early on
+        // validation failure; since we've been called again, it passed and can be flushed.
         if let Some(prev) = self.pending_tracer.take() {
             prev.mark_verified();
         }
 
-        // In the pipeline / staged sync path, the block we're about to trace is by
-        // definition already finalized — staged sync only replays blocks up to the
-        // finalized head — so advertise it as the finalized ref in the block event.
+        // In the pipeline / staged sync path, the block we're about to trace is by definition
+        // already finalized — staged sync only replays blocks up to the finalized head — so
+        // advertise it as the finalized ref in the block event.
         let finalized = Some(firehose_tracer::types::FinalizedBlockRef {
-            number: block.number(),
+            number: block.header().number(),
             hash: Some(block.hash()),
         });
-        let mut tracer = FirehoseBlockTracer::start::<F::Primitives>(block, finalized);
-        match trace_block::<F, DB, <F::Primitives as NodePrimitives>::Receipt>(
-            &self.strategy_factory,
-            &mut self.db,
-            block,
-            None,
-            &mut tracer,
-        ) {
+        let mut tracer =
+            FirehoseBlockTracer::start::<F::Primitives>(block.sealed_block(), finalized);
+
+        // Genesis (block 1): on_genesis_block has already been flushed by start and
+        // there are no mid-block events to emit. Execute the block normally (for state mutations)
+        // without going through the wrapper; the tracer guard has `is_genesis() == true` and
+        // mark_verified is a no-op.
+        if tracer.is_genesis() {
+            let result = (|| -> Result<_, BlockExecutionError> {
+                let r = self
+                    .strategy_factory
+                    .executor_for_block(&mut self.db, block)
+                    .map_err(BlockExecutionError::other)?
+                    .execute_block(block.transactions_recovered())?;
+                self.db.merge_transitions(BundleRetention::Reverts);
+                Ok(r)
+            })();
+            return match result {
+                Ok(r) => {
+                    self.pending_tracer = Some(tracer);
+                    Ok(r)
+                }
+                Err(e) => {
+                    tracer.mark_failed(&e);
+                    Err(e)
+                }
+            };
+        }
+
+        let block_result =
+            run_wrapped_block::<F, DB>(&self.strategy_factory, &mut self.db, block, &mut tracer);
+
+        match block_result {
             Ok(result) => {
+                self.db.merge_transitions(BundleRetention::Reverts);
                 self.pending_tracer = Some(tracer);
                 Ok(result)
             }
@@ -171,29 +426,13 @@ where
     }
 }
 
-/// Executes a block with a [`crate::inspector::FirehoseInspector`] sourced from the provided
-/// [`FirehoseBlockTracer`], firing per-transaction and system-call tracer hooks.
-///
-/// This function is shared by both the pipeline ([`FirehoseBlockExecutor::execute_and_trace_one`])
-/// and the live engine path ([`crate::engine`], via payload validation). It deliberately does **not**
-/// emit `on_block_start` or `on_block_end` — those are owned by the caller via
-/// [`FirehoseBlockTracer::start`], [`FirehoseBlockTracer::mark_verified`] and
-/// [`FirehoseBlockTracer::mark_failed`] — so that callers can defer the end-of-block signal until
-/// after post-execution validation (receipt root, state root, consensus) has completed.
-///
-/// When `receipts` is `Some`, the tracer emits `on_tx_end` with receipts computed from the
-/// caller-provided slice (live path: receipts already validated by the preceding execution pass).
-/// When `None`, the tracer reconstructs them from each transaction's execution result
-/// (pipeline path: no prior receipts available).
-///
-/// State mutations (pre/post-execution changes, tx commits) are merged into `db` with
-/// [`BundleRetention::Reverts`] on success. On error, the bundle is left as-is so the caller can
-/// observe partial state for diagnostics.
-pub fn trace_block<F, DB, R>(
+/// Runs a single block through a [`FirehoseWrappedExecutor`] using the existing tracer guard for
+/// mid-block event emission. Does not emit `on_block_start`/`on_block_end` — those are owned by
+/// the caller via the [`FirehoseBlockTracer`] lifecycle.
+fn run_wrapped_block<F, DB>(
     evm_config: &F,
     db: &mut State<DB>,
     block: &RecoveredBlock<<F::Primitives as NodePrimitives>::Block>,
-    receipts: Option<&[R]>,
     tracer_guard: &mut FirehoseBlockTracer,
 ) -> Result<BlockExecutionResult<<F::Primitives as NodePrimitives>::Receipt>, BlockExecutionError>
 where
@@ -205,64 +444,6 @@ where
     <<BlockTy<F::Primitives> as BlockTrait>::Body as BlockBody>::OmmerHeader:
         BlockHeader + Sealable,
     TxTy<F::Primitives>: Transaction + TxHashRef + SignatureFields,
-    R: TxReceipt<Log = Log>,
-{
-    // Block 1 is the genesis marker: the live caller short-circuits here because the validation
-    // pass already produced receipts. The pipeline caller still has real transactions to execute,
-    // so fall through in that case. We distinguish by the presence of pre-computed receipts.
-    if tracer_guard.is_genesis() && receipts.is_some() {
-        return Ok(BlockExecutionResult {
-            receipts: Vec::new(),
-            requests: Default::default(),
-            gas_used: 0,
-            blob_gas_used: 0,
-        });
-    }
-
-    // Run all executor logic inside a helper function. When the helper returns (whether
-    // Ok or Err), its locals — including the executor and the FirehoseInspector that
-    // mutably borrows the tracer — are dropped. The tracer borrow is released before
-    // we touch `tracer_guard.tracer_mut()` again for post-execution emissions.
-    let block_result = execute_block_inner(tracer_guard, evm_config, db, block, receipts);
-
-    match block_result {
-        Ok(result) => {
-            // Tracer borrow released — safe to call directly.
-            // Close the post-execution system-call window FIRST so that
-            // self.transaction is None, then emit withdrawal balance changes so
-            // on_balance_change routes them to block.balance_changes (not
-            // deferred_call_state, which would be discarded by reset_transaction).
-            let tracer = tracer_guard.tracer_mut();
-            tracer.on_system_call_end();
-            emit_withdrawal_balance_changes(tracer, db, block.body().withdrawals());
-            db.merge_transitions(BundleRetention::Reverts);
-            Ok(result)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Core executor logic for [`trace_block`]. All locals (executor, inspector) are dropped on
-/// return so the mutable borrow on the tracer is released before the caller emits any further
-/// post-execution events.
-#[allow(clippy::too_many_arguments)]
-fn execute_block_inner<F, DB, R>(
-    tracer_guard: &mut FirehoseBlockTracer,
-    evm_config: &F,
-    db: &mut State<DB>,
-    block: &RecoveredBlock<<F::Primitives as NodePrimitives>::Block>,
-    receipts: Option<&[R]>,
-) -> Result<BlockExecutionResult<<F::Primitives as NodePrimitives>::Receipt>, BlockExecutionError>
-where
-    F: ConfigureEvm,
-    DB: reth_evm::Database,
-    BlockTy<F::Primitives>: BlockTrait,
-    <BlockTy<F::Primitives> as BlockTrait>::Header: BlockHeader + Sealable,
-    <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,
-    <<BlockTy<F::Primitives> as BlockTrait>::Body as BlockBody>::OmmerHeader:
-        BlockHeader + Sealable,
-    TxTy<F::Primitives>: Transaction + TxHashRef + SignatureFields,
-    R: TxReceipt<Log = Log>,
 {
     let evm_env = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?;
     let exec_ctx =
@@ -270,136 +451,34 @@ where
 
     let inspector = tracer_guard.inspector();
     let evm = evm_config.evm_with_env_and_inspector(db, evm_env, inspector);
-    let mut executor = evm_config.create_executor(evm, exec_ctx);
+    let inner = evm_config.create_executor(evm, exec_ctx);
 
-    // System calls (EIP-4788, EIP-2935, etc.)
-    executor.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
-    executor.apply_pre_execution_changes().map_err(BlockExecutionError::from)?;
-    executor.evm_mut().inspector_mut().tracer_mut().on_system_call_end();
+    let withdrawals = block.body().withdrawals().cloned();
+    let wrapped = FirehoseWrappedExecutor::new(inner, withdrawals);
 
-    let mut prev_cumulative_gas: u64 = 0;
-    let mut log_index: u32 = 0;
-
-    // EIP-4844: blob gas price is a block-level property derived from excess_blob_gas.
-    // None for pre-Cancun blocks that don't have this field.
-    let blob_gas_price: Option<U256> = block
-        .header()
-        .excess_blob_gas()
-        .map(|excess| U256::from(alloy_eips::eip4844::calc_blob_gasprice(excess)));
-
-    for (tx_index, recovered_tx) in block.transactions_recovered().enumerate() {
-        let tx: &TxTy<F::Primitives> = &**recovered_tx;
-
-        let (r, s, v) = tx.signature_fields();
-        let tx_event = mapper::signed_tx_to_tx_event(tx, recovered_tx.signer(), tx_index, r, s, v);
-        executor.evm_mut().inspector_mut().tracer_mut().on_tx_start(tx_event, None);
-
-        let tx_result = executor.execute_transaction_without_commit(recovered_tx).map_err(|e| {
-            BlockExecutionError::msg(format!("transaction execution failed: {e:?}"))
-        })?;
-
-        // Compute gas used and effective gas price, then emit post-tx balance changes (sender
-        // refund, miner fee). Both paths (caller-supplied receipts vs reconstructed-from-tx_result)
-        // use the same inspector bookkeeping.
-        let gas_used = {
-            use alloy_evm::block::TxResult as _;
-            tx_result.result().result.gas_used()
-        };
-        {
-            let sender = recovered_tx.signer();
-            let coinbase = block.header().beneficiary();
-            let gas_limit = tx.gas_limit();
-            let base_fee = block.header().base_fee_per_gas().unwrap_or(0);
-            let effective_gas_price: u128 = if tx.is_dynamic_fee() {
-                std::cmp::min(
-                    tx.max_fee_per_gas(),
-                    base_fee as u128 + tx.max_priority_fee_per_gas().unwrap_or(0),
-                )
-            } else {
-                tx.gas_price().unwrap_or(0)
-            };
-
-            // Committed log count from the ExecutionResult (empty on Revert/Halt).
-            let committed_log_count = {
-                use alloy_evm::block::TxResult as _;
-                tx_result.result().result.logs().len() as u32
-            };
-            let (evm_db, inspector, _) = executor.evm_mut().components_mut();
-            inspector.process_post_tx_balance_changes(
-                sender,
-                coinbase,
-                gas_limit,
-                gas_used,
-                effective_gas_price,
-                base_fee,
-                committed_log_count,
-                |addr| {
-                    evm_db.basic(addr).ok().flatten().map(|info| info.balance).unwrap_or(U256::ZERO)
-                },
-            );
-        }
-
-        executor
-            .commit_transaction(tx_result)
-            .map_err(|e| BlockExecutionError::msg(format!("transaction commit failed: {e:?}")))?;
-
-        // Build receipt_data for on_tx_end. If the caller supplied receipts (live path), use
-        // them for accurate cumulative gas and log data; otherwise reconstruct from the
-        // tx_result we just observed (pipeline path).
-        let mut receipt_data = if let Some(receipts) = receipts {
-            let receipt = &receipts[tx_index];
-            let cumulative_gas = receipt.cumulative_gas_used();
-            let actual_gas_used = cumulative_gas - prev_cumulative_gas;
-            let rd = mapper::to_receipt_data(receipt, tx_index as u32, actual_gas_used, log_index);
-            log_index += receipt.logs().len() as u32;
-            prev_cumulative_gas = cumulative_gas;
-            rd
-        } else {
-            let committed =
-                executor.receipts().last().expect("commit_transaction pushed a receipt");
-            let rd = mapper::to_receipt_data(committed, tx_index as u32, gas_used, log_index);
-            log_index += committed.logs().len() as u32;
-            prev_cumulative_gas += gas_used;
-            rd
-        };
-
-        // EIP-4844: populate blob gas fields for type-3 transactions.
-        if let Some(blob_gas_used) = tx.blob_gas_used() {
-            receipt_data.blob_gas_used = blob_gas_used;
-            receipt_data.blob_gas_price = blob_gas_price;
-        }
-
-        executor.evm_mut().inspector_mut().tracer_mut().on_tx_end(Some(&receipt_data), None);
-    }
-
-    executor.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
-
-    // apply_post_execution_changes takes self, consuming the executor and dropping the
-    // inspector. The tracer borrow is released when this function returns.
-    executor.apply_post_execution_changes().map_err(BlockExecutionError::from)
+    wrapped.execute_block(block.transactions_recovered())
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Emits withdrawal balance changes to the tracer after the post-execution system-call window
-/// has been closed (i.e. after `on_system_call_end` has been called).
+/// Emits EIP-4895 withdrawal balance changes to the tracer after the post-execution system-call
+/// window has closed.
 ///
-/// EIP-4895 validator withdrawals are applied via `db.increment_balances()` inside the executor's
-/// `finish()` call, bypassing the EVM journal entirely. The `FirehoseInspector` never sees them.
-/// This function bridges the gap by replaying withdrawals in order against the final DB state.
+/// Validator withdrawals are applied via `db.increment_balances()` inside the executor's
+/// `finish()`, bypassing the EVM journal entirely — the [`crate::inspector::FirehoseInspector`]
+/// never sees them. This function bridges the gap by walking the withdrawal list in reverse
+/// from the known post-all-withdrawals DB balance, reconstructing per-step pre/post pairs (see
+/// [`withdrawal_balance_events`]) so each event gets a distinct monotonically increasing ordinal.
 ///
 /// Must be called with `tracer.transaction == None` (i.e. outside any system-call window) so
-/// that `on_balance_change` routes the events to `block.balance_changes` directly. Calling it
-/// inside the system-call window causes the changes to land in `deferred_call_state`, which is
-/// discarded by `on_system_call_end`.
-fn emit_withdrawal_balance_changes<DB>(
-    tracer: &mut firehose_tracer::Tracer,
-    db: &mut State<DB>,
-    withdrawals: Option<&Withdrawals>,
-) where
-    DB: reth_evm::Database,
+/// that `on_balance_change` routes the events to `block.balance_changes` directly.
+fn emit_withdrawal_balance_changes<E>(evm: &mut E, withdrawals: Option<&Withdrawals>)
+where
+    E: reth_evm::Evm,
+    E::Inspector: FirehoseInspectorApi,
+    E::DB: reth_revm::Database,
 {
     use firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason;
 
@@ -409,12 +488,13 @@ fn emit_withdrawal_balance_changes<DB>(
         return;
     }
 
+    let (db, inspector, _) = evm.components_mut();
     let events = withdrawal_balance_events(withdrawals, |addr| {
         db.basic(addr).ok().flatten().map(|i| i.balance).unwrap_or_default()
     });
 
     for (addr, pre, post) in events {
-        tracer.on_balance_change(addr, pre, post, Reason::Withdrawal);
+        inspector.tracer_mut().on_balance_change(addr, pre, post, Reason::Withdrawal);
     }
 }
 
@@ -431,7 +511,6 @@ fn withdrawal_balance_events(
     withdrawals: &[alloy_eips::eip4895::Withdrawal],
     mut get_final_balance: impl FnMut(Address) -> U256,
 ) -> Vec<(Address, U256, U256)> {
-    // Seed the running balance map with the final DB value for every address that appears.
     let mut current: HashMap<Address, U256> = HashMap::new();
     for w in withdrawals {
         if w.amount > 0 {
@@ -439,7 +518,6 @@ fn withdrawal_balance_events(
         }
     }
 
-    // Walk backwards, peeling off each withdrawal to recover the per-step pre/post pair.
     let mut events: Vec<(Address, U256, U256)> = Vec::with_capacity(withdrawals.len());
     for w in withdrawals.iter().rev() {
         if w.amount == 0 {
@@ -459,7 +537,6 @@ fn withdrawal_balance_events(
 mod tests {
     use super::*;
     use alloy_eips::eip4895::Withdrawal;
-    use alloy_primitives::Address;
 
     fn addr(byte: u8) -> Address {
         Address::repeat_byte(byte)
@@ -473,11 +550,15 @@ mod tests {
         U256::from(gwei) * U256::from(1_000_000_000u64)
     }
 
-    fn make_withdrawal(index: u64, validator: u64, address: Address, amount_gwei: u64) -> Withdrawal {
+    fn make_withdrawal(
+        index: u64,
+        validator: u64,
+        address: Address,
+        amount_gwei: u64,
+    ) -> Withdrawal {
         Withdrawal { index, validator_index: validator, address, amount: amount_gwei }
     }
 
-    /// Calls `withdrawal_balance_events` with a fixed balance map.
     fn events_with_balances(
         withdrawals: &[Withdrawal],
         final_balances: &HashMap<Address, U256>,
@@ -492,7 +573,7 @@ mod tests {
         let a = addr(0xAA);
         let ws = [make_withdrawal(0, 0, a, gwei(100))];
         let mut finals = HashMap::new();
-        finals.insert(a, wei(1100)); // started at 1000, received 100 gwei
+        finals.insert(a, wei(1100));
 
         let events = events_with_balances(&ws, &finals);
 
@@ -501,28 +582,20 @@ mod tests {
 
     #[test]
     fn test_two_withdrawals_same_address_ordering() {
-        // W1: A +50 gwei, W2: A +150 gwei → final A = 1200
         let a = addr(0xAA);
-        let ws = [
-            make_withdrawal(0, 0, a, gwei(50)),
-            make_withdrawal(1, 0, a, gwei(150)),
-        ];
+        let ws = [make_withdrawal(0, 0, a, gwei(50)), make_withdrawal(1, 0, a, gwei(150))];
         let mut finals = HashMap::new();
-        finals.insert(a, wei(1200)); // started at 1000
+        finals.insert(a, wei(1200));
 
         let events = events_with_balances(&ws, &finals);
 
         assert_eq!(events.len(), 2);
-        // W1: pre=1000, post=1050
         assert_eq!(events[0], (a, wei(1000), wei(1050)));
-        // W2: pre=1050, post=1200
         assert_eq!(events[1], (a, wei(1050), wei(1200)));
     }
 
     #[test]
     fn test_interleaved_different_addresses() {
-        // W1: A +50, W2: B +20, W3: A +150
-        // Final: A=1200, B=220
         let a = addr(0xAA);
         let b = addr(0xBB);
         let ws = [
@@ -531,24 +604,21 @@ mod tests {
             make_withdrawal(2, 0, a, gwei(150)),
         ];
         let mut finals = HashMap::new();
-        finals.insert(a, wei(1200)); // started at 1000
-        finals.insert(b, wei(220));  // started at 200
+        finals.insert(a, wei(1200));
+        finals.insert(b, wei(220));
 
         let events = events_with_balances(&ws, &finals);
 
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0], (a, wei(1000), wei(1050))); // W1
-        assert_eq!(events[1], (b, wei(200),  wei(220)));  // W2
-        assert_eq!(events[2], (a, wei(1050), wei(1200))); // W3
+        assert_eq!(events[0], (a, wei(1000), wei(1050)));
+        assert_eq!(events[1], (b, wei(200), wei(220)));
+        assert_eq!(events[2], (a, wei(1050), wei(1200)));
     }
 
     #[test]
     fn test_zero_amount_withdrawals_skipped() {
         let a = addr(0xAA);
-        let ws = [
-            make_withdrawal(0, 0, a, 0),        // skipped
-            make_withdrawal(1, 0, a, gwei(100)),
-        ];
+        let ws = [make_withdrawal(0, 0, a, 0), make_withdrawal(1, 0, a, gwei(100))];
         let mut finals = HashMap::new();
         finals.insert(a, wei(1100));
 
@@ -572,7 +642,9 @@ mod tests {
 /// A thin wrapper around any [`ConfigureEvm`] that overrides [`ConfigureEvm::batch_executor`]
 /// to return a [`FirehoseBlockExecutor`] instead of the default `BasicBlockExecutor`.
 ///
-/// All other methods delegate directly to the inner config.
+/// All other methods delegate directly to the inner config. The live engine path (payload
+/// validator) constructs its wrapped executor explicitly, since `create_executor` cannot tighten
+/// its inspector bound via a trait override.
 #[derive(Clone, Debug)]
 pub struct FirehoseEvmConfig<F> {
     /// The wrapped EVM configuration.
@@ -581,7 +653,7 @@ pub struct FirehoseEvmConfig<F> {
 
 impl<F: ConfigureEvm> FirehoseEvmConfig<F> {
     /// Wraps an existing EVM configuration.
-    pub fn new(inner: F) -> Self {
+    pub const fn new(inner: F) -> Self {
         Self { inner }
     }
 }

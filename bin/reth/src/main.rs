@@ -8,10 +8,9 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
 use clap::Parser;
-use reth::FirehoseExecutorBuilder;
-use reth::cli::Cli;
+use reth::{cli::Cli, FirehoseExecutorBuilder};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
-use reth_node_ethereum::{EthereumNode, node::EthereumAddOns};
+use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
 use tracing::info;
 
 fn main() {

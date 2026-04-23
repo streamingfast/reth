@@ -5,7 +5,7 @@ use eyre::Context;
 use futures::StreamExt;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_forks::EthereumHardforks;
-use reth_evm::{block::TxResult as _, execute::BlockExecutor};
+use reth_evm::execute::BlockExecutor;
 use reth_exex::{ExExContext, ExExEvent};
 use reth_provider::{BlockIdReader, BlockReader, StateProviderBox, StateProviderFactory};
 use reth_revm::{database::StateProviderDatabase, revm::Database as _, State};
