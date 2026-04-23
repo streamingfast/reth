@@ -51,6 +51,46 @@ use reth_revm::{
     State,
 };
 
+/// Chain-specific hook that emits additional post-tx balance changes after the generic
+/// gas-refund-to-sender and priority-tip-to-coinbase emissions done by the inspector.
+///
+/// Fired by [`FirehoseWrappedExecutor`] once per transaction, immediately after
+/// [`FirehoseInspectorApi::process_post_tx_balance_changes_erased`] and before the transaction
+/// is committed to the state DB. The EVM context at that point still holds the current
+/// transaction in `ctx.tx()`, so implementations can read per-tx data (envelope, caller,
+/// etc.) via `evm.ctx()`.
+///
+/// The primary use case is OP Stack: `OpHandler::reward_beneficiary` credits the BaseFeeVault,
+/// L1FeeVault, and OperatorFeeVault predeploys via `Journal::balance_incr` during revm's
+/// post_execution phase, which fires no inspector hooks — so those vault credits are invisible
+/// to the tracer unless the chain integrator re-emits them via this hook.
+///
+/// Implementations typically call `evm.inspector_mut().tracer_mut().on_balance_change(...)`
+/// with `Reason::RewardTransactionFee` for each crediting.
+pub trait PostTxExtras<E>
+where
+    E: reth_evm::Evm,
+    E::Inspector: FirehoseInspectorApi,
+{
+    /// Emit chain-specific post-tx balance changes. `gas_used` is the post-refund gas
+    /// charged to the sender; `base_fee` is the block's EIP-1559 base fee (0 pre-London).
+    fn emit_post_tx_extras(&self, evm: &mut E, gas_used: u64, base_fee: u64);
+}
+
+/// No-op [`PostTxExtras`] used on Ethereum mainnet (and any chain whose fee distribution is
+/// already covered by the generic sender-refund + coinbase-tip emissions).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoPostTxExtras;
+
+impl<E> PostTxExtras<E> for NoPostTxExtras
+where
+    E: reth_evm::Evm,
+    E::Inspector: FirehoseInspectorApi,
+{
+    #[inline]
+    fn emit_post_tx_extras(&self, _evm: &mut E, _gas_used: u64, _base_fee: u64) {}
+}
+
 /// A [`BlockExecutor`] wrapper that fires Firehose tracer hooks around a delegate executor.
 ///
 /// The inner executor's EVM must have been configured with a [`FirehoseInspectorApi`]-capable
@@ -74,12 +114,18 @@ use reth_revm::{
 /// The wrapper does **not** emit `on_block_start` / `on_block_end`; those are owned by the caller
 /// via [`FirehoseBlockTracer::start`] / [`FirehoseBlockTracer::mark_verified`] /
 /// [`FirehoseBlockTracer::mark_failed`] so they can be deferred past post-execution validation.
-pub struct FirehoseWrappedExecutor<Inner> {
+///
+/// The `Extras` type parameter plugs in a chain-specific [`PostTxExtras`] hook that fires after
+/// the generic post-tx balance accounting, used by OP Stack variants to emit `RewardTransactionFee`
+/// entries for the BaseFeeVault / L1FeeVault / OperatorFeeVault predeploys. Defaults to
+/// [`NoPostTxExtras`] so the wrapper remains a pure mainnet Ethereum executor by default.
+pub struct FirehoseWrappedExecutor<Inner, Extras = NoPostTxExtras> {
     inner: Inner,
     withdrawals: Option<Withdrawals>,
     /// Running count of logs emitted so far in this block, used to derive each receipt's
     /// block-wide `log_index_start` when building `on_tx_end` receipt data.
     log_index: u32,
+    extras: Extras,
 }
 
 impl Debug for FirehoseWrappedExecutor<()> {
@@ -88,21 +134,37 @@ impl Debug for FirehoseWrappedExecutor<()> {
     }
 }
 
-impl<Inner> FirehoseWrappedExecutor<Inner> {
+impl<Inner> FirehoseWrappedExecutor<Inner, NoPostTxExtras> {
     /// Wraps `inner` with Firehose tracer hooks. `withdrawals` is consumed inside
     /// [`Self::finish`] to emit per-address balance changes for EIP-4895 validator withdrawals.
     pub const fn new(inner: Inner, withdrawals: Option<Withdrawals>) -> Self {
-        Self { inner, withdrawals, log_index: 0 }
+        Self { inner, withdrawals, log_index: 0, extras: NoPostTxExtras }
     }
 }
 
-impl<Inner> BlockExecutor for FirehoseWrappedExecutor<Inner>
+impl<Inner, Extras> FirehoseWrappedExecutor<Inner, Extras> {
+    /// Same as [`Self::new`] but lets the caller supply a [`PostTxExtras`] hook that fires after
+    /// the generic per-tx balance accounting. Used by OP Stack variants to emit the three fee
+    /// vault balance changes that are otherwise invisible to the tracer (they originate from
+    /// `Journal::balance_incr` calls inside the OP handler's `reward_beneficiary`, which revm
+    /// runs during post_execution with no inspector hooks).
+    pub const fn with_extras(
+        inner: Inner,
+        withdrawals: Option<Withdrawals>,
+        extras: Extras,
+    ) -> Self {
+        Self { inner, withdrawals, log_index: 0, extras }
+    }
+}
+
+impl<Inner, Extras> BlockExecutor for FirehoseWrappedExecutor<Inner, Extras>
 where
     Inner: BlockExecutor,
     Inner::Transaction: Transaction + TxHashRef + SignatureFields,
     <Inner::Evm as reth_evm::Evm>::Inspector: FirehoseInspectorApi,
     <Inner::Evm as reth_evm::Evm>::DB: reth_revm::Database,
     Inner::Receipt: TxReceipt<Log = Log>,
+    Extras: PostTxExtras<Inner::Evm>,
 {
     type Transaction = Inner::Transaction;
     type Receipt = Inner::Receipt;
@@ -192,6 +254,11 @@ where
                 &mut get_pre,
             );
         }
+
+        // Chain-specific post-tx balance emissions (e.g. OP Stack fee vault credits). Runs after
+        // the generic gas-refund / coinbase-tip emissions so ordinal ordering matches the handler
+        // order: mainnet `reward_beneficiary` (coinbase) → OP `balance_incr` (fee vaults).
+        self.extras.emit_post_tx_extras(self.inner.evm_mut(), gas_used, base_fee);
 
         if !f(&result.result().result).should_commit() {
             // Preserve the invariant that every on_tx_start is paired with on_tx_end.
