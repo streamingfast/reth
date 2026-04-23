@@ -4,6 +4,7 @@ use firehose_tracer::{
     types::{Opcode, StringError},
 };
 use reth_revm::revm::{
+    context::JournalEntry,
     context_interface::{ContextTr, JournalTr},
     inspector::{Inspector, JournalExt},
     interpreter::{
@@ -55,6 +56,12 @@ pub struct FirehoseInspector<'a> {
     /// where nonce resets and code clears happen after gas accounting.
     pending_selfdestruct_cleanups: Vec<SelfdestructCleanupEntry>,
 
+    /// Flat snapshot of all committed journal entries for the current transaction, captured
+    /// at root call/create exit (after execution, before revm's post-execution runs).
+    /// Used in `process_post_tx_balance_changes` to derive correct sender/coinbase balances
+    /// even when the root call reverted and `balance_tracker` is stale.
+    tx_journal_snapshot: Vec<JournalEntry>,
+
     // increments at the end of each transaction, to get proper block index for logs
     log_block_index: u32,
 
@@ -70,6 +77,7 @@ impl<'a> Debug for FirehoseInspector<'a> {
             .field("balance_tracker_keys", &self.balance_tracker.keys())
             .field("pending_value_transfer_check", &self.pending_value_transfer_check)
             .field("selfdestruct_addresses", &self.selfdestruct_addresses)
+            .field("tx_journal_snapshot_len", &self.tx_journal_snapshot.len())
             .finish()
     }
 }
@@ -93,6 +101,7 @@ impl<'a> FirehoseInspector<'a> {
             pending_value_transfer_check: false,
             selfdestruct_addresses: HashSet::new(),
             pending_selfdestruct_cleanups: Vec::new(),
+            tx_journal_snapshot: Vec::new(),
             log_block_index: 0,
             trx_logs_count: 0,
         }
@@ -555,17 +564,69 @@ impl<'a> FirehoseInspector<'a> {
         }
     }
 
+    /// Derive an address's balance at the end of EVM execution by replaying the committed
+    /// journal entries for the transaction.
+    ///
+    /// The snapshot is captured at root call/create exit — after execution but before revm's
+    /// post-execution (reimburse_caller / reward_beneficiary). Replaying it produces the
+    /// correct balance to use as `old_balance` for the gas-refund and coinbase-reward events.
+    ///
+    /// For the sender, `gas_buy_cost` (= gas_limit × effective_gas_price) is needed to
+    /// convert the `BalanceChange { old_balance }` gas-buy entry into the post-gas-buy balance.
+    /// For coinbase (which has no gas-buy BalanceChange), pass `U256::ZERO`.
+    fn resolve_post_tx_balance(
+        address: Address,
+        gas_buy_cost: U256,
+        tx_journal: &[JournalEntry],
+        get_pre_tx_balance: &mut impl FnMut(Address) -> U256,
+    ) -> U256 {
+        let mut balance: Option<U256> = None;
+
+        for entry in tx_journal {
+            match entry {
+                // Gas buy (deduct_caller) is always the first BalanceChange for the sender.
+                // Recover the post-gas-buy balance: old_balance − gas_buy_cost.
+                // Only applied when balance is still None (i.e. this is the first entry for
+                // this address); subsequent BalanceChange entries (e.g. from custom precompiles
+                // or future EIPs) have unknown deltas and are skipped to avoid corrupting the
+                // running balance with the wrong formula.
+                JournalEntry::BalanceChange { address: a, old_balance }
+                    if *a == address && balance.is_none() =>
+                {
+                    balance = Some(old_balance.saturating_sub(gas_buy_cost));
+                }
+                JournalEntry::BalanceTransfer { from, to, balance: amount } => {
+                    if *from == address {
+                        let b = balance.get_or_insert_with(|| get_pre_tx_balance(address));
+                        *b = b.saturating_sub(*amount);
+                    }
+                    if *to == address {
+                        let b = balance.get_or_insert_with(|| get_pre_tx_balance(address));
+                        *b = b.saturating_add(*amount);
+                    }
+                }
+                // SELFDESTRUCT: contract's balance was zeroed.
+                JournalEntry::AccountDestroyed { address: a, .. } if *a == address => {
+                    balance = Some(U256::ZERO);
+                }
+                _ => {}
+            }
+        }
+
+        balance.unwrap_or_else(|| get_pre_tx_balance(address))
+    }
+
     /// Emit post-execution balance changes: gas refund to sender and miner fee to coinbase.
     ///
     /// In Geth, these are emitted by `OnBalanceChange` hooks inside `reimburse_caller` and
     /// `reward_beneficiary`. In revm, no inspector hooks fire during post_execution, so we
     /// explicitly compute and emit them using the Ethereum gas accounting rules.
     ///
-    /// Must be called after `execute_transaction_without_commit` returns. Uses `balance_tracker`
-    /// for the sender's last-known balance and `get_pre_tx_balance` for the coinbase's pre-tx
-    /// balance (State<DB> still holds pre-tx balances at this point).
+    /// Must be called after `execute_transaction_without_commit` returns. Uses the committed
+    /// journal snapshot (captured at root call/create exit) to derive correct balances even
+    /// when the root call reverted and `balance_tracker` would be stale.
     ///
-    /// Resets `balance_tracker`, `code_change_tracker`, and `journal_processed_up_to`
+    /// Resets `balance_tracker`, `tx_journal_snapshot`, and `journal_processed_up_to`
     /// so the inspector is ready for the next transaction.
     pub fn process_post_tx_balance_changes<F>(
         &mut self,
@@ -582,19 +643,26 @@ impl<'a> FirehoseInspector<'a> {
     {
         use pb::sf::ethereum::r#type::v2::balance_change::Reason;
 
+        let gas_buy_cost = U256::from(gas_limit) * U256::from(effective_gas_price);
+        let remaining_gas = gas_limit.saturating_sub(gas_used);
+        let refund_amount = U256::from(remaining_gas) * U256::from(effective_gas_price);
+
+        // Derive sender's balance after execution (before gas refund) from the committed
+        // journal snapshot. This is correct even for reverted transactions where
+        // balance_tracker would hold stale intermediate values.
+        let sender_balance = Self::resolve_post_tx_balance(
+            sender,
+            gas_buy_cost,
+            &self.tx_journal_snapshot,
+            &mut get_pre_tx_balance,
+        );
+
         // Gas refund to sender: reimburse unused gas at effective_gas_price.
         // gas_used from ExecutionResult already accounts for the capped refund counter,
         // so remaining_gas = gas_limit - gas_used includes both unspent gas and EVM refunds.
-        let remaining_gas = gas_limit.saturating_sub(gas_used);
         if remaining_gas > 0 {
-            let refund_amount = U256::from(remaining_gas) * U256::from(effective_gas_price);
-            let old_balance = self
-                .balance_tracker
-                .get(&sender)
-                .copied()
-                .unwrap_or_else(|| get_pre_tx_balance(sender));
-            let new_balance = old_balance + refund_amount;
-            self.tracer.on_balance_change(sender, old_balance, new_balance, Reason::GasRefund);
+            let new_balance = sender_balance + refund_amount;
+            self.tracer.on_balance_change(sender, sender_balance, new_balance, Reason::GasRefund);
         }
 
         // Coinbase reward: the priority fee portion of consumed gas.
@@ -603,15 +671,26 @@ impl<'a> FirehoseInspector<'a> {
         let priority_fee_per_gas = effective_gas_price.saturating_sub(base_fee as u128);
         if gas_used > 0 && priority_fee_per_gas > 0 {
             let reward_amount = U256::from(gas_used) * U256::from(priority_fee_per_gas);
-            let old_balance = self
-                .balance_tracker
-                .get(&coinbase)
-                .copied()
-                .unwrap_or_else(|| get_pre_tx_balance(coinbase));
-            let new_balance = old_balance + reward_amount;
+
+            // When sender == coinbase, the gas refund event was emitted first; use the
+            // sender's updated balance as the coinbase's old_balance. Otherwise derive
+            // independently from the journal snapshot (coinbase has no gas-buy BalanceChange,
+            // so gas_buy_cost is zero).
+            let coinbase_balance = if sender == coinbase {
+                sender_balance + refund_amount
+            } else {
+                Self::resolve_post_tx_balance(
+                    coinbase,
+                    U256::ZERO,
+                    &self.tx_journal_snapshot,
+                    &mut get_pre_tx_balance,
+                )
+            };
+
+            let new_balance = coinbase_balance + reward_amount;
             self.tracer.on_balance_change(
                 coinbase,
-                old_balance,
+                coinbase_balance,
                 new_balance,
                 Reason::RewardTransactionFee,
             );
@@ -638,6 +717,7 @@ impl<'a> FirehoseInspector<'a> {
         self.balance_tracker.clear();
         self.selfdestruct_addresses.clear();
         self.journal_processed_up_to = 0;
+        self.tx_journal_snapshot.clear();
 
         // Advance the block-wide log counter by the COMMITTED log count, not by the
         // cached `trx_logs_count` which reflects `journal.logs().len()` at the last log
@@ -945,6 +1025,14 @@ where
             self.capture_selfdestruct_cleanup(context);
         }
 
+        // At root call exit, snapshot the committed journal. This is captured after
+        // process_journal_changes and before revm's post-execution (reimburse_caller /
+        // reward_beneficiary), giving process_post_tx_balance_changes the correct
+        // sender/coinbase balances to use as old_balance for gas refund and miner reward.
+        if depth == 0 {
+            self.tx_journal_snapshot = context.journal().journal().to_vec();
+        }
+
         // The `reverted` parameter in on_call_exit means "did the call fail"
         // (any failure), not specifically "was it a REVERT opcode". The tracer
         // internally distinguishes reverts from other failures via the error string.
@@ -1098,6 +1186,12 @@ where
         // (same rationale as in call_end — emission deferred to process_post_tx_balance_changes).
         if depth == 0 && !self.selfdestruct_addresses.is_empty() {
             self.capture_selfdestruct_cleanup(context);
+        }
+
+        // Same rationale as in call_end: snapshot the committed journal at root exit so
+        // process_post_tx_balance_changes can derive correct post-execution balances.
+        if depth == 0 {
+            self.tx_journal_snapshot = context.journal().journal().to_vec();
         }
 
         self.tracer.on_call_exit(
