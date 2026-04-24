@@ -17,8 +17,8 @@ pub mod runner;
 
 pub use block_tracer::FirehoseBlockTracer;
 pub use executor::{
-    FirehoseBlockExecutor, FirehoseEvmConfig, FirehoseWrappedExecutor, NoPostTxExtras,
-    NoPreTxAdjust, PostTxExtras, PreTxAdjust,
+    ChainHooks, FirehoseBlockExecutor, FirehoseEvmConfig, FirehoseWrappedExecutor, NoChainHooks,
+    NoPostTxExtras, NoPreTxAdjust, PostTxExtras, PreTxAdjust,
 };
 pub use runner::run_exex;
 
