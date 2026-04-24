@@ -36,11 +36,6 @@ pub struct FirehoseInspector<'a> {
     /// Advances at each call/create entry and exit to avoid processing the same entries twice.
     journal_processed_up_to: usize,
 
-    /// Tracks the last balance emitted for each address within the current transaction.
-    /// Used to determine the delta for post-execution balance changes (gas refund, miner fee)
-    /// that happen after all inspector call hooks but before commit.
-    balance_tracker: HashMap<Address, U256>,
-
     /// When true, the next `step` call should process journal changes to pick up
     /// the value transfer BalanceTransfer entry pushed by frame_init AFTER the
     /// call/create hook returned. This ensures value transfers for ALL calls
@@ -74,7 +69,6 @@ impl<'a> Debug for FirehoseInspector<'a> {
         f.debug_struct("FirehoseInspector")
             .field("last_step", &self.last_step.as_ref().map(|s| s.opcode))
             .field("journal_processed_up_to", &self.journal_processed_up_to)
-            .field("balance_tracker_keys", &self.balance_tracker.keys())
             .field("pending_value_transfer_check", &self.pending_value_transfer_check)
             .field("selfdestruct_addresses", &self.selfdestruct_addresses)
             .field("tx_journal_snapshot_len", &self.tx_journal_snapshot.len())
@@ -97,7 +91,6 @@ impl<'a> FirehoseInspector<'a> {
             tracer,
             last_step: None,
             journal_processed_up_to: 0,
-            balance_tracker: HashMap::new(),
             pending_value_transfer_check: false,
             selfdestruct_addresses: HashSet::new(),
             pending_selfdestruct_cleanups: Vec::new(),
@@ -202,7 +195,6 @@ impl<'a> FirehoseInspector<'a> {
                         .unwrap_or(U256::ZERO);
                     if old_balance != new_balance {
                         self.tracer.on_balance_change(address, old_balance, new_balance, reason);
-                        self.balance_tracker.insert(address, new_balance);
                     }
                 }
                 JournalEntry::BalanceTransfer { from, to, balance } => {
@@ -216,9 +208,7 @@ impl<'a> FirehoseInspector<'a> {
                         let old_to = new_to.saturating_sub(balance);
 
                         self.tracer.on_balance_change(from, old_from, new_from, reason);
-                        self.balance_tracker.insert(from, new_from);
                         self.tracer.on_balance_change(to, old_to, new_to, reason);
-                        self.balance_tracker.insert(to, new_to);
                     }
                 }
                 JournalEntry::NonceChange { address, previous_nonce } => {
@@ -306,7 +296,6 @@ impl<'a> FirehoseInspector<'a> {
                             U256::ZERO,
                             Reason::SuicideWithdraw,
                         );
-                        self.balance_tracker.insert(*address, U256::ZERO);
 
                         if address != target {
                             // Target received the balance (already mutated by revm)
@@ -323,7 +312,6 @@ impl<'a> FirehoseInspector<'a> {
                                 target_balance,
                                 Reason::SuicideRefund,
                             );
-                            self.balance_tracker.insert(*target, target_balance);
                         }
                         // Self-beneficiary locally created (address == target): only the
                         // initial WITHDRAW is emitted. Geth 1.17.x does not emit the
@@ -351,7 +339,6 @@ impl<'a> FirehoseInspector<'a> {
                             from_balance,
                             Reason::SuicideWithdraw,
                         );
-                        self.balance_tracker.insert(*from, from_balance);
 
                         let to_balance = context
                             .journal()
@@ -365,7 +352,6 @@ impl<'a> FirehoseInspector<'a> {
                             to_balance,
                             Reason::SuicideRefund,
                         );
-                        self.balance_tracker.insert(*to, to_balance);
                     }
 
                     found = true;
@@ -488,8 +474,8 @@ impl<'a> FirehoseInspector<'a> {
                 auth_tracker.get_mut(&authority).unwrap();
 
             // 4. Code must be empty or an EIP-7702 delegation designator.
-            let code_eligible = *tracked_code_hash == KECCAK_EMPTY ||
-                (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
+            let code_eligible = *tracked_code_hash == KECCAK_EMPTY
+                || (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
             if !code_eligible {
                 continue;
             }
@@ -620,6 +606,9 @@ impl<'a> FirehoseInspector<'a> {
                 _ => {}
             }
         }
+        if balance.is_none() {
+            firehose_tracer::firehose_debug!("balance is none for address: {:?}", address);
+        }
 
         balance.unwrap_or_else(|| get_pre_tx_balance(address))
     }
@@ -722,7 +711,6 @@ impl<'a> FirehoseInspector<'a> {
             }
         }
 
-        self.balance_tracker.clear();
         self.selfdestruct_addresses.clear();
         self.journal_processed_up_to = 0;
         self.tx_journal_snapshot.clear();
@@ -764,17 +752,17 @@ impl<'a> FirehoseInspector<'a> {
             InstructionResult::Revert => "execution reverted".to_string(),
             InstructionResult::CallTooDeep => "max call depth exceeded".to_string(),
             InstructionResult::OutOfFunds => "insufficient balance for transfer".to_string(),
-            InstructionResult::CreateInitCodeStartingEF00 |
-            InstructionResult::InvalidEOFInitCode |
-            InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
+            InstructionResult::CreateInitCodeStartingEF00
+            | InstructionResult::InvalidEOFInitCode
+            | InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
 
             // Out-of-gas variants — Geth distinguishes CREATE vs CALL context
-            InstructionResult::OutOfGas |
-            InstructionResult::MemoryOOG |
-            InstructionResult::MemoryLimitOOG |
-            InstructionResult::PrecompileOOG |
-            InstructionResult::InvalidOperandOOG |
-            InstructionResult::ReentrancySentryOOG => {
+            InstructionResult::OutOfGas
+            | InstructionResult::MemoryOOG
+            | InstructionResult::MemoryLimitOOG
+            | InstructionResult::PrecompileOOG
+            | InstructionResult::InvalidOperandOOG
+            | InstructionResult::ReentrancySentryOOG => {
                 if is_create {
                     "contract creation code storage out of gas".to_string()
                 } else {
@@ -787,8 +775,8 @@ impl<'a> FirehoseInspector<'a> {
             InstructionResult::InvalidJump => "invalid jump destination".to_string(),
             InstructionResult::StackOverflow => "stack limit reached 1024 (1023)".to_string(),
             InstructionResult::StackUnderflow => "stack underflow".to_string(),
-            InstructionResult::CallNotAllowedInsideStatic |
-            InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
+            InstructionResult::CallNotAllowedInsideStatic
+            | InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
             InstructionResult::CreateCollision => "contract address collision".to_string(),
             InstructionResult::CreateContractSizeLimit => "max code size exceeded".to_string(),
             InstructionResult::CreateContractStartingWithEF => {
@@ -928,7 +916,6 @@ where
                         new_balance,
                         pb::sf::ethereum::r#type::v2::balance_change::Reason::GasBuy,
                     );
-                    self.balance_tracker.insert(inputs.caller, new_balance);
                 }
 
                 // Nonce bump from deduct_caller (CALL transactions) or
@@ -1103,7 +1090,6 @@ where
                         new_balance,
                         pb::sf::ethereum::r#type::v2::balance_change::Reason::GasBuy,
                     );
-                    self.balance_tracker.insert(inputs.caller(), new_balance);
                 }
 
                 // Nonce bump from deduct_caller (only for CALL txs; for CREATE txs
@@ -1167,10 +1153,10 @@ where
         // - CreateCollision / OverflowPayment: create_account_checkpoint itself failed
         let skip_created_nonce = matches!(
             outcome.result.result,
-            InstructionResult::CallTooDeep |
-                InstructionResult::OutOfFunds |
-                InstructionResult::CreateCollision |
-                InstructionResult::OverflowPayment
+            InstructionResult::CallTooDeep
+                | InstructionResult::OutOfFunds
+                | InstructionResult::CreateCollision
+                | InstructionResult::OverflowPayment
         );
         if !skip_created_nonce {
             if let Some(address) = outcome.address {
