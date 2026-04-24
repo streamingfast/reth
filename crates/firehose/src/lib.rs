@@ -16,7 +16,10 @@ pub mod prelude;
 pub mod runner;
 
 pub use block_tracer::FirehoseBlockTracer;
-pub use executor::{FirehoseEvmConfig, FirehoseWrappedExecutor, NoPostTxExtras, PostTxExtras};
+pub use executor::{
+    FirehoseEvmConfig, FirehoseWrappedExecutor, NoPostTxExtras, NoPreTxAdjust, PostTxExtras,
+    PreTxAdjust,
+};
 pub use runner::run_exex;
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};

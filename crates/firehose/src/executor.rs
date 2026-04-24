@@ -91,6 +91,56 @@ where
     fn emit_post_tx_extras(&self, _evm: &mut E, _gas_used: u64, _base_fee: u64) {}
 }
 
+/// Chain-specific hook that patches the per-tx [`firehose_tracer::types::TxEvent`] produced by
+/// the generic envelope-derived mapper before it is handed to the tracer via `on_tx_start`.
+///
+/// Parallel to [`PostTxExtras`] but running at a different point in the tx lifecycle: after
+/// [`mapper::signed_tx_to_tx_event`] builds the event from the envelope, but before the event is
+/// consumed by the tracer. At this point the DB reflects pre-tx state, so implementations can
+/// read account data (nonce, code, balance) to fill in fields the envelope itself does not
+/// carry.
+///
+/// The primary use case is OP Stack deposit transactions: [`alloy_op_consensus::TxDeposit`]
+/// carries no `nonce` field on the envelope — its `Transaction::nonce()` impl returns a literal
+/// `0` — so the event reaches the tracer with nonce 0. The real nonce is the sender account's
+/// pre-execution nonce (post-Regolith the state transition increments it as part of the deposit).
+/// Implementations fetch it via `evm.db_mut().basic(sender).nonce`.
+pub trait PreTxAdjust<E>
+where
+    E: reth_evm::Evm,
+    E::Inspector: FirehoseInspectorApi,
+{
+    /// Mutate `tx_event` in place. `sender` is the recovered signer; `evm` exposes pre-tx state
+    /// for DB reads. Implementations should leave the event untouched for tx types they do not
+    /// care about.
+    fn adjust_tx_event(
+        &self,
+        evm: &mut E,
+        tx_event: &mut firehose_tracer::types::TxEvent,
+        sender: Address,
+    );
+}
+
+/// No-op [`PreTxAdjust`] used on Ethereum mainnet (and any chain whose envelope already carries
+/// every field the tracer needs).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoPreTxAdjust;
+
+impl<E> PreTxAdjust<E> for NoPreTxAdjust
+where
+    E: reth_evm::Evm,
+    E::Inspector: FirehoseInspectorApi,
+{
+    #[inline]
+    fn adjust_tx_event(
+        &self,
+        _evm: &mut E,
+        _tx_event: &mut firehose_tracer::types::TxEvent,
+        _sender: Address,
+    ) {
+    }
+}
+
 /// A [`BlockExecutor`] wrapper that fires Firehose tracer hooks around a delegate executor.
 ///
 /// The inner executor's EVM must have been configured with a [`FirehoseInspectorApi`]-capable
@@ -119,13 +169,19 @@ where
 /// the generic post-tx balance accounting, used by OP Stack variants to emit `RewardTransactionFee`
 /// entries for the BaseFeeVault / L1FeeVault / OperatorFeeVault predeploys. Defaults to
 /// [`NoPostTxExtras`] so the wrapper remains a pure mainnet Ethereum executor by default.
-pub struct FirehoseWrappedExecutor<Inner, Extras = NoPostTxExtras> {
+///
+/// The `Adjust` type parameter plugs in a chain-specific [`PreTxAdjust`] hook that can patch the
+/// per-tx [`firehose_tracer::types::TxEvent`] before it is handed to the tracer, used by OP Stack
+/// variants to overwrite the deposit-tx nonce (deposit envelopes carry no nonce — the effective
+/// value lives on the sender account). Defaults to [`NoPreTxAdjust`].
+pub struct FirehoseWrappedExecutor<Inner, Extras = NoPostTxExtras, Adjust = NoPreTxAdjust> {
     inner: Inner,
     withdrawals: Option<Withdrawals>,
     /// Running count of logs emitted so far in this block, used to derive each receipt's
     /// block-wide `log_index_start` when building `on_tx_end` receipt data.
     log_index: u32,
     extras: Extras,
+    adjust: Adjust,
 }
 
 impl Debug for FirehoseWrappedExecutor<()> {
@@ -134,15 +190,21 @@ impl Debug for FirehoseWrappedExecutor<()> {
     }
 }
 
-impl<Inner> FirehoseWrappedExecutor<Inner, NoPostTxExtras> {
+impl<Inner> FirehoseWrappedExecutor<Inner, NoPostTxExtras, NoPreTxAdjust> {
     /// Wraps `inner` with Firehose tracer hooks. `withdrawals` is consumed inside
     /// [`Self::finish`] to emit per-address balance changes for EIP-4895 validator withdrawals.
     pub const fn new(inner: Inner, withdrawals: Option<Withdrawals>) -> Self {
-        Self { inner, withdrawals, log_index: 0, extras: NoPostTxExtras }
+        Self {
+            inner,
+            withdrawals,
+            log_index: 0,
+            extras: NoPostTxExtras,
+            adjust: NoPreTxAdjust,
+        }
     }
 }
 
-impl<Inner, Extras> FirehoseWrappedExecutor<Inner, Extras> {
+impl<Inner, Extras> FirehoseWrappedExecutor<Inner, Extras, NoPreTxAdjust> {
     /// Same as [`Self::new`] but lets the caller supply a [`PostTxExtras`] hook that fires after
     /// the generic per-tx balance accounting. Used by OP Stack variants to emit the three fee
     /// vault balance changes that are otherwise invisible to the tracer (they originate from
@@ -153,11 +215,25 @@ impl<Inner, Extras> FirehoseWrappedExecutor<Inner, Extras> {
         withdrawals: Option<Withdrawals>,
         extras: Extras,
     ) -> Self {
-        Self { inner, withdrawals, log_index: 0, extras }
+        Self { inner, withdrawals, log_index: 0, extras, adjust: NoPreTxAdjust }
     }
 }
 
-impl<Inner, Extras> BlockExecutor for FirehoseWrappedExecutor<Inner, Extras>
+impl<Inner, Extras, Adjust> FirehoseWrappedExecutor<Inner, Extras, Adjust> {
+    /// Like [`Self::with_extras`] but additionally installs a [`PreTxAdjust`] hook that can patch
+    /// each [`firehose_tracer::types::TxEvent`] before it reaches the tracer. Used by OP Stack
+    /// variants to fix up the deposit-tx nonce (see [`PreTxAdjust`]).
+    pub const fn with_hooks(
+        inner: Inner,
+        withdrawals: Option<Withdrawals>,
+        adjust: Adjust,
+        extras: Extras,
+    ) -> Self {
+        Self { inner, withdrawals, log_index: 0, extras, adjust }
+    }
+}
+
+impl<Inner, Extras, Adjust> BlockExecutor for FirehoseWrappedExecutor<Inner, Extras, Adjust>
 where
     Inner: BlockExecutor,
     Inner::Transaction: Transaction + TxHashRef + SignatureFields,
@@ -165,6 +241,7 @@ where
     <Inner::Evm as reth_evm::Evm>::DB: reth_revm::Database,
     Inner::Receipt: TxReceipt<Log = Log>,
     Extras: PostTxExtras<Inner::Evm>,
+    Adjust: PreTxAdjust<Inner::Evm>,
 {
     type Transaction = Inner::Transaction;
     type Receipt = Inner::Receipt;
@@ -200,7 +277,7 @@ where
             max_priority_fee_per_gas,
             gas_price_opt,
             gas_limit,
-            tx_event,
+            mut tx_event,
         ) = {
             let inner_tx: &Inner::Transaction = recovered.tx();
             let (r, s, v) = inner_tx.signature_fields();
@@ -217,6 +294,11 @@ where
 
         let base_fee = self.inner.evm().block().basefee();
         let coinbase = self.inner.evm().block().beneficiary();
+
+        // Chain-specific pre-tx patching of the event (e.g. OP Stack deposit nonce override).
+        // Runs after the envelope-derived mapper and before `on_tx_start` so the tracer sees the
+        // final, chain-consistent event.
+        self.adjust.adjust_tx_event(self.inner.evm_mut(), &mut tx_event, sender);
 
         self.inner.evm_mut().inspector_mut().tracer_mut().on_tx_start(tx_event, None);
 
