@@ -547,7 +547,15 @@ impl<'a> FirehoseInspector<'a> {
         CTX: ContextTr,
         CTX::Journal: JournalExt,
     {
-        for &address in self.selfdestruct_addresses.iter() {
+        // Iterate in ascending address order so downstream nonce/code-change events are
+        // emitted deterministically, matching Geth's `statedb.Finalise()` which sorts
+        // self-destructed addresses before invoking hooks. Without this, creating and
+        // selfdestructing N contracts in one tx would emit cleanup hooks in HashSet
+        // iteration order and diverge from Geth firehose traces.
+        let mut sorted: Vec<Address> = self.selfdestruct_addresses.iter().copied().collect();
+        sorted.sort_unstable();
+
+        for address in sorted {
             if let Some(account) = context.journal().evm_state().get(&address) {
                 self.pending_selfdestruct_cleanups.push(SelfdestructCleanupEntry {
                     address,
