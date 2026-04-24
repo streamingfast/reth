@@ -69,7 +69,7 @@ impl FirehoseBlockTracer {
         if is_genesis {
             guard.on_genesis_block(
                 firehose_tracer::types::BlockEvent {
-                    block: mapper::to_block_data_eth_sealed::<N>(block),
+                    block: mapper::to_block_data(block),
                     finalized,
                     flash_block: None,
                 },
@@ -77,7 +77,7 @@ impl FirehoseBlockTracer {
             );
         } else {
             guard.on_block_start(firehose_tracer::types::BlockEvent {
-                block: mapper::to_block_data_eth_sealed::<N>(block),
+                block: mapper::to_block_data(block),
                 finalized,
                 flash_block: None,
             });

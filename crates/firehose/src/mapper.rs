@@ -14,8 +14,7 @@ use alloy_rlp::Encodable;
 use firehose_tracer::types::{
     AccessTuple, BlockData, GenesisAlloc, SetCodeAuthorization, TxEvent, UncleData, WithdrawalData,
 };
-use reth_node_api::FullNodeComponents;
-use reth_primitives_traits::{Block as BlockTrait, BlockBody, NodePrimitives};
+use reth_primitives_traits::{Block as BlockTrait, BlockBody};
 use reth_provider::{AccountReader, ProviderResult};
 
 pub(crate) fn to_genesis_alloc(genesis: &Genesis) -> GenesisAlloc {
@@ -43,48 +42,11 @@ fn map_genesis_storage(storage: &Option<BTreeMap<B256, B256>>) -> HashMap<B256, 
     }
 }
 
-pub(crate) fn to_block_data<Node: FullNodeComponents>(block: &RecoveredBlock<Node>) -> BlockData {
-    let header = block.header();
-
-    BlockData {
-        number: header.number(),
-        hash: block.hash(),
-        parent_hash: header.parent_hash(),
-        uncle_hash: header.ommers_hash(),
-        coinbase: header.beneficiary(),
-        root: header.state_root(),
-        tx_hash: header.transactions_root(),
-        receipt_hash: header.receipts_root(),
-        bloom: header.logs_bloom(),
-        difficulty: header.difficulty(),
-        gas_limit: header.gas_limit(),
-        gas_used: header.gas_used(),
-        time: header.timestamp(),
-        extra: header.extra_data().clone(),
-        mix_digest: header.mix_hash().unwrap_or_default(),
-        nonce: header.nonce().map(|n| u64::from_be_bytes(n.into())).unwrap_or_default(),
-        base_fee: header.base_fee_per_gas().map(U256::from),
-        // RLP-encoded length of the sealed block
-        size: block.sealed_block().length() as u64,
-        uncles: map_uncles::<Node>(block),
-        withdrawals: map_withdrawals::<Node>(block),
-        withdrawals_root: header.withdrawals_root(),
-        blob_gas_used: header.blob_gas_used(),
-        excess_blob_gas: header.excess_blob_gas(),
-        parent_beacon_root: header.parent_beacon_block_root(),
-        requests_hash: header.requests_hash(),
-        tx_dependency: None,
-        // EIP-7843: Amsterdam slot number — not yet exposed by reth Header trait
-        slot_number: None,
-    }
-}
-
 /// Returns block data from a `SealedBlock<B>`.
 ///
-/// Signer-free — reads header fields, ommers, withdrawals, and RLP-encoded length only. Used by
-/// [`crate::block_tracer::FirehoseBlockTracer::start`] to emit `on_block_start` before
-/// transaction senders are recovered.
-pub(crate) fn to_block_data_sealed<B>(block: &reth_primitives_traits::SealedBlock<B>) -> BlockData
+/// Signer-free: reads header fields, ommers, withdrawals, and RLP-encoded length only. Callers
+/// holding a `RecoveredBlock` pass `block.sealed_block()`.
+pub fn to_block_data<B>(block: &reth_primitives_traits::SealedBlock<B>) -> BlockData
 where
     B: BlockTrait,
     B::Header: ConsensusBlockHeader + Sealable,
@@ -111,34 +73,22 @@ where
         mix_digest: header.mix_hash().unwrap_or_default(),
         nonce: header.nonce().map(|n| u64::from_be_bytes(n.into())).unwrap_or_default(),
         base_fee: header.base_fee_per_gas().map(U256::from),
+        // RLP-encoded length of the sealed block.
         size: block.length() as u64,
-        uncles: map_uncles_sealed(block),
-        withdrawals: map_withdrawals_sealed(block),
+        uncles: map_uncles(block),
+        withdrawals: map_withdrawals(block),
         withdrawals_root: header.withdrawals_root(),
         blob_gas_used: header.blob_gas_used(),
         excess_blob_gas: header.excess_blob_gas(),
         parent_beacon_root: header.parent_beacon_block_root(),
         requests_hash: header.requests_hash(),
         tx_dependency: None,
+        // EIP-7843: Amsterdam slot number — not yet exposed by reth Header trait
         slot_number: None,
     }
 }
 
-/// Convenience wrapper: produces [`BlockData`] for any `NodePrimitives`-based sealed block.
-pub fn to_block_data_eth_sealed<P>(
-    block: &reth_primitives_traits::SealedBlock<<P as NodePrimitives>::Block>,
-) -> BlockData
-where
-    P: NodePrimitives,
-    P::Block: BlockTrait,
-    <P::Block as BlockTrait>::Header: ConsensusBlockHeader + Sealable,
-    <P::Block as BlockTrait>::Body: BlockBody,
-    <<P::Block as BlockTrait>::Body as BlockBody>::OmmerHeader: ConsensusBlockHeader + Sealable,
-{
-    to_block_data_sealed(block)
-}
-
-fn map_uncles_sealed<B>(block: &reth_primitives_traits::SealedBlock<B>) -> Vec<UncleData>
+fn map_uncles<B>(block: &reth_primitives_traits::SealedBlock<B>) -> Vec<UncleData>
 where
     B: BlockTrait,
     B::Body: BlockBody,
@@ -150,7 +100,7 @@ where
     ommers.iter().map(to_uncle_data).collect()
 }
 
-fn map_withdrawals_sealed<B>(block: &reth_primitives_traits::SealedBlock<B>) -> Vec<WithdrawalData>
+fn map_withdrawals<B>(block: &reth_primitives_traits::SealedBlock<B>) -> Vec<WithdrawalData>
 where
     B: BlockTrait,
     B::Body: BlockBody,
@@ -179,14 +129,6 @@ pub(crate) fn to_finalized_ref(
     })
 }
 
-fn map_uncles<Node: FullNodeComponents>(block: &RecoveredBlock<Node>) -> Vec<UncleData> {
-    let Some(ommers) = block.body().ommers() else {
-        return Vec::new();
-    };
-
-    ommers.iter().map(to_uncle_data).collect()
-}
-
 fn to_uncle_data<H>(uncle: &H) -> UncleData
 where
     H: ConsensusBlockHeader + Sealable,
@@ -211,22 +153,6 @@ where
         nonce: uncle.nonce().map(|n| u64::from_be_bytes(n.into())).unwrap_or_default(),
         base_fee: uncle.base_fee_per_gas().map(U256::from),
     }
-}
-
-fn map_withdrawals<Node: FullNodeComponents>(block: &RecoveredBlock<Node>) -> Vec<WithdrawalData> {
-    block
-        .body()
-        .withdrawals()
-        .map(|ws| ws.as_slice())
-        .unwrap_or_default()
-        .iter()
-        .map(|w| WithdrawalData {
-            index: w.index,
-            validator_index: w.validator_index,
-            address: w.address,
-            amount: w.amount,
-        })
-        .collect()
 }
 
 /// SignatureFields provides generic access to transaction signature (r, s, v) bytes.

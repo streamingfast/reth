@@ -33,7 +33,7 @@ where
     if block.number() == 1 {
         tracer.on_genesis_block(
             firehose_tracer::types::BlockEvent {
-                block: mapper::to_block_data::<Node>(block),
+                block: mapper::to_block_data(block.sealed_block()),
                 finalized: None,
                 flash_block: None,
             },
@@ -43,7 +43,7 @@ where
     }
 
     tracer.on_block_start(firehose_tracer::types::BlockEvent {
-        block: mapper::to_block_data::<Node>(block),
+        block: mapper::to_block_data(block.sealed_block()),
         finalized: mapper::to_finalized_ref(ctx.provider().finalized_block_num_hash()),
         flash_block: None,
     });
