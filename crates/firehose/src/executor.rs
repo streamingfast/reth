@@ -434,7 +434,13 @@ where
 
 /// Pipeline [`Executor`] that runs each block through a [`FirehoseWrappedExecutor`] and defers
 /// the end-of-block flush until the caller confirms post-execution validation succeeded.
-pub struct FirehoseBlockExecutor<F, DB> {
+///
+/// Carries optional chain-specific [`PostTxExtras`] / [`PreTxAdjust`] hooks that are cloned into
+/// every per-block [`FirehoseWrappedExecutor`] via [`FirehoseWrappedExecutor::with_hooks`]. By
+/// default both resolve to their no-op variants so the pipeline stays a pure mainnet Ethereum
+/// executor — OP Stack integrators call [`FirehoseBlockExecutor::new_with_hooks`] to install
+/// `OpPostTxExtras` / `OpPreTxAdjust`.
+pub struct FirehoseBlockExecutor<F, DB, Extras = NoPostTxExtras, Adjust = NoPreTxAdjust> {
     /// The underlying EVM configuration used to create block executors.
     pub strategy_factory: F,
     /// Revm state holding all accumulated changes across the batch.
@@ -442,6 +448,10 @@ pub struct FirehoseBlockExecutor<F, DB> {
     /// Tracer guard for the most recently executed block. Finalized by the next
     /// `execute_and_trace_one` call or by `into_state` — see the module-level docs.
     pending_tracer: Option<FirehoseBlockTracer>,
+    /// Chain-specific post-tx balance emission hook, cloned into each per-block wrapper.
+    extras: Extras,
+    /// Chain-specific pre-tx event adjustment hook, cloned into each per-block wrapper.
+    adjust: Adjust,
 }
 
 impl Debug for FirehoseBlockExecutor<(), ()> {
@@ -450,15 +460,26 @@ impl Debug for FirehoseBlockExecutor<(), ()> {
     }
 }
 
-impl<F, DB: reth_evm::Database> FirehoseBlockExecutor<F, DB> {
-    /// Creates a new `FirehoseBlockExecutor`.
+impl<F, DB: reth_evm::Database> FirehoseBlockExecutor<F, DB, NoPostTxExtras, NoPreTxAdjust> {
+    /// Creates a new `FirehoseBlockExecutor` with no-op chain hooks (mainnet default).
     pub fn new(strategy_factory: F, db: DB) -> Self {
-        let db = State::builder().with_database(db).with_bundle_update().build();
-        Self { strategy_factory, db, pending_tracer: None }
+        Self::new_with_hooks(strategy_factory, db, NoPreTxAdjust, NoPostTxExtras)
     }
 }
 
-impl<F, DB> Executor<DB> for FirehoseBlockExecutor<F, DB>
+impl<F, DB: reth_evm::Database, Extras, Adjust> FirehoseBlockExecutor<F, DB, Extras, Adjust> {
+    /// Creates a new `FirehoseBlockExecutor` with the provided chain-specific hooks.
+    ///
+    /// `adjust` patches each per-tx [`firehose_tracer::types::TxEvent`] before `on_tx_start`;
+    /// `extras` emits additional post-tx balance changes. See [`FirehoseWrappedExecutor`] for
+    /// the end-to-end flow.
+    pub fn new_with_hooks(strategy_factory: F, db: DB, adjust: Adjust, extras: Extras) -> Self {
+        let db = State::builder().with_database(db).with_bundle_update().build();
+        Self { strategy_factory, db, pending_tracer: None, extras, adjust }
+    }
+}
+
+impl<F, DB, Extras, Adjust> Executor<DB> for FirehoseBlockExecutor<F, DB, Extras, Adjust>
 where
     F: ConfigureEvm,
     DB: reth_evm::Database,
@@ -468,6 +489,22 @@ where
     <<BlockTy<F::Primitives> as BlockTrait>::Body as BlockBody>::OmmerHeader:
         BlockHeader + Sealable,
     TxTy<F::Primitives>: Transaction + TxHashRef + SignatureFields,
+    Extras: Clone,
+    Adjust: Clone,
+    for<'a> Extras: PostTxExtras<
+        <<F::BlockExecutorFactory as alloy_evm::block::BlockExecutorFactory>::EvmFactory
+            as alloy_evm::EvmFactory>::Evm<
+            &'a mut State<DB>,
+            crate::inspector::FirehoseInspector<'a>,
+        >,
+    >,
+    for<'a> Adjust: PreTxAdjust<
+        <<F::BlockExecutorFactory as alloy_evm::block::BlockExecutorFactory>::EvmFactory
+            as alloy_evm::EvmFactory>::Evm<
+            &'a mut State<DB>,
+            crate::inspector::FirehoseInspector<'a>,
+        >,
+    >,
 {
     type Primitives = F::Primitives;
     type Error = BlockExecutionError;
@@ -541,8 +578,14 @@ where
             };
         }
 
-        let block_result =
-            run_wrapped_block::<F, DB>(&self.strategy_factory, &mut self.db, block, &mut tracer);
+        let block_result = run_wrapped_block::<F, DB, Extras, Adjust>(
+            &self.strategy_factory,
+            &mut self.db,
+            block,
+            &mut tracer,
+            self.adjust.clone(),
+            self.extras.clone(),
+        );
 
         match block_result {
             Ok(result) => {
@@ -593,11 +636,13 @@ where
 /// Runs a single block through a [`FirehoseWrappedExecutor`] using the existing tracer guard for
 /// mid-block event emission. Does not emit `on_block_start`/`on_block_end` — those are owned by
 /// the caller via the [`FirehoseBlockTracer`] lifecycle.
-fn run_wrapped_block<F, DB>(
+fn run_wrapped_block<F, DB, Extras, Adjust>(
     evm_config: &F,
     db: &mut State<DB>,
     block: &RecoveredBlock<<F::Primitives as NodePrimitives>::Block>,
     tracer_guard: &mut FirehoseBlockTracer,
+    adjust: Adjust,
+    extras: Extras,
 ) -> Result<BlockExecutionResult<<F::Primitives as NodePrimitives>::Receipt>, BlockExecutionError>
 where
     F: ConfigureEvm,
@@ -608,6 +653,20 @@ where
     <<BlockTy<F::Primitives> as BlockTrait>::Body as BlockBody>::OmmerHeader:
         BlockHeader + Sealable,
     TxTy<F::Primitives>: Transaction + TxHashRef + SignatureFields,
+    for<'a> Extras: PostTxExtras<
+        <<F::BlockExecutorFactory as alloy_evm::block::BlockExecutorFactory>::EvmFactory
+            as alloy_evm::EvmFactory>::Evm<
+            &'a mut State<DB>,
+            crate::inspector::FirehoseInspector<'a>,
+        >,
+    >,
+    for<'a> Adjust: PreTxAdjust<
+        <<F::BlockExecutorFactory as alloy_evm::block::BlockExecutorFactory>::EvmFactory
+            as alloy_evm::EvmFactory>::Evm<
+            &'a mut State<DB>,
+            crate::inspector::FirehoseInspector<'a>,
+        >,
+    >,
 {
     let evm_env = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?;
     let exec_ctx =
@@ -618,7 +677,7 @@ where
     let inner = evm_config.create_executor(evm, exec_ctx);
 
     let withdrawals = block.body().withdrawals().cloned();
-    let wrapped = FirehoseWrappedExecutor::new(inner, withdrawals);
+    let wrapped = FirehoseWrappedExecutor::with_hooks(inner, withdrawals, adjust, extras);
 
     wrapped.execute_block(block.transactions_recovered())
 }
@@ -809,6 +868,14 @@ mod tests {
 /// All other methods delegate directly to the inner config. The live engine path (payload
 /// validator) constructs its wrapped executor explicitly, since `create_executor` cannot tighten
 /// its inspector bound via a trait override.
+///
+/// This wrapper always installs [`NoPostTxExtras`] / [`NoPreTxAdjust`] — suitable for mainnet
+/// Ethereum out of the box. Chains that need chain-specific tracer hooks (OP Stack fee vaults,
+/// deposit-nonce fixups, ...) must provide their own [`ConfigureEvm`] wrapper whose
+/// `batch_executor` constructs [`FirehoseBlockExecutor::new_with_hooks`] with concrete hook
+/// types — the `for<'a> Extras: PostTxExtras<Evm<&'a mut State<DB>, ...>>` bound cannot be
+/// written on a generic [`ConfigureEvm`] impl because `DB` is a method-level generic on
+/// `batch_executor<DB>`, but it *is* expressible for fixed `F`/`Extras`/`Adjust`.
 #[derive(Clone, Debug)]
 pub struct FirehoseEvmConfig<F> {
     /// The wrapped EVM configuration.
