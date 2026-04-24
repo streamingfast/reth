@@ -255,6 +255,23 @@ impl<'a> FirehoseInspector<'a> {
                         );
                     }
                 }
+                JournalEntry::AccountCreated { address, .. } => {
+                    // EIP-161a: `create_account_checkpoint` directly sets the newly created
+                    // contract's nonce to 1 WITHOUT pushing a NonceChange/NonceBump entry.
+                    // We derive the 0→1 bump from the AccountCreated marker instead.
+                    //
+                    // Emitting from the journal (rather than at `create_end`) is what matches
+                    // Geth's ordinal ordering: the created-contract nonce bump is interleaved
+                    // with frame_init events (caller nonce bump + balance transfer) BEFORE the
+                    // constructor runs, not emitted after the whole CREATE (which would place
+                    // it after any code deployment and nested calls).
+                    //
+                    // Failure modes automatically no-op here: CallTooDeep / OutOfFunds abort
+                    // before create_account_checkpoint pushes the entry; CreateCollision also
+                    // aborts before the push; OverflowPayment pushes the entry but then reverts
+                    // the checkpoint, truncating it back out of the journal.
+                    self.tracer.on_nonce_change(address, 0, 1);
+                }
                 _ => {}
             }
         }
@@ -1129,40 +1146,17 @@ where
         _inputs: &CreateInputs,
         outcome: &mut CreateOutcome,
     ) {
-        use reth_revm::revm::interpreter::InstructionResult;
-
         log_journal("create_exit", context);
 
-        // Scan journal entries accumulated during this create's execution (including code
-        // deployment) BEFORE popping the call, so changes are attributed to the CREATE
-        // call.
+        // Scan journal entries accumulated during this create's execution (including the
+        // code-deployment `CodeChange` and, via our `AccountCreated` arm, the created
+        // contract's 0→1 nonce bump) BEFORE popping the call, so changes are attributed
+        // to the CREATE call.
         self.process_journal_changes(context);
 
         // Clear pending flag: if the CREATE failed before executing any opcode (e.g.
         // OutOfFunds, CallTooDeep, CreateCollision), step never ran to clear it.
         self.pending_value_transfer_check = false;
-
-        // Emit the created contract's nonce change (0→1, EIP-161). This is set directly
-        // by create_account_checkpoint (target_acc.info.nonce = 1) WITHOUT pushing a
-        // NonceBump journal entry, so process_journal_changes will never pick it up.
-        // If the CREATE failed, the journal checkpoint was reverted but the nonce change
-        // still needs to be recorded in the Firehose trace (stateReverted captures it).
-        //
-        // Skip for failures that occur BEFORE create_account_checkpoint runs:
-        // - CallTooDeep / OutOfFunds: frame setup aborted before checkpoint
-        // - CreateCollision / OverflowPayment: create_account_checkpoint itself failed
-        let skip_created_nonce = matches!(
-            outcome.result.result,
-            InstructionResult::CallTooDeep
-                | InstructionResult::OutOfFunds
-                | InstructionResult::CreateCollision
-                | InstructionResult::OverflowPayment
-        );
-        if !skip_created_nonce {
-            if let Some(address) = outcome.address {
-                self.tracer.on_nonce_change(address, 0, 1);
-            }
-        }
 
         let depth = context.journal().depth() as i32;
         let failed = !outcome.result.is_ok();
