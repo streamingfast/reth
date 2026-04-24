@@ -277,6 +277,7 @@ where
             max_priority_fee_per_gas,
             gas_price_opt,
             gas_limit,
+            blob_gas_used,
             mut tx_event,
         ) = {
             let inner_tx: &Inner::Transaction = recovered.tx();
@@ -288,12 +289,19 @@ where
                 inner_tx.max_priority_fee_per_gas().unwrap_or(0),
                 inner_tx.gas_price(),
                 inner_tx.gas_limit(),
+                // EIP-4844: total blob gas consumed by this tx (num_blobs × GAS_PER_BLOB); 0 for
+                // non-blob tx types. Geth populates `receipt.BlobGasUsed` from this value.
+                inner_tx.blob_gas_used().unwrap_or(0),
                 tx_event,
             )
         };
 
         let base_fee = self.inner.evm().block().basefee();
         let coinbase = self.inner.evm().block().beneficiary();
+        // EIP-4844 blob gas price is a block-level property (derived from `excess_blob_gas`).
+        // `blob_gasprice()` returns `None` for pre-Cancun blocks, matching Geth's omission of
+        // the field on pre-Cancun receipts.
+        let blob_gas_price = self.inner.evm().block().blob_gasprice().map(U256::from);
 
         // Chain-specific pre-tx patching of the event (e.g. OP Stack deposit nonce override).
         // Runs after the envelope-derived mapper and before `on_tx_start` so the tracer sees the
@@ -356,7 +364,14 @@ where
             let committed =
                 self.inner.receipts().last().expect("commit_transaction pushed a receipt");
             self.log_index += committed.logs().len() as u32;
-            mapper::to_receipt_data(committed, tx_index as u32, gas_used, log_index_start)
+            mapper::to_receipt_data(
+                committed,
+                tx_index as u32,
+                gas_used,
+                log_index_start,
+                blob_gas_used,
+                blob_gas_price,
+            )
         };
         self.inner.evm_mut().inspector_mut().tracer_mut().on_tx_end(Some(&receipt_data), None);
 

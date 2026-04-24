@@ -321,11 +321,15 @@ pub fn receipt_data_from_parts(
 /// - `tx_index`: 0-based index of this transaction in the block
 /// - `gas_used`: gas consumed by this transaction alone (cumulative_gas - prev_cumulative_gas)
 /// - `log_index_start`: block-wide log index of the first log in this receipt
+/// - `blob_gas_used`: total blob gas consumed by this tx (0 for non-EIP-4844 transactions)
+/// - `blob_gas_price`: per-unit blob gas price from the block (None pre-Cancun)
 pub fn to_receipt_data<R>(
     receipt: &R,
     tx_index: u32,
     gas_used: u64,
     log_index_start: u32,
+    blob_gas_used: u64,
+    blob_gas_price: Option<U256>,
 ) -> firehose_tracer::types::ReceiptData
 where
     R: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
@@ -337,6 +341,8 @@ where
         receipt.cumulative_gas_used(),
     );
     receipt_data.logs_bloom = *receipt.bloom().data();
+    receipt_data.blob_gas_used = blob_gas_used;
+    receipt_data.blob_gas_price = blob_gas_price;
     for (i, log) in receipt.logs().iter().enumerate() {
         receipt_data.add_log(firehose_tracer::types::LogData::new(
             log.address,

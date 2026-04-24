@@ -8,7 +8,11 @@ use reth_ethereum_forks::EthereumHardforks;
 use reth_evm::execute::BlockExecutor;
 use reth_exex::{ExExContext, ExExEvent};
 use reth_provider::{BlockIdReader, BlockReader, StateProviderBox, StateProviderFactory};
-use reth_revm::{database::StateProviderDatabase, revm::Database as _, State};
+use reth_revm::{
+    database::StateProviderDatabase,
+    revm::{context::Block as _, Database as _},
+    State,
+};
 
 /// Executes EVM transactions in a block one by one, firing tracer hooks at the appropriate times.
 ///
@@ -189,7 +193,18 @@ where
         let cumulative_gas = receipt.cumulative_gas_used();
         let gas_used = cumulative_gas - prev_cumulative_gas;
         let log_count = receipt.logs().len() as u32;
-        let receipt_data = mapper::to_receipt_data(receipt, tx_index as u32, gas_used, log_index);
+        // EIP-4844 receipt fields. `blob_gas_used()` returns `None` for non-blob tx types;
+        // `blob_gasprice()` returns `None` for pre-Cancun blocks. Matches Geth's receipt shape.
+        let blob_gas_used = tx.blob_gas_used().unwrap_or(0);
+        let blob_gas_price = executor.evm().block().blob_gasprice().map(U256::from);
+        let receipt_data = mapper::to_receipt_data(
+            receipt,
+            tx_index as u32,
+            gas_used,
+            log_index,
+            blob_gas_used,
+            blob_gas_price,
+        );
         prev_cumulative_gas = cumulative_gas;
         log_index += log_count;
 
