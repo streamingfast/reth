@@ -978,24 +978,17 @@ where
                     );
                 }
 
-                // Nonce bump from deduct_caller (CALL transactions) or from original
-                // state for CREATE (nonce bump happens later in create_account_checkpoint).
-                //
-                // CRITICAL: deduct_caller bumps the caller's nonce by EXACTLY 1 for CALL
-                // transactions. If the tx is EIP-7702 AND the sender is also an authority
-                // in the auth list, revm's `apply_auth_list` (which runs before this
-                // inspector hook fires) bumps the same nonce by another 1 per applied auth.
-                // By the time we read `account.info.nonce` here, it may reflect BOTH the
-                // deduct_caller bump and the EIP-7702 bumps — producing a single emitted
-                // change like 219 → 221 on the wire when the user expects 219 → 220 here
-                // and 220 → 221 separately from `process_eip7702_auth_list` (called below).
-                //
-                // Emit only the deduct_caller portion (always +1 for CALL); the EIP-7702
-                // bumps are emitted independently by `process_eip7702_auth_list`, which
-                // scans the auth list with the per-authority running nonce.
-                let old_nonce = account.original_info.nonce;
-                if old_nonce < account.info.nonce {
-                    self.tracer.on_nonce_change(inputs.caller, old_nonce, old_nonce + 1);
+                // See `deduct_caller_nonce_emission` for why we emit `(old, old+1)`
+                // instead of `(original_info.nonce, info.nonce)`. Short version: when the
+                // tx is EIP-7702 AND the sender is also an authority in the auth list,
+                // `info.nonce` already reflects the EIP-7702 bump on top of deduct_caller's,
+                // and `process_eip7702_auth_list` (called below) emits those bumps
+                // separately. Letting the live nonce through here would double-count.
+                if let Some((old, new)) = deduct_caller_nonce_emission(
+                    account.original_info.nonce,
+                    account.info.nonce,
+                ) {
+                    self.tracer.on_nonce_change(inputs.caller, old, new);
                 }
             }
         } else {
@@ -1441,6 +1434,41 @@ pub fn log_evm_state(label: &str, state: &reth_revm::revm::state::EvmState) {
     }
 }
 
+/// Decide what `(old_nonce, new_nonce)` to emit at the depth-0 root call entry for
+/// the deduct_caller portion of the tx's pre-execution work.
+///
+/// On a vanilla CALL transaction the caller's nonce is bumped by exactly 1 by
+/// `validate_against_state_and_deduct_caller` (in revm and in
+/// `base_revm::OpHandler`), so `original_info.nonce` and `info.nonce` differ by 1
+/// and `(original, original + 1)` matches `(original, info.nonce)`.
+///
+/// On an EIP-7702 transaction whose **sender is also an authority** in the auth
+/// list, revm's `apply_auth_list` runs *before* the inspector's `call` hook fires
+/// and bumps the same nonce again per applied auth. By the time we read
+/// `account.info.nonce` here it reflects deduct_caller's `+1` *plus* every
+/// EIP-7702 auth's `+1` for the sender. Returning the live `(original, info.nonce)`
+/// here would emit a single change like `219 → 221` for what should be just the
+/// deduct_caller event; `process_eip7702_auth_list` (called a few lines later)
+/// then emits `220 → 221` correctly. The on-the-wire trace would carry both —
+/// double-counting the auth bump on the deduct_caller line.
+///
+/// Fix: emit only the deduct_caller portion, which is always `+1` for CALL on
+/// every chain we support (mainnet ETH and OP including OP deposit-typed CALLs).
+/// The auth bumps stay owned by `process_eip7702_auth_list`.
+///
+/// On CREATE the caller's nonce is bumped later in `create_account_checkpoint`,
+/// not by `deduct_caller`, so `original == current` here and we emit nothing.
+pub(crate) fn deduct_caller_nonce_emission(
+    original_nonce: u64,
+    current_nonce: u64,
+) -> Option<(u64, u64)> {
+    if original_nonce < current_nonce {
+        Some((original_nonce, original_nonce + 1))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1458,6 +1486,58 @@ mod tests {
 
     fn balance_transfer(from: Address, to: Address, amount: U256) -> JournalEntry {
         JournalEntry::BalanceTransfer { from, to, balance: amount }
+    }
+
+    /// Vanilla CALL: deduct_caller bumps by 1, no EIP-7702 auths affect the
+    /// sender, so `original` and `current` differ by exactly 1. Emits the
+    /// observed bump as-is.
+    #[test]
+    fn deduct_caller_nonce_emission_vanilla_call() {
+        assert_eq!(Some((219, 220)), deduct_caller_nonce_emission(219, 220));
+    }
+
+    /// EIP-7702 CALL where the sender is also an authority in its own auth list.
+    /// deduct_caller bumps `219 → 220`, then revm's `apply_auth_list` bumps
+    /// `220 → 221` for the matching auth — both before our `call` hook fires.
+    /// `current = 221` here, but we must emit only the deduct_caller portion
+    /// (`+1`). The auth bump is owned by `process_eip7702_auth_list` and emits
+    /// separately as `220 → 221`. Live-block regression: pre-fix the trace
+    /// carried `(219, 221)` followed by `(220, 221)` — this test pins the fix.
+    #[test]
+    fn deduct_caller_nonce_emission_eip7702_self_authorized() {
+        assert_eq!(Some((219, 220)), deduct_caller_nonce_emission(219, 221));
+    }
+
+    /// EIP-7702 CALL where the sender is also an authority AND there are
+    /// multiple matching auths in the list. apply_auth_list applies several
+    /// per-authority bumps; `current` is `original + 1 (deduct_caller) + N (auths)`.
+    /// We still emit only the +1 from deduct_caller; each of the N auth bumps
+    /// is emitted independently by `process_eip7702_auth_list` with its own
+    /// per-authority running nonce.
+    #[test]
+    fn deduct_caller_nonce_emission_eip7702_multiple_self_authorizations() {
+        // current = 219 + 1 (deduct_caller) + 3 (three auths bumping the sender)
+        assert_eq!(Some((219, 220)), deduct_caller_nonce_emission(219, 223));
+    }
+
+    /// CREATE: deduct_caller does NOT bump the caller nonce — that happens
+    /// later in `create_account_checkpoint`. At our depth-0 `call` hook the
+    /// nonce hasn't moved yet, so we must emit nothing. (For CREATE the depth-0
+    /// hook in question is the `create` hook; this case still validates that the
+    /// helper returns None when `original == current`, guarding against a future
+    /// path that might call this helper outside the CALL flow.)
+    #[test]
+    fn deduct_caller_nonce_emission_no_bump_yields_none() {
+        assert_eq!(None, deduct_caller_nonce_emission(219, 219));
+    }
+
+    /// Defensive: if the live nonce ever appears to have *gone backwards* we
+    /// emit nothing rather than producing a `(old, old+1)` event that
+    /// contradicts state. Should never happen in practice (revm's nonces are
+    /// monotonic per tx) — this just locks the contract.
+    #[test]
+    fn deduct_caller_nonce_emission_decreasing_yields_none() {
+        assert_eq!(None, deduct_caller_nonce_emission(220, 219));
     }
 
     /// Mainnet shape: `validate_against_state_and_deduct_caller` records exactly one
