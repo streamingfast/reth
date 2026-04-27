@@ -57,6 +57,21 @@ pub struct FirehoseInspector<'a> {
     /// even when the root call reverted and `balance_tracker` is stale.
     tx_journal_snapshot: Vec<JournalEntry>,
 
+    /// Sender's account balance at the start of root execution (i.e. after all pre-execution
+    /// deductions: gas buy on mainnet, gas buy + L1 cost + operator fee on OP Stack).
+    /// Captured at depth 0 from `account.info.balance` and consumed by
+    /// `process_post_tx_balance_changes` as the starting point for gas-refund accounting.
+    ///
+    /// Without this capture we would derive the post-pre-exec balance by subtracting
+    /// `gas_buy_cost` from the journal's first `BalanceChange { old_balance }` entry — that
+    /// formula is correct only on chains where gas buy is the only pre-exec deduction. OP
+    /// folds L1 cost (and Isthmus-onward operator fee) into the same single `set_balance`
+    /// call inside `validate_against_state_and_deduct_caller`, so the journal entry's
+    /// implicit new balance is `old - gas_buy_cost - additional_op_cost`. Capturing the live
+    /// account balance instead of recomputing makes the sender's gas-refund `old_balance`
+    /// correct on every chain.
+    tx_post_pre_exec_sender_balance: Option<U256>,
+
     // increments at the end of each transaction, to get proper block index for logs
     log_block_index: u32,
 
@@ -95,6 +110,7 @@ impl<'a> FirehoseInspector<'a> {
             selfdestruct_addresses: HashSet::new(),
             pending_selfdestruct_cleanups: Vec::new(),
             tx_journal_snapshot: Vec::new(),
+            tx_post_pre_exec_sender_balance: None,
             log_block_index: 0,
             trx_logs_count: 0,
         }
@@ -582,25 +598,38 @@ impl<'a> FirehoseInspector<'a> {
     /// post-execution (reimburse_caller / reward_beneficiary). Replaying it produces the
     /// correct balance to use as `old_balance` for the gas-refund and coinbase-reward events.
     ///
-    /// For the sender, `gas_buy_cost` (= gas_limit × effective_gas_price) is needed to
-    /// convert the `BalanceChange { old_balance }` gas-buy entry into the post-gas-buy balance.
-    /// For coinbase (which has no gas-buy BalanceChange), pass `U256::ZERO`.
+    /// `initial_balance` seeds the running balance, suppressing the journal-walk fallback for
+    /// the first `BalanceChange` entry. Pass `Some(post_pre_exec_balance)` when the caller has
+    /// already captured the live account balance (e.g. for the sender, snapshotted at root
+    /// call entry into `tx_post_pre_exec_sender_balance`); pass `None` to derive it from the
+    /// journal.
+    ///
+    /// When `initial_balance` is `None`, the algorithm falls back to:
+    /// `first BalanceChange { old_balance }` − `gas_buy_cost`. That formula is correct on
+    /// chains where gas buy is the only pre-exec deduction; on OP Stack it under-counts by the
+    /// L1/operator fee folded into the same balance change, which is why the sender path
+    /// always passes `initial_balance = Some(..)`.
+    ///
+    /// For coinbase (which has no gas-buy BalanceChange), pass `gas_buy_cost = U256::ZERO`
+    /// and `initial_balance = None` — the journal walk recovers from `BalanceTransfer`
+    /// entries or `get_pre_tx_balance` if the coinbase had no journal activity.
     fn resolve_post_tx_balance(
         address: Address,
+        initial_balance: Option<U256>,
         gas_buy_cost: U256,
         tx_journal: &[JournalEntry],
         get_pre_tx_balance: &mut impl FnMut(Address) -> U256,
     ) -> U256 {
-        let mut balance: Option<U256> = None;
+        let mut balance: Option<U256> = initial_balance;
 
         for entry in tx_journal {
             match entry {
                 // Gas buy (deduct_caller) is always the first BalanceChange for the sender.
                 // Recover the post-gas-buy balance: old_balance − gas_buy_cost.
-                // Only applied when balance is still None (i.e. this is the first entry for
-                // this address); subsequent BalanceChange entries (e.g. from custom precompiles
-                // or future EIPs) have unknown deltas and are skipped to avoid corrupting the
-                // running balance with the wrong formula.
+                // Only applied when balance is still None (i.e. caller did not pre-seed via
+                // `initial_balance` and this is the first entry for this address); subsequent
+                // BalanceChange entries (custom precompiles, future EIPs, …) have unknown
+                // deltas and are skipped to avoid corrupting the running balance.
                 JournalEntry::BalanceChange { address: a, old_balance }
                     if *a == address && balance.is_none() =>
                 {
@@ -661,11 +690,18 @@ impl<'a> FirehoseInspector<'a> {
         let remaining_gas = gas_limit.saturating_sub(gas_used);
         let refund_amount = U256::from(remaining_gas) * U256::from(effective_gas_price);
 
-        // Derive sender's balance after execution (before gas refund) from the committed
-        // journal snapshot. This is correct even for reverted transactions where
-        // balance_tracker would hold stale intermediate values.
+        // Derive sender's balance after execution (before gas refund). Seed with the
+        // post-pre-exec balance captured at root call entry — this is the only reliable
+        // source on chains (OP Stack) that fold multiple pre-exec deductions (gas buy + L1
+        // cost + operator fee) into a single journal `BalanceChange` whose implicit new
+        // balance can't be recovered from `old_balance − gas_buy_cost` alone.
+        // `tx_post_pre_exec_sender_balance` is `None` when the depth-0 root entry hook
+        // didn't capture (e.g. tracer activated mid-tx, or sender account missing from the
+        // EVM state map); in that case `resolve_post_tx_balance` falls back to the
+        // journal-walk derivation, which is correct for chains without the OP-style fold.
         let sender_balance = Self::resolve_post_tx_balance(
             sender,
+            self.tx_post_pre_exec_sender_balance.take(),
             gas_buy_cost,
             &self.tx_journal_snapshot,
             &mut get_pre_tx_balance,
@@ -695,6 +731,7 @@ impl<'a> FirehoseInspector<'a> {
             } else {
                 Self::resolve_post_tx_balance(
                     coinbase,
+                    None,
                     U256::ZERO,
                     &self.tx_journal_snapshot,
                     &mut get_pre_tx_balance,
@@ -924,8 +961,14 @@ where
 
             if let Some(account) = context.journal().evm_state().get(&inputs.caller) {
                 // Gas buy: sender's balance decreased by gas_limit * effective_gas_price
+                // (and on OP Stack also by L1 cost + operator fee — all folded into a single
+                // BalanceChange journal entry by `validate_against_state_and_deduct_caller`).
                 let old_balance = account.original_info.balance;
                 let new_balance = account.info.balance;
+                // Snapshot sender's post-pre-exec balance so `process_post_tx_balance_changes`
+                // can use it as the gas-refund `old_balance` instead of recomputing via
+                // `old - gas_buy_cost` (which misses OP's additional L1/operator deductions).
+                self.tx_post_pre_exec_sender_balance = Some(new_balance);
                 if old_balance != new_balance {
                     self.tracer.on_balance_change(
                         inputs.caller,
@@ -1097,9 +1140,12 @@ where
             self.journal_processed_up_to = context.journal().journal().len();
 
             if let Some(account) = context.journal().evm_state().get(&inputs.caller()) {
-                // Gas buy balance change
+                // Gas buy balance change (folds in OP L1 cost + operator fee on OP Stack;
+                // see the matching CALL-path comment for why we snapshot post-pre-exec
+                // balance before emitting).
                 let old_balance = account.original_info.balance;
                 let new_balance = account.info.balance;
+                self.tx_post_pre_exec_sender_balance = Some(new_balance);
                 if old_balance != new_balance {
                     self.tracer.on_balance_change(
                         inputs.caller(),
@@ -1381,5 +1427,151 @@ pub fn log_evm_state(label: &str, state: &reth_revm::revm::state::EvmState) {
             info.code_hash,
             account.status,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reth_revm::revm::context::JournalEntry;
+
+    fn addr(b: u8) -> Address {
+        Address::repeat_byte(b)
+    }
+
+    /// Build a `BalanceChange` entry for `address` with `old_balance` (the only field revm
+    /// records on the journal — the new balance is whatever the live account holds).
+    fn balance_change(address: Address, old_balance: U256) -> JournalEntry {
+        JournalEntry::BalanceChange { address, old_balance }
+    }
+
+    fn balance_transfer(from: Address, to: Address, amount: U256) -> JournalEntry {
+        JournalEntry::BalanceTransfer { from, to, balance: amount }
+    }
+
+    /// Mainnet shape: `validate_against_state_and_deduct_caller` records exactly one
+    /// `BalanceChange` for the sender whose implicit new balance is `old − gas_buy_cost`.
+    /// With `initial_balance = None`, the journal-walk fallback recovers the right value.
+    #[test]
+    fn resolve_post_tx_balance_mainnet_gas_buy_only() {
+        let sender = addr(0xAA);
+        let pre_tx = U256::from(0xfa_u64);
+        let gas_buy_cost = U256::from(0x10_u64);
+
+        let journal = vec![balance_change(sender, pre_tx)];
+        let mut get_pre = |_: Address| pre_tx;
+
+        let resolved = FirehoseInspector::resolve_post_tx_balance(
+            sender,
+            None,
+            gas_buy_cost,
+            &journal,
+            &mut get_pre,
+        );
+        assert_eq!(resolved, U256::from(0xea_u64), "mainnet: pre - gas_buy");
+    }
+
+    /// OP Stack shape: `validate_against_state_and_deduct_caller` folds gas_buy + L1 cost
+    /// (+ operator fee under Isthmus) into a single `set_balance` call, so the journal
+    /// records ONE `BalanceChange { old = pre_tx }` whose implicit new balance is
+    /// `pre_tx − (gas_buy + additional_op_cost)`.
+    ///
+    /// The pre-fix algorithm computed `pre_tx − gas_buy_cost`, over-counting by
+    /// `additional_op_cost` and producing an `old_balance` for the gas-refund event that
+    /// was higher than the gas-buy `new_balance` the user actually saw. The fix passes
+    /// the live post-pre-exec balance via `initial_balance` so the journal walk seeds
+    /// correctly.
+    ///
+    /// This test reproduces the bug observed on base-mainnet:
+    /// gas-buy event:    old=0xfa  new=0xea  (Δ = 0x10 = gas_buy + L1)
+    /// gas-refund event: old=0xea  new=0xff  (Δ = 0x15 = remaining gas + …)
+    /// The pre-fix code would have given gas-refund old=0xef (= 0xfa − gas_buy(0x05) +
+    /// transfer-in(…)), which is the user's reported wrong value.
+    #[test]
+    fn resolve_post_tx_balance_op_combined_pre_exec_deduction() {
+        let sender = addr(0xAA);
+        let pre_tx = U256::from(0xfa_u64);
+        let gas_buy_cost = U256::from(0x05_u64);
+        let post_pre_exec = U256::from(0xea_u64); // observed on the live account at depth 0
+
+        // Single combined journal entry: validate_against_state_and_deduct_caller's
+        // `set_balance(pre_tx − gas_buy − l1)`.
+        let journal = vec![balance_change(sender, pre_tx)];
+        let mut get_pre = |_: Address| pre_tx;
+
+        // Pre-fix behaviour: ignore `initial_balance`, use journal walk only.
+        let pre_fix = FirehoseInspector::resolve_post_tx_balance(
+            sender,
+            None,
+            gas_buy_cost,
+            &journal,
+            &mut get_pre,
+        );
+        assert_eq!(
+            pre_fix,
+            U256::from(0xf5_u64),
+            "pre-fix derives pre_tx − gas_buy_cost = 0xfa − 0x05 = 0xf5 (wrong on OP)"
+        );
+
+        // Post-fix behaviour: `initial_balance = Some(post_pre_exec)` short-circuits the
+        // BalanceChange match, returning the live captured balance.
+        let post_fix = FirehoseInspector::resolve_post_tx_balance(
+            sender,
+            Some(post_pre_exec),
+            gas_buy_cost,
+            &journal,
+            &mut get_pre,
+        );
+        assert_eq!(post_fix, post_pre_exec, "post-fix uses captured live balance");
+    }
+
+    /// `BalanceTransfer` entries from execution (e.g. value transfers from sender during
+    /// CALL) must still apply on top of the seeded balance. This guards the formula
+    /// `gas-refund old = post_pre_exec − value_out + value_in`.
+    #[test]
+    fn resolve_post_tx_balance_op_with_value_transfers() {
+        let sender = addr(0xAA);
+        let other = addr(0xBB);
+        let post_pre_exec = U256::from(100_u64);
+
+        let journal = vec![
+            balance_change(sender, U256::from(150_u64)), // pre_tx; new = post_pre_exec
+            balance_transfer(sender, other, U256::from(20_u64)), // sender pays 20
+            balance_transfer(other, sender, U256::from(5_u64)),  // sender receives 5
+        ];
+        let mut get_pre = |_: Address| U256::ZERO;
+
+        let resolved = FirehoseInspector::resolve_post_tx_balance(
+            sender,
+            Some(post_pre_exec),
+            U256::ZERO, // unused on this path
+            &journal,
+            &mut get_pre,
+        );
+        assert_eq!(
+            resolved,
+            U256::from(85_u64),
+            "100 − 20 + 5 = 85 (transfers applied on top of seeded post-pre-exec balance)"
+        );
+    }
+
+    /// Coinbase path: no pre-exec deduction, no seeded balance — the journal walk falls
+    /// back to `get_pre_tx_balance` when no entries reference the address. This must keep
+    /// working (sender ≠ coinbase coinbase-reward emission relies on it).
+    #[test]
+    fn resolve_post_tx_balance_coinbase_falls_back_to_pre_tx() {
+        let coinbase = addr(0xCC);
+        let pre_tx_coinbase = U256::from(7_u64);
+        let journal: Vec<JournalEntry> = vec![];
+        let mut get_pre = |_: Address| pre_tx_coinbase;
+
+        let resolved = FirehoseInspector::resolve_post_tx_balance(
+            coinbase,
+            None,
+            U256::ZERO,
+            &journal,
+            &mut get_pre,
+        );
+        assert_eq!(resolved, pre_tx_coinbase);
     }
 }
