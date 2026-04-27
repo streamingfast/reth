@@ -293,6 +293,67 @@ impl<'a> FirehoseInspector<'a> {
         }
     }
 
+    /// Shared pre-`on_call_enter` bookkeeping for the `call` and `create` hooks.
+    ///
+    /// At depth 0, the journal already contains entries from `deduct_caller`
+    /// (BalanceChange for gas cost, NonceBump for CALL transactions) and `load_accounts`
+    /// (AccountWarmed for coinbase/access-list). We skip `process_journal_changes` to
+    /// avoid emitting `deduct_caller`'s BalanceChange with the wrong reason (Transfer
+    /// instead of GasBuy); instead we advance past all pre-execution journal entries
+    /// and emit gas buy + nonce explicitly with the correct reasons.
+    ///
+    /// At depth > 0 we process journal entries BEFORE pushing the child call so that
+    /// entries from the parent's execution (including the parent call's own value
+    /// transfer BalanceTransfer) are attributed to the parent, not the child. In Geth,
+    /// OnEnter fires first (pushing the call), then Transfer runs and OnBalanceChange
+    /// fires (on the newly-pushed call). revm's journal captures the same entries but
+    /// they're only visible at the NEXT inspector hook. By processing here (before
+    /// pushing), the parent's BalanceTransfer from a previous call setup lands on the
+    /// parent. The current call's own value transfer will be created by revm AFTER the
+    /// hook returns and processed at the next call/call_end, correctly landing on THIS
+    /// call.
+    ///
+    /// Note on nonce semantics at depth 0:
+    /// - CALL transactions: `deduct_caller` bumped the nonce; emitted here.
+    /// - CREATE transactions: `deduct_caller` did NOT bump the nonce — that happens later in
+    ///   `create_account_checkpoint`, which pushes a NonceChange journal entry that
+    ///   `process_journal_changes` picks up.
+    fn enter_frame_pre_hook<CTX>(&mut self, context: &mut CTX, caller: Address)
+    where
+        CTX: ContextTr,
+        CTX::Journal: JournalExt,
+    {
+        let depth = context.journal().depth() as i32;
+
+        if depth > 0 {
+            self.process_journal_changes(context);
+            return;
+        }
+
+        self.journal_processed_up_to = context.journal().journal().len();
+
+        let Some(account) = context.journal().evm_state().get(&caller) else { return };
+
+        self.tracer.on_balance_change(
+            caller,
+            account.original_info.balance,
+            account.info.balance,
+            pb::sf::ethereum::r#type::v2::balance_change::Reason::GasBuy,
+        );
+
+        // See `deduct_caller_nonce_emission` for why we emit `(old, old+1)`
+        // instead of `(original_info.nonce, info.nonce)`. Short version: when the
+        // tx is EIP-7702 AND the sender is also an authority in the auth list,
+        // `info.nonce` already reflects the EIP-7702 bump on top of deduct_caller's,
+        // and `process_eip7702_auth_list` (called below) emits those bumps
+        // separately. Letting the live nonce through here would double-count.
+        if let Some((old, new)) =
+            deduct_caller_nonce_emission(account.original_info.nonce, account.info.nonce)
+        {
+            self.tracer.on_nonce_change(caller, old, new);
+        }
+    }
+
     /// Process SELFDESTRUCT balance changes from journal entries pushed during the opcode.
     ///
     /// SELFDESTRUCT causes revm to push journal entries (AccountDestroyed or BalanceTransfer)
@@ -507,8 +568,8 @@ impl<'a> FirehoseInspector<'a> {
                 auth_tracker.get_mut(&authority).unwrap();
 
             // 4. Code must be empty or an EIP-7702 delegation designator.
-            let code_eligible = *tracked_code_hash == KECCAK_EMPTY
-                || (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
+            let code_eligible = *tracked_code_hash == KECCAK_EMPTY ||
+                (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
             if !code_eligible {
                 continue;
             }
@@ -806,17 +867,17 @@ impl<'a> FirehoseInspector<'a> {
             InstructionResult::Revert => "execution reverted".to_string(),
             InstructionResult::CallTooDeep => "max call depth exceeded".to_string(),
             InstructionResult::OutOfFunds => "insufficient balance for transfer".to_string(),
-            InstructionResult::CreateInitCodeStartingEF00
-            | InstructionResult::InvalidEOFInitCode
-            | InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
+            InstructionResult::CreateInitCodeStartingEF00 |
+            InstructionResult::InvalidEOFInitCode |
+            InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
 
             // Out-of-gas variants — Geth distinguishes CREATE vs CALL context
-            InstructionResult::OutOfGas
-            | InstructionResult::MemoryOOG
-            | InstructionResult::MemoryLimitOOG
-            | InstructionResult::PrecompileOOG
-            | InstructionResult::InvalidOperandOOG
-            | InstructionResult::ReentrancySentryOOG => {
+            InstructionResult::OutOfGas |
+            InstructionResult::MemoryOOG |
+            InstructionResult::MemoryLimitOOG |
+            InstructionResult::PrecompileOOG |
+            InstructionResult::InvalidOperandOOG |
+            InstructionResult::ReentrancySentryOOG => {
                 if is_create {
                     "contract creation code storage out of gas".to_string()
                 } else {
@@ -829,8 +890,8 @@ impl<'a> FirehoseInspector<'a> {
             InstructionResult::InvalidJump => "invalid jump destination".to_string(),
             InstructionResult::StackOverflow => "stack limit reached 1024 (1023)".to_string(),
             InstructionResult::StackUnderflow => "stack underflow".to_string(),
-            InstructionResult::CallNotAllowedInsideStatic
-            | InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
+            InstructionResult::CallNotAllowedInsideStatic |
+            InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
             InstructionResult::CreateCollision => "contract address collision".to_string(),
             InstructionResult::CreateContractSizeLimit => "max code size exceeded".to_string(),
             InstructionResult::CreateContractStartingWithEF => {
@@ -950,61 +1011,7 @@ where
 
         log_journal("call_enter", context);
 
-        if depth == 0 {
-            // At depth 0 (root call entry), the journal contains entries from deduct_caller
-            // (BalanceChange for gas cost, NonceBump for CALL transactions) and load_accounts
-            // (AccountWarmed for coinbase/access-list). We skip process_journal_changes here
-            // because deduct_caller's BalanceChange would be emitted with the wrong reason
-            // (Transfer instead of GasBuy). Instead, advance past all pre-execution journal
-            // entries and emit gas buy + nonce explicitly with the correct reasons.
-            self.journal_processed_up_to = context.journal().journal().len();
-
-            if let Some(account) = context.journal().evm_state().get(&inputs.caller) {
-                // Gas buy: sender's balance decreased by gas_limit * effective_gas_price
-                // (and on OP Stack also by L1 cost + operator fee — all folded into a single
-                // BalanceChange journal entry by `validate_against_state_and_deduct_caller`).
-                let old_balance = account.original_info.balance;
-                let new_balance = account.info.balance;
-                // Snapshot sender's post-pre-exec balance so `process_post_tx_balance_changes`
-                // can use it as the gas-refund `old_balance` instead of recomputing via
-                // `old - gas_buy_cost` (which misses OP's additional L1/operator deductions).
-                self.tx_post_pre_exec_sender_balance = Some(new_balance);
-                if old_balance != new_balance {
-                    self.tracer.on_balance_change(
-                        inputs.caller,
-                        old_balance,
-                        new_balance,
-                        pb::sf::ethereum::r#type::v2::balance_change::Reason::GasBuy,
-                    );
-                }
-
-                // See `deduct_caller_nonce_emission` for why we emit `(old, old+1)`
-                // instead of `(original_info.nonce, info.nonce)`. Short version: when the
-                // tx is EIP-7702 AND the sender is also an authority in the auth list,
-                // `info.nonce` already reflects the EIP-7702 bump on top of deduct_caller's,
-                // and `process_eip7702_auth_list` (called below) emits those bumps
-                // separately. Letting the live nonce through here would double-count.
-                if let Some((old, new)) = deduct_caller_nonce_emission(
-                    account.original_info.nonce,
-                    account.info.nonce,
-                ) {
-                    self.tracer.on_nonce_change(inputs.caller, old, new);
-                }
-            }
-        } else {
-            // Process journal entries BEFORE pushing the child call. This ensures that
-            // entries from the parent's execution (including the parent call's own value
-            // transfer BalanceTransfer) are attributed to the parent call, not the child.
-            //
-            // In Geth, OnEnter fires first (pushing the call), then Transfer runs and
-            // OnBalanceChange fires (on the newly-pushed call). revm's journal captures
-            // the same entries but they're only visible at the NEXT inspector hook. By
-            // processing here (before pushing), the parent's BalanceTransfer from a
-            // previous call setup lands on the parent. The current call's own value
-            // transfer will be created by revm AFTER this hook returns and processed
-            // at the next call/call_end, correctly landing on THIS call.
-            self.process_journal_changes(context);
-        }
+        self.enter_frame_pre_hook(context, inputs.caller);
 
         self.tracer.on_call_enter(
             depth,
@@ -1133,44 +1140,7 @@ where
             self.tracer.set_transaction_to(created_address);
         }
 
-        if depth == 0 {
-            // Same rationale as in `call` hook: skip process_journal_changes at depth 0
-            // to avoid double-emitting deduct_caller's BalanceChange/NonceBump with wrong
-            // reasons. Emit gas buy + nonce explicitly instead.
-            //
-            // For CREATE, deduct_caller does NOT bump the nonce (only CALL does).
-            // create_account_checkpoint will bump the nonce later and DOES push a
-            // NonceChange journal entry that process_journal_changes will pick up.
-            self.journal_processed_up_to = context.journal().journal().len();
-
-            if let Some(account) = context.journal().evm_state().get(&inputs.caller()) {
-                // Gas buy balance change (folds in OP L1 cost + operator fee on OP Stack;
-                // see the matching CALL-path comment for why we snapshot post-pre-exec
-                // balance before emitting).
-                let old_balance = account.original_info.balance;
-                let new_balance = account.info.balance;
-                self.tx_post_pre_exec_sender_balance = Some(new_balance);
-                if old_balance != new_balance {
-                    self.tracer.on_balance_change(
-                        inputs.caller(),
-                        old_balance,
-                        new_balance,
-                        pb::sf::ethereum::r#type::v2::balance_change::Reason::GasBuy,
-                    );
-                }
-
-                // Nonce bump from deduct_caller (only for CALL txs; for CREATE txs
-                // the nonce hasn't been bumped yet by deduct_caller, so old == new).
-                let old_nonce = account.original_info.nonce;
-                let new_nonce = account.info.nonce;
-                if old_nonce != new_nonce {
-                    self.tracer.on_nonce_change(inputs.caller(), old_nonce, new_nonce);
-                }
-            }
-        } else {
-            // Process journal entries BEFORE pushing child (same rationale as in `call` hook).
-            self.process_journal_changes(context);
-        }
+        self.enter_frame_pre_hook(context, inputs.caller());
 
         self.tracer.on_call_enter(
             depth,
@@ -1628,7 +1598,7 @@ mod tests {
         let journal = vec![
             balance_change(sender, U256::from(150_u64)), // pre_tx; new = post_pre_exec
             balance_transfer(sender, other, U256::from(20_u64)), // sender pays 20
-            balance_transfer(other, sender, U256::from(5_u64)),  // sender receives 5
+            balance_transfer(other, sender, U256::from(5_u64)), // sender receives 5
         ];
         let mut get_pre = |_: Address| U256::ZERO;
 
