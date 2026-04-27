@@ -978,13 +978,24 @@ where
                     );
                 }
 
-                // Nonce bump from deduct_caller (CALL transactions) or
-                // from original state for CREATE (nonce bump happens later
-                // in create_account_checkpoint).
+                // Nonce bump from deduct_caller (CALL transactions) or from original
+                // state for CREATE (nonce bump happens later in create_account_checkpoint).
+                //
+                // CRITICAL: deduct_caller bumps the caller's nonce by EXACTLY 1 for CALL
+                // transactions. If the tx is EIP-7702 AND the sender is also an authority
+                // in the auth list, revm's `apply_auth_list` (which runs before this
+                // inspector hook fires) bumps the same nonce by another 1 per applied auth.
+                // By the time we read `account.info.nonce` here, it may reflect BOTH the
+                // deduct_caller bump and the EIP-7702 bumps — producing a single emitted
+                // change like 219 → 221 on the wire when the user expects 219 → 220 here
+                // and 220 → 221 separately from `process_eip7702_auth_list` (called below).
+                //
+                // Emit only the deduct_caller portion (always +1 for CALL); the EIP-7702
+                // bumps are emitted independently by `process_eip7702_auth_list`, which
+                // scans the auth list with the per-authority running nonce.
                 let old_nonce = account.original_info.nonce;
-                let new_nonce = account.info.nonce;
-                if old_nonce != new_nonce {
-                    self.tracer.on_nonce_change(inputs.caller, old_nonce, new_nonce);
+                if old_nonce < account.info.nonce {
+                    self.tracer.on_nonce_change(inputs.caller, old_nonce, old_nonce + 1);
                 }
             }
         } else {
