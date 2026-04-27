@@ -42,6 +42,14 @@ pub struct FirehoseInspector<'a> {
     /// (successful or failed, root or nested) are captured before any revert.
     pending_value_transfer_check: bool,
 
+    /// Set in the `call` hook when revm is about to attempt a self-transfer
+    /// (CallScheme::Call with caller == target_address and value > 0). revm
+    /// short-circuits these in `transfer_loaded` without pushing a BalanceTransfer
+    /// journal entry, so we synthesize the two balance change events ourselves
+    /// when the frame actually starts executing (step) or exits successfully
+    /// without any opcode run (call_end on a no-code target).
+    pending_self_transfer: Option<(Address, U256)>,
+
     /// Addresses that executed SELFDESTRUCT and were truly destroyed (AccountDestroyed
     /// journal entry) during the current transaction.
     selfdestruct_addresses: HashSet<Address>,
@@ -107,6 +115,7 @@ impl<'a> FirehoseInspector<'a> {
             last_step: None,
             journal_processed_up_to: 0,
             pending_value_transfer_check: false,
+            pending_self_transfer: None,
             selfdestruct_addresses: HashSet::new(),
             pending_selfdestruct_cleanups: Vec::new(),
             tx_journal_snapshot: Vec::new(),
@@ -291,6 +300,32 @@ impl<'a> FirehoseInspector<'a> {
                 _ => {}
             }
         }
+    }
+
+    /// Emit the two synthetic Transfer balance change events for a self-transfer
+    /// (caller == recipient, value > 0). revm's `transfer_loaded` short-circuits
+    /// these without pushing a BalanceTransfer journal entry — but Geth still
+    /// reports the debit-then-credit pair (net-zero), so we mirror that here.
+    fn emit_self_transfer_balance_changes<CTX>(
+        &mut self,
+        context: &mut CTX,
+        address: Address,
+        value: U256,
+    ) where
+        CTX: ContextTr,
+        CTX::Journal: JournalExt,
+    {
+        let reason = pb::sf::ethereum::r#type::v2::balance_change::Reason::Transfer;
+        let current = context
+            .journal()
+            .evm_state()
+            .get(&address)
+            .map(|a| a.info.balance)
+            .unwrap_or(U256::ZERO);
+        let intermediate = current.saturating_sub(value);
+
+        self.tracer.on_balance_change(address, current, intermediate, reason);
+        self.tracer.on_balance_change(address, intermediate, current, reason);
     }
 
     /// Shared pre-`on_call_enter` bookkeeping for the `call` and `create` hooks.
@@ -938,6 +973,9 @@ where
         if self.pending_value_transfer_check {
             self.pending_value_transfer_check = false;
             self.process_journal_changes(context);
+            if let Some((address, value)) = self.pending_self_transfer.take() {
+                self.emit_self_transfer_balance_changes(context, address, value);
+            }
         }
 
         let journal = context.journal();
@@ -1053,6 +1091,20 @@ where
         // value transfer (if any). Set flag so the first `step` picks it up.
         self.pending_value_transfer_check = true;
 
+        // Detect self-transfers (caller == target_address, value > 0) for regular CALLs.
+        // revm short-circuits these in `transfer_loaded` without pushing a BalanceTransfer
+        // entry, so we record the pending transfer here and emit the synthetic
+        // debit/credit pair when the frame starts executing or exits successfully.
+        if matches!(inputs.scheme, CallScheme::Call)
+            && inputs.caller == inputs.target_address
+        {
+            if let Some(value) = inputs.value.transfer() {
+                if !value.is_zero() {
+                    self.pending_self_transfer = Some((inputs.caller, value));
+                }
+            }
+        }
+
         None
     }
 
@@ -1063,6 +1115,16 @@ where
         // Scan journal entries accumulated during this call's execution BEFORE popping it,
         // so changes are attributed to the call that caused them.
         self.process_journal_changes(context);
+
+        // Emit synthetic balance changes for a pending self-transfer if the call succeeded
+        // (no-code target: step never fires but the transfer did happen). On failure
+        // (OutOfFunds / CallTooDeep) revm reverts the checkpoint, so we drop the pending
+        // entry without emitting.
+        if let Some((address, value)) = self.pending_self_transfer.take() {
+            if outcome.result.is_ok() {
+                self.emit_self_transfer_balance_changes(context, address, value);
+            }
+        }
 
         // Clear pending flag: if the call failed before executing any opcode (e.g.
         // OutOfFunds, CallTooDeep), step never ran to clear it.
