@@ -80,6 +80,22 @@ pub struct FirehoseInspector<'a> {
     /// correct on every chain.
     tx_post_pre_exec_sender_balance: Option<U256>,
 
+    /// Override for the depth-0 root-call sender balance change emitted by
+    /// `enter_frame_pre_hook`. When `None`, the inspector emits the change with reason
+    /// `GasBuy` (mainnet semantics: `validate_against_state_and_deduct_caller` charges the
+    /// caller for `gas_limit * gas_price`). When `Some(reason)`, the inspector emits with
+    /// the supplied reason instead and clears the override (single-shot, per-tx).
+    ///
+    /// The OP Stack uses this to flag deposit transactions: their depth-0 balance change
+    /// is the `mint` credit applied by `OpHandler::validate_against_state_and_deduct_caller`
+    /// (`balance + mint − effective_balance_spending`), not a gas buy. The chain-specific
+    /// `PreTxAdjust` impl detects deposit envelopes (`tx_type == OptimismDeposit`) and calls
+    /// [`Self::set_root_balance_reason`] with `IncreaseMint` before the depth-0 hook fires.
+    /// Any chain that needs a different reason here (e.g. `Burn` for a fee-burn variant) can
+    /// follow the same pattern from its own `PreTxAdjust`.
+    root_balance_reason_override:
+        Option<pb::sf::ethereum::r#type::v2::balance_change::Reason>,
+
     // increments at the end of each transaction, to get proper block index for logs
     log_block_index: u32,
 
@@ -120,6 +136,7 @@ impl<'a> FirehoseInspector<'a> {
             pending_selfdestruct_cleanups: Vec::new(),
             tx_journal_snapshot: Vec::new(),
             tx_post_pre_exec_sender_balance: None,
+            root_balance_reason_override: None,
             log_block_index: 0,
             trx_logs_count: 0,
         }
@@ -129,6 +146,16 @@ impl<'a> FirehoseInspector<'a> {
     /// methods (on_tx_start, on_tx_end, etc.) while the inspector owns the tracer borrow.
     pub fn tracer_mut(&mut self) -> &mut firehose_tracer::Tracer {
         self.tracer
+    }
+
+    /// Override the reason for the depth-0 root-call sender balance change emitted by the next
+    /// transaction. Single-shot: the override is consumed when the depth-0 hook fires. Intended
+    /// for chain-specific `PreTxAdjust` impls (see `root_balance_reason_override` field doc).
+    pub fn set_root_balance_reason(
+        &mut self,
+        reason: pb::sf::ethereum::r#type::v2::balance_change::Reason,
+    ) {
+        self.root_balance_reason_override = Some(reason);
     }
 
     /// Capture KECCAK256 preimage from the interpreter state.
@@ -382,11 +409,23 @@ impl<'a> FirehoseInspector<'a> {
         // Do NOT remove during refactors. See `resolve_post_tx_balance_*` tests.
         self.tx_post_pre_exec_sender_balance = Some(account.info.balance);
 
+        // Reason for the depth-0 sender balance change. Defaults to `GasBuy` (mainnet
+        // semantics: `validate_against_state_and_deduct_caller` charges the caller for
+        // `gas_limit * gas_price`). Chain-specific `PreTxAdjust` impls can override this via
+        // [`Self::set_root_balance_reason`] before the depth-0 hook fires — e.g. OP Stack uses
+        // `IncreaseMint` for deposit txs whose depth-0 change is `balance + mint − spending`,
+        // not a gas buy. The override is single-shot (consumed via `.take()`) so the next tx
+        // starts clean.
+        let reason = self
+            .root_balance_reason_override
+            .take()
+            .unwrap_or(pb::sf::ethereum::r#type::v2::balance_change::Reason::GasBuy);
+
         self.tracer.on_balance_change(
             caller,
             account.original_info.balance,
             account.info.balance,
-            pb::sf::ethereum::r#type::v2::balance_change::Reason::GasBuy,
+            reason,
         );
 
         // See `deduct_caller_nonce_emission` for why we emit `(old, old+1)`
@@ -1328,6 +1367,16 @@ pub trait FirehoseInspectorApi {
     /// executor wrapper (`on_system_call_start/end`, `on_tx_start/end`).
     fn tracer_mut(&mut self) -> &mut firehose_tracer::Tracer;
 
+    /// Override the reason emitted for the depth-0 root-call sender balance change of the next
+    /// transaction (single-shot, consumed when the depth-0 hook fires). Default behavior — no
+    /// override — emits `GasBuy`. Chain-specific [`PreTxAdjust`](crate::PreTxAdjust) impls call
+    /// this to flag e.g. OP Stack deposit txs as `IncreaseMint`. See
+    /// [`FirehoseInspector::set_root_balance_reason`] for the full contract.
+    fn set_root_balance_reason(
+        &mut self,
+        reason: pb::sf::ethereum::r#type::v2::balance_change::Reason,
+    );
+
     /// Type-erased version of [`FirehoseInspector::process_post_tx_balance_changes`].
     ///
     /// `get_pre_tx_balance` is passed as a trait object so the call site does not need to be
@@ -1349,6 +1398,13 @@ pub trait FirehoseInspectorApi {
 impl<'a> FirehoseInspectorApi for FirehoseInspector<'a> {
     fn tracer_mut(&mut self) -> &mut firehose_tracer::Tracer {
         self.tracer
+    }
+
+    fn set_root_balance_reason(
+        &mut self,
+        reason: pb::sf::ethereum::r#type::v2::balance_change::Reason,
+    ) {
+        Self::set_root_balance_reason(self, reason);
     }
 
     fn process_post_tx_balance_changes_erased(
@@ -1836,5 +1892,33 @@ mod tests {
              this is the negative control that justifies the seeded path"
         );
         assert_eq!(unseeded, U256::from(0xf5_u64));
+    }
+
+    /// Pins the `set_root_balance_reason` contract: the override defaults to `None`, gets
+    /// set by the public setter, and is single-shot (consumed via `.take()` by the depth-0
+    /// hook). A future refactor that drops the `.take()` would let the previous tx's reason
+    /// leak into the next tx — this test is the canary for that.
+    #[test]
+    fn root_balance_reason_override_is_single_shot() {
+        use pb::sf::ethereum::r#type::v2::balance_change::Reason;
+        let mut tracer = firehose_tracer::Tracer::new_with_writer(
+            firehose_tracer::config::Config::default(),
+            Box::new(Vec::<u8>::new()),
+        );
+        let mut inspector = FirehoseInspector::new(&mut tracer);
+
+        // Default: no override.
+        assert_eq!(inspector.root_balance_reason_override, None);
+
+        // Setter installs the override.
+        inspector.set_root_balance_reason(Reason::IncreaseMint);
+        assert_eq!(inspector.root_balance_reason_override, Some(Reason::IncreaseMint));
+
+        // The depth-0 hook reads it via `.take()`. Simulating that here pins the consumption
+        // contract: after one read the override is cleared, so the next tx starts clean even
+        // if its `PreTxAdjust` impl decides not to install one.
+        let consumed = inspector.root_balance_reason_override.take();
+        assert_eq!(consumed, Some(Reason::IncreaseMint));
+        assert_eq!(inspector.root_balance_reason_override, None);
     }
 }
