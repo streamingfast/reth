@@ -387,6 +387,12 @@ impl<'a> FirehoseInspector<'a> {
         {
             self.tracer.on_nonce_change(caller, old, new);
         }
+
+        // Replay the EIP-7702 auth list BEFORE on_call_enter so emissions land in the
+        // tracer's deferred_call_state and are prepended to the root call. This matches
+        // Geth's ordering: auth-list nonce/code changes carry ordinals less than the
+        // root call's beginOrdinal.
+        self.process_eip7702_auth_list(context);
     }
 
     /// Process SELFDESTRUCT balance changes from journal entries pushed during the opcode.
@@ -513,10 +519,15 @@ impl<'a> FirehoseInspector<'a> {
     /// state initialized from `original_info`, to emit one code change and one nonce change
     /// per applied auth in chronological order.
     ///
-    /// After the replay, the caller advances `journal_processed_up_to` past the
-    /// EIP-7702 journal entries so that `process_journal_changes` won't re-process them.
+    /// Must be called at root-call entry (depth=0) BEFORE `on_call_enter`, so the
+    /// emitted nonce/code changes land in the tracer's `deferred_call_state` and get
+    /// prepended to the root call (matching Geth's ordering: auth-list ordinals fall
+    /// below the root call's `beginOrdinal`).
     ///
-    /// Must be called at root-call entry (depth=0) AFTER `on_call_enter`.
+    /// `journal_processed_up_to` is already advanced past these EIP-7702 journal entries
+    /// by the caller's earlier `journal_processed_up_to = journal().len()` snapshot
+    /// (the snapshot is taken after `apply_eip7702_auth_list` has already written its
+    /// journal entries), so `process_journal_changes` will skip the entries.
     fn process_eip7702_auth_list<CTX>(&mut self, context: &mut CTX)
     where
         CTX: ContextTr,
@@ -631,12 +642,14 @@ impl<'a> FirehoseInspector<'a> {
             let old_code = tracked_code.clone();
             let old_nonce = *tracked_nonce;
 
+            // Geth's `applyAuthorization` calls `SetNonce` then `SetCode` (state_transition.go),
+            // firing OnNonceChange before OnCodeChange. Match that ordering so per-auth ordinals
+            // come out as (nonce, code) pairs.
+            self.tracer.on_nonce_change(authority, old_nonce, old_nonce + 1);
             // Emit code change only when the hash actually differs.
             if old_hash != new_hash {
                 self.tracer.on_code_change(authority, old_hash, new_hash, &old_code, &new_code);
             }
-            // Always emit nonce change for each applied auth.
-            self.tracer.on_nonce_change(authority, old_nonce, old_nonce + 1);
 
             // Advance per-authority tracker.
             *tracked_nonce = old_nonce + 1;
@@ -1075,16 +1088,6 @@ where
                     self.tracer.set_current_call_address_delegates_to(eip7702);
                 }
             }
-        }
-
-        // At root call entry, replay the EIP-7702 auth list to emit one code change and
-        // one nonce change per applied auth in chronological order. This correctly captures
-        // intermediate states when the same authority appears multiple times in the list.
-        if depth == 0 {
-            self.process_eip7702_auth_list(context);
-            // Advance past EIP-7702 journal entries so process_journal_changes won't
-            // re-process the CodeChange/NonceBump entries we just handled.
-            self.journal_processed_up_to = context.journal().journal().len();
         }
 
         // After this hook returns, revm's frame_init will push a BalanceTransfer for the
