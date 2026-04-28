@@ -194,13 +194,7 @@ impl<Inner> FirehoseWrappedExecutor<Inner, NoPostTxExtras, NoPreTxAdjust> {
     /// Wraps `inner` with Firehose tracer hooks. `withdrawals` is consumed inside
     /// [`Self::finish`] to emit per-address balance changes for EIP-4895 validator withdrawals.
     pub const fn new(inner: Inner, withdrawals: Option<Withdrawals>) -> Self {
-        Self {
-            inner,
-            withdrawals,
-            log_index: 0,
-            extras: NoPostTxExtras,
-            adjust: NoPreTxAdjust,
-        }
+        Self { inner, withdrawals, log_index: 0, extras: NoPostTxExtras, adjust: NoPreTxAdjust }
     }
 }
 
@@ -448,8 +442,8 @@ where
 ///
 /// An implementation must:
 ///  1. build the inspector-capable EVM via [`ConfigureEvm::evm_with_env_and_inspector`],
-///  2. wrap the resulting executor in [`FirehoseWrappedExecutor::with_hooks`] with
-///     whatever chain-specific hooks are desired,
+///  2. wrap the resulting executor in [`FirehoseWrappedExecutor::with_hooks`] with whatever
+///     chain-specific hooks are desired,
 ///  3. call `.execute_block(..)` and return the result.
 ///
 /// The implementation must NOT emit `on_block_start` / `on_block_end` — those are owned
@@ -462,10 +456,7 @@ pub trait ChainHooks<F: ConfigureEvm>: Send + Sync + Clone + Unpin + 'static {
         db: &mut State<DB>,
         block: &RecoveredBlock<<F::Primitives as NodePrimitives>::Block>,
         tracer: &mut FirehoseBlockTracer,
-    ) -> Result<
-        BlockExecutionResult<<F::Primitives as NodePrimitives>::Receipt>,
-        BlockExecutionError,
-    >;
+    ) -> Result<BlockExecutionResult<<F::Primitives as NodePrimitives>::Receipt>, BlockExecutionError>;
 }
 
 /// No-op [`ChainHooks`] for mainnet Ethereum — installs [`NoPostTxExtras`] / [`NoPreTxAdjust`].
@@ -488,10 +479,8 @@ where
         db: &mut State<DB>,
         block: &RecoveredBlock<<F::Primitives as NodePrimitives>::Block>,
         tracer: &mut FirehoseBlockTracer,
-    ) -> Result<
-        BlockExecutionResult<<F::Primitives as NodePrimitives>::Receipt>,
-        BlockExecutionError,
-    > {
+    ) -> Result<BlockExecutionResult<<F::Primitives as NodePrimitives>::Receipt>, BlockExecutionError>
+    {
         // Safe to use `run_wrapped_block` here: its `for<'a> NoPostTxExtras: PostTxExtras<..>`
         // HRTB is trivially satisfied by [`NoPostTxExtras`]'s blanket `impl<E: Evm>`.
         run_wrapped_block::<F, DB, NoPostTxExtras, NoPreTxAdjust>(

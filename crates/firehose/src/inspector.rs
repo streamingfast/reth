@@ -8,8 +8,9 @@ use reth_revm::revm::{
     context_interface::{ContextTr, JournalTr},
     inspector::{Inspector, JournalExt},
     interpreter::{
-        interpreter::EthInterpreter, interpreter_types::Jumps, CallInputs, CallOutcome,
-        CreateInputs, CreateOutcome, Interpreter,
+        interpreter::EthInterpreter,
+        interpreter_types::{Jumps, LoopControl},
+        CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter,
     },
     primitives::KECCAK_EMPTY,
 };
@@ -21,6 +22,11 @@ use std::{
 struct StepContext {
     start_journal_idx: usize,
     opcode: u8,
+    /// For KECCAK256: preimage captured in `step` (where stack still holds offset/size),
+    /// emitted from `step_end` only when the opcode did not halt. Mirrors Geth's firehose
+    /// tracer, which hooks the opcode body after the gas charge and so emits no preimage
+    /// when KECCAK256 fails (e.g. OOG on memory expansion).
+    keccak_preimage: Option<(B256, Vec<u8>)>,
 }
 
 /// FirehoseInspector captures execution traces for the Firehose format
@@ -93,8 +99,7 @@ pub struct FirehoseInspector<'a> {
     /// [`Self::set_root_balance_reason`] with `IncreaseMint` before the depth-0 hook fires.
     /// Any chain that needs a different reason here (e.g. `Burn` for a fee-burn variant) can
     /// follow the same pattern from its own `PreTxAdjust`.
-    root_balance_reason_override:
-        Option<pb::sf::ethereum::r#type::v2::balance_change::Reason>,
+    root_balance_reason_override: Option<pb::sf::ethereum::r#type::v2::balance_change::Reason>,
 
     // increments at the end of each transaction, to get proper block index for logs
     log_block_index: u32,
@@ -166,18 +171,17 @@ impl<'a> FirehoseInspector<'a> {
     /// Since `step` fires before memory resize, the memory region may not yet
     /// be allocated. Like Geth's `scope.Memory.GetPtr`, we zero-pad any bytes
     /// beyond current memory length to produce a complete preimage.
-    fn step_keccak256(
-        tracer: &mut firehose_tracer::Tracer,
-        interp: &mut Interpreter<EthInterpreter>,
-    ) {
+    ///
+    /// Returns the (hash, preimage) pair to be emitted later from `step_end` if the
+    /// opcode actually executes successfully.
+    fn step_keccak256(interp: &mut Interpreter<EthInterpreter>) -> Option<(B256, Vec<u8>)> {
         let (Ok(offset), Ok(size)) = (interp.stack.peek(0), interp.stack.peek(1)) else {
-            return;
+            return None;
         };
 
         let len = size.saturating_to::<usize>();
         if len == 0 {
-            tracer.on_keccak_preimage(alloy_primitives::utils::KECCAK256_EMPTY, &[]);
-            return;
+            return Some((alloy_primitives::utils::KECCAK256_EMPTY, Vec::new()));
         }
 
         let offset = offset.saturating_to::<usize>();
@@ -187,7 +191,7 @@ impl<'a> FirehoseInspector<'a> {
             // Happy path: entire region is within current memory, no allocation
             let preimage = interp.memory.slice_len(offset, len);
             let hash = alloy_primitives::keccak256(&*preimage);
-            tracer.on_keccak_preimage(hash, &preimage);
+            Some((hash, preimage.to_vec()))
         } else {
             // Memory not yet resized (step fires before resize_memory!).
             // Zero-pad like Geth's Memory.GetPtr to produce a complete preimage.
@@ -197,7 +201,7 @@ impl<'a> FirehoseInspector<'a> {
                 buf[..copy_len].copy_from_slice(&interp.memory.slice_len(offset, copy_len));
             }
             let hash = alloy_primitives::keccak256(&buf);
-            tracer.on_keccak_preimage(hash, &buf);
+            Some((hash, buf))
         }
     }
 
@@ -666,8 +670,8 @@ impl<'a> FirehoseInspector<'a> {
                 auth_tracker.get_mut(&authority).unwrap();
 
             // 4. Code must be empty or an EIP-7702 delegation designator.
-            let code_eligible = *tracked_code_hash == KECCAK_EMPTY
-                || (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
+            let code_eligible = *tracked_code_hash == KECCAK_EMPTY ||
+                (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
             if !code_eligible {
                 continue;
             }
@@ -967,17 +971,17 @@ impl<'a> FirehoseInspector<'a> {
             InstructionResult::Revert => "execution reverted".to_string(),
             InstructionResult::CallTooDeep => "max call depth exceeded".to_string(),
             InstructionResult::OutOfFunds => "insufficient balance for transfer".to_string(),
-            InstructionResult::CreateInitCodeStartingEF00
-            | InstructionResult::InvalidEOFInitCode
-            | InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
+            InstructionResult::CreateInitCodeStartingEF00 |
+            InstructionResult::InvalidEOFInitCode |
+            InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
 
             // Out-of-gas variants — Geth distinguishes CREATE vs CALL context
-            InstructionResult::OutOfGas
-            | InstructionResult::MemoryOOG
-            | InstructionResult::MemoryLimitOOG
-            | InstructionResult::PrecompileOOG
-            | InstructionResult::InvalidOperandOOG
-            | InstructionResult::ReentrancySentryOOG => {
+            InstructionResult::OutOfGas |
+            InstructionResult::MemoryOOG |
+            InstructionResult::MemoryLimitOOG |
+            InstructionResult::PrecompileOOG |
+            InstructionResult::InvalidOperandOOG |
+            InstructionResult::ReentrancySentryOOG => {
                 if is_create {
                     "contract creation code storage out of gas".to_string()
                 } else {
@@ -990,8 +994,8 @@ impl<'a> FirehoseInspector<'a> {
             InstructionResult::InvalidJump => "invalid jump destination".to_string(),
             InstructionResult::StackOverflow => "stack limit reached 1024 (1023)".to_string(),
             InstructionResult::StackUnderflow => "stack underflow".to_string(),
-            InstructionResult::CallNotAllowedInsideStatic
-            | InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
+            InstructionResult::CallNotAllowedInsideStatic |
+            InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
             InstructionResult::CreateCollision => "contract address collision".to_string(),
             InstructionResult::CreateContractSizeLimit => "max code size exceeded".to_string(),
             InstructionResult::CreateContractStartingWithEF => {
@@ -1050,22 +1054,36 @@ where
         let gas = interp.gas.remaining();
         let depth = journal.depth() as i32;
 
-        self.last_step =
-            Some(StepContext { start_journal_idx: journal.journal().len(), opcode: op });
+        let start_journal_idx = journal.journal().len();
 
         self.tracer.on_opcode(pc, op, gas, 0, &[], depth, None);
 
-        if op == Opcode::Keccak256 as u8 {
-            Self::step_keccak256(&mut self.tracer, interp);
-        }
+        // For KECCAK256, capture the (hash, preimage) now while the stack still holds
+        // offset/size, but defer emission to `step_end` so that we only record preimages
+        // for opcodes that actually executed (not those that halt with OOG on memory
+        // expansion or other dynamic-gas failures). Matches Geth's firehose tracer, which
+        // hooks the opcode body after the gas charge.
+        let keccak_preimage =
+            (op == Opcode::Keccak256 as u8).then(|| Self::step_keccak256(interp)).flatten();
+
+        self.last_step = Some(StepContext { start_journal_idx, opcode: op, keccak_preimage });
     }
 
     /// Called after each opcode executes; used to detect SSTORE and SELFDESTRUCT state changes.
-    fn step_end(&mut self, _interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
+    fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
         let step_ctx = match self.last_step.take() {
             Some(ctx) => ctx,
             None => return,
         };
+
+        // Emit KECCAK256 preimage only when the opcode actually executed. revm's interpreter
+        // loop calls step_end after every dispatched opcode regardless of outcome; a halted
+        // opcode (e.g., OOG on memory expansion) sets an action which we detect via is_end().
+        if let Some((hash, preimage)) = step_ctx.keccak_preimage {
+            if !interp.bytecode.is_end() {
+                self.tracer.on_keccak_preimage(hash, &preimage);
+            }
+        }
 
         use reth_revm::revm::context::JournalEntry;
 
