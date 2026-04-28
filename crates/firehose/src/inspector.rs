@@ -627,8 +627,8 @@ impl<'a> FirehoseInspector<'a> {
                 auth_tracker.get_mut(&authority).unwrap();
 
             // 4. Code must be empty or an EIP-7702 delegation designator.
-            let code_eligible = *tracked_code_hash == KECCAK_EMPTY ||
-                (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
+            let code_eligible = *tracked_code_hash == KECCAK_EMPTY
+                || (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
             if !code_eligible {
                 continue;
             }
@@ -928,17 +928,17 @@ impl<'a> FirehoseInspector<'a> {
             InstructionResult::Revert => "execution reverted".to_string(),
             InstructionResult::CallTooDeep => "max call depth exceeded".to_string(),
             InstructionResult::OutOfFunds => "insufficient balance for transfer".to_string(),
-            InstructionResult::CreateInitCodeStartingEF00 |
-            InstructionResult::InvalidEOFInitCode |
-            InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
+            InstructionResult::CreateInitCodeStartingEF00
+            | InstructionResult::InvalidEOFInitCode
+            | InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
 
             // Out-of-gas variants — Geth distinguishes CREATE vs CALL context
-            InstructionResult::OutOfGas |
-            InstructionResult::MemoryOOG |
-            InstructionResult::MemoryLimitOOG |
-            InstructionResult::PrecompileOOG |
-            InstructionResult::InvalidOperandOOG |
-            InstructionResult::ReentrancySentryOOG => {
+            InstructionResult::OutOfGas
+            | InstructionResult::MemoryOOG
+            | InstructionResult::MemoryLimitOOG
+            | InstructionResult::PrecompileOOG
+            | InstructionResult::InvalidOperandOOG
+            | InstructionResult::ReentrancySentryOOG => {
                 if is_create {
                     "contract creation code storage out of gas".to_string()
                 } else {
@@ -951,8 +951,8 @@ impl<'a> FirehoseInspector<'a> {
             InstructionResult::InvalidJump => "invalid jump destination".to_string(),
             InstructionResult::StackOverflow => "stack limit reached 1024 (1023)".to_string(),
             InstructionResult::StackUnderflow => "stack underflow".to_string(),
-            InstructionResult::CallNotAllowedInsideStatic |
-            InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
+            InstructionResult::CallNotAllowedInsideStatic
+            | InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
             InstructionResult::CreateCollision => "contract address collision".to_string(),
             InstructionResult::CreateContractSizeLimit => "max code size exceeded".to_string(),
             InstructionResult::CreateContractStartingWithEF => {
@@ -1111,9 +1111,7 @@ where
         // revm short-circuits these in `transfer_loaded` without pushing a BalanceTransfer
         // entry, so we record the pending transfer here and emit the synthetic
         // debit/credit pair when the frame starts executing or exits successfully.
-        if matches!(inputs.scheme, CallScheme::Call)
-            && inputs.caller == inputs.target_address
-        {
+        if matches!(inputs.scheme, CallScheme::Call) && inputs.caller == inputs.target_address {
             if let Some(value) = inputs.value.transfer() {
                 if !value.is_zero() {
                     self.pending_self_transfer = Some((inputs.caller, value));
@@ -1211,12 +1209,6 @@ where
         };
 
         log_journal("create_enter", context);
-
-        // For root-level CREATE/CREATE2 (depth 0), the TxEvent.to was None (contract creation),
-        // leaving the transaction trace's `to` field empty. Patch it now that we know the address.
-        if depth == 0 {
-            self.tracer.set_transaction_to(created_address);
-        }
 
         self.enter_frame_pre_hook(context, inputs.caller());
 
