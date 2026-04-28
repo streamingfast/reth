@@ -369,6 +369,19 @@ impl<'a> FirehoseInspector<'a> {
 
         let Some(account) = context.journal().evm_state().get(&caller) else { return };
 
+        // REGRESSION GUARD: snapshot the live post-pre-exec sender balance so
+        // `process_post_tx_balance_changes` can use it as the gas-refund `old_balance`
+        // instead of recomputing via `first BalanceChange.old_balance − gas_buy_cost`.
+        // The recompute formula is correct on mainnet (gas buy is the only pre-exec
+        // deduction) but **wrong on OP Stack**, where
+        // `validate_against_state_and_deduct_caller` folds gas_buy + L1_cost
+        // (+ Isthmus operator fee) into a single `set_balance` whose journal entry
+        // only records `old_balance = pre_tx`. Without this snapshot, OP transactions
+        // emit a gas-refund `old_balance` that is higher than the gas-buy `new_balance`
+        // by `(L1 + operator_fee)` — exactly the bug this line is here to prevent.
+        // Do NOT remove during refactors. See `resolve_post_tx_balance_*` tests.
+        self.tx_post_pre_exec_sender_balance = Some(account.info.balance);
+
         self.tracer.on_balance_change(
             caller,
             account.original_info.balance,
@@ -1699,5 +1712,137 @@ mod tests {
             &mut get_pre,
         );
         assert_eq!(resolved, pre_tx_coinbase);
+    }
+
+    // ----------------------------------------------------------------------
+    // Regression guards for the `tx_post_pre_exec_sender_balance` snapshot
+    // path (`enter_frame_pre_hook` → `resolve_post_tx_balance`).
+    //
+    // Background: commit `e23632b3` introduced the `initial_balance: Option<U256>`
+    // parameter and the `tx_post_pre_exec_sender_balance` field to fix an OP Stack
+    // bug where the gas-refund event's `old_balance` was higher than the gas-buy
+    // event's `new_balance`. A subsequent refactor (`59843d61c`) extracted the
+    // depth-0 root-entry block into `enter_frame_pre_hook` and silently dropped
+    // the snapshot assignment, regressing the fix. The tests below pin both the
+    // function-level contract and the user-visible invariant so future refactors
+    // surface the regression immediately.
+    // ----------------------------------------------------------------------
+
+    /// When the seed is `Some(..)` and the sender has NO journal entries (e.g. a
+    /// reverted root call that touched no other accounts), the seed must flow
+    /// through unchanged. Guards against a "fix" that requires a journal entry to
+    /// produce a result on the seeded path.
+    #[test]
+    fn resolve_post_tx_balance_seeded_with_no_sender_journal_entries_returns_seed() {
+        let sender = addr(0xAA);
+        let other = addr(0xBB);
+        let post_pre_exec = U256::from(0xea_u64);
+
+        // Journal entries exist but none reference the sender.
+        let journal = vec![balance_change(other, U256::from(0x100_u64))];
+        let mut get_pre = |_: Address| panic!("must not fall back to get_pre_tx_balance");
+
+        let resolved = FirehoseInspector::resolve_post_tx_balance(
+            sender,
+            Some(post_pre_exec),
+            U256::from(0x05_u64), // gas_buy_cost ignored on the seeded path
+            &journal,
+            &mut get_pre,
+        );
+        assert_eq!(resolved, post_pre_exec);
+    }
+
+    /// `AccountDestroyed` for the sender (degenerate case — sender SELFDESTRUCTs
+    /// itself within the tx) must dominate the seed: balance becomes zero.
+    #[test]
+    fn resolve_post_tx_balance_seeded_then_account_destroyed_yields_zero() {
+        let sender = addr(0xAA);
+        let post_pre_exec = U256::from(0xea_u64);
+
+        let journal = vec![JournalEntry::AccountDestroyed {
+            had_balance: post_pre_exec,
+            address: sender,
+            target: addr(0xBB),
+            destroyed_status:
+                reth_revm::revm::context_interface::journaled_state::entry::SelfdestructionRevertStatus::LocallySelfdestroyed,
+        }];
+        let mut get_pre = |_: Address| panic!("must not fall back to get_pre_tx_balance");
+
+        let resolved = FirehoseInspector::resolve_post_tx_balance(
+            sender,
+            Some(post_pre_exec),
+            U256::ZERO,
+            &journal,
+            &mut get_pre,
+        );
+        assert_eq!(resolved, U256::ZERO);
+    }
+
+    /// Pins the OP-stack bug from the report: when the sender has no balance
+    /// activity between pre-exec deduction and post-exec refund (no transfers,
+    /// no precompile-driven BalanceChange), the gas-refund event's `old_balance`
+    /// must equal the gas-buy event's `new_balance`. Any deviation in that
+    /// scenario means `additional_op_cost` (L1 fee + operator fee on Isthmus)
+    /// was double-counted somewhere.
+    ///
+    /// (When the sender does see transfers mid-tx, the two values legitimately
+    /// diverge — `resolve_post_tx_balance` replays `BalanceTransfer` entries
+    /// to track that, and the gas-refund `old_balance` reflects the live
+    /// post-execution balance, not the post-pre-exec snapshot.)
+    ///
+    /// Reproduces the exact `0xfa / 0xea` numbers from the base-mainnet bug
+    /// report. Without seeding (`initial_balance = None`), the journal-walk
+    /// fallback computes `0xfa - 0x05 = 0xf5` — a value strictly greater than
+    /// `0xea` and visibly broken in the trace. With seeding, the contract holds.
+    #[test]
+    fn resolve_post_tx_balance_op_invariant_gas_refund_old_equals_gas_buy_new() {
+        let sender = addr(0xAA);
+        let pre_tx = U256::from(0xfa_u64);
+        let gas_buy_cost = U256::from(0x05_u64);
+        let l1_plus_operator_fee = U256::from(0x0b_u64);
+        // What the OP handler actually wrote to the live account balance:
+        // `pre_tx − gas_buy − (L1 + operator)`.
+        let live_post_pre_exec = pre_tx - gas_buy_cost - l1_plus_operator_fee;
+        assert_eq!(live_post_pre_exec, U256::from(0xea_u64));
+
+        // Single combined journal entry recorded by
+        // `validate_against_state_and_deduct_caller`.
+        let journal = vec![balance_change(sender, pre_tx)];
+        let mut get_pre = |_: Address| pre_tx;
+
+        // Invariant under test: gas-buy `new_balance` (= live post-pre-exec balance)
+        // must equal gas-refund `old_balance` (= what the consumer reads back).
+        let gas_buy_new = live_post_pre_exec;
+        let gas_refund_old = FirehoseInspector::resolve_post_tx_balance(
+            sender,
+            Some(live_post_pre_exec), // what `enter_frame_pre_hook` snapshots
+            gas_buy_cost,
+            &journal,
+            &mut get_pre,
+        );
+        assert_eq!(
+            gas_refund_old, gas_buy_new,
+            "OP gas-refund old_balance must equal gas-buy new_balance — \
+             if this fails, the call site likely stopped seeding \
+             tx_post_pre_exec_sender_balance"
+        );
+
+        // Negative control: confirm the un-seeded path still produces the wrong
+        // value. If this assertion ever flips, the broken-derivation test below
+        // is no longer load-bearing and the OP-fold semantics have changed
+        // upstream — re-evaluate the seeded path then.
+        let unseeded = FirehoseInspector::resolve_post_tx_balance(
+            sender,
+            None,
+            gas_buy_cost,
+            &journal,
+            &mut get_pre,
+        );
+        assert_ne!(
+            unseeded, gas_buy_new,
+            "un-seeded path must still produce the broken (over-counted) value — \
+             this is the negative control that justifies the seeded path"
+        );
+        assert_eq!(unseeded, U256::from(0xf5_u64));
     }
 }
