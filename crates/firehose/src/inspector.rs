@@ -1269,6 +1269,9 @@ where
 
         self.enter_frame_pre_hook(context, inputs.caller());
 
+        // `on_call_enter` auto-patches the transaction's `to` field for root CREATE/CREATE2
+        // (the original `TxEvent.to` is None for contract-creation txs), so no explicit patch
+        // is needed here.
         self.tracer.on_call_enter(
             depth,
             call_type,

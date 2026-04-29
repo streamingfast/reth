@@ -16,21 +16,36 @@ use alloy_consensus::BlockHeader;
 use alloy_primitives::Sealable;
 use reth_node_api::NodePrimitives;
 use reth_primitives_traits::{Block as BlockTrait, BlockBody, SealedBlock};
-use std::{fmt::Debug, sync::MutexGuard};
+use std::{fmt::Debug, ops::DerefMut, sync::MutexGuard};
 
 use crate::{inspector::FirehoseInspector, mapper};
 
-/// Drop guard wrapping the global tracer's `MutexGuard` for the duration of a single block.
+/// Default tracer-handle type: a `MutexGuard` over the process-wide global tracer.
+pub type GlobalTracerGuard = MutexGuard<'static, firehose_tracer::Tracer>;
+
+/// Drop guard wrapping a tracer handle for the duration of a single block.
+///
+/// `G` is the tracer-handle type. By default it's [`GlobalTracerGuard`] — i.e. a `MutexGuard`
+/// pointing at the process-wide tracer installed via [`crate::init_tracer`]. Tests and other
+/// callers that need a self-contained tracer can use `FirehoseBlockTracer<&'a mut
+/// firehose_tracer::Tracer>` via [`FirehoseBlockTracer::start_local`] to bypass the global
+/// entirely.
 ///
 /// See the module-level documentation for the full lifecycle contract.
-pub struct FirehoseBlockTracer {
-    guard: MutexGuard<'static, firehose_tracer::Tracer>,
+pub struct FirehoseBlockTracer<G = GlobalTracerGuard>
+where
+    G: DerefMut<Target = firehose_tracer::Tracer>,
+{
+    guard: G,
     status: Status,
     /// `true` if this guard was created for block 1 (the genesis marker).
     is_genesis: bool,
 }
 
-impl Debug for FirehoseBlockTracer {
+impl<G> Debug for FirehoseBlockTracer<G>
+where
+    G: DerefMut<Target = firehose_tracer::Tracer>,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FirehoseBlockTracer")
             .field("status", &self.status)
@@ -39,7 +54,7 @@ impl Debug for FirehoseBlockTracer {
     }
 }
 
-impl FirehoseBlockTracer {
+impl FirehoseBlockTracer<GlobalTracerGuard> {
     /// Acquires the global tracer and emits the start-of-block event.
     ///
     /// For block 1 this emits `on_genesis_block` (with an empty genesis alloc — the caller is
@@ -84,7 +99,52 @@ impl FirehoseBlockTracer {
         }
         Self { guard, status: Status::Started, is_genesis }
     }
+}
 
+impl<'a> FirehoseBlockTracer<&'a mut firehose_tracer::Tracer> {
+    /// Borrow-based variant of [`Self::start`] that drives the block lifecycle through a
+    /// caller-supplied tracer instance instead of the process-wide global.
+    ///
+    /// This is intended for tests and one-off integration harnesses that need a self-contained
+    /// tracer (e.g. one whose output writer is an in-memory buffer they can later inspect).
+    /// Callers must keep the tracer alive for the lifetime of the returned guard.
+    pub fn start_local<N>(
+        tracer: &'a mut firehose_tracer::Tracer,
+        block: &SealedBlock<N::Block>,
+        finalized: Option<firehose_tracer::types::FinalizedBlockRef>,
+    ) -> Self
+    where
+        N: NodePrimitives,
+        N::Block: BlockTrait,
+        <N::Block as BlockTrait>::Header: BlockHeader + Sealable,
+        <N::Block as BlockTrait>::Body: BlockBody,
+        <<N::Block as BlockTrait>::Body as BlockBody>::OmmerHeader: BlockHeader + Sealable,
+    {
+        let is_genesis = block.header().number() == 1;
+        if is_genesis {
+            tracer.on_genesis_block(
+                firehose_tracer::types::BlockEvent {
+                    block: mapper::to_block_data(block),
+                    finalized,
+                    flash_block: None,
+                },
+                Default::default(),
+            );
+        } else {
+            tracer.on_block_start(firehose_tracer::types::BlockEvent {
+                block: mapper::to_block_data(block),
+                finalized,
+                flash_block: None,
+            });
+        }
+        Self { guard: tracer, status: Status::Started, is_genesis }
+    }
+}
+
+impl<G> FirehoseBlockTracer<G>
+where
+    G: DerefMut<Target = firehose_tracer::Tracer>,
+{
     /// Returns `true` if this guard was created for the genesis marker (block 1).
     pub const fn is_genesis(&self) -> bool {
         self.is_genesis
@@ -133,7 +193,10 @@ impl FirehoseBlockTracer {
     }
 }
 
-impl Drop for FirehoseBlockTracer {
+impl<G> Drop for FirehoseBlockTracer<G>
+where
+    G: DerefMut<Target = firehose_tracer::Tracer>,
+{
     fn drop(&mut self) {
         // Safety net: any early-return path that fails to call mark_verified/mark_failed ends here.
         // Treat it as failure so the block is discarded rather than flushed. Genesis is exempt:

@@ -483,7 +483,7 @@ where
     {
         // Safe to use `run_wrapped_block` here: its `for<'a> NoPostTxExtras: PostTxExtras<..>`
         // HRTB is trivially satisfied by [`NoPostTxExtras`]'s blanket `impl<E: Evm>`.
-        run_wrapped_block::<F, DB, NoPostTxExtras, NoPreTxAdjust>(
+        run_wrapped_block::<F, DB, NoPostTxExtras, NoPreTxAdjust, _>(
             evm_config,
             db,
             block,
@@ -670,17 +670,31 @@ where
 /// Runs a single block through a [`FirehoseWrappedExecutor`] using the existing tracer guard for
 /// mid-block event emission. Does not emit `on_block_start`/`on_block_end` — those are owned by
 /// the caller via the [`FirehoseBlockTracer`] lifecycle.
-fn run_wrapped_block<F, DB, Extras, Adjust>(
+/// Builds a [`FirehoseWrappedExecutor`] around `evm_config`'s per-block executor with the tracer
+/// held by `tracer_guard` wired into the EVM as a [`crate::inspector::FirehoseInspector`], then
+/// runs the block.
+///
+/// The function is generic over the tracer-handle type `G`, so it works equally with the
+/// process-wide global guard ([`crate::block_tracer::GlobalTracerGuard`], the default) and with a
+/// caller-owned `&'a mut firehose_tracer::Tracer` produced by
+/// [`FirehoseBlockTracer::start_local`]. The latter form is used by the integration test harness
+/// to capture a single block's Firehose output into an in-memory buffer.
+///
+/// Does **not** emit `on_block_start` / `on_block_end` — those are owned by the
+/// [`FirehoseBlockTracer`] lifecycle (see [`FirehoseBlockTracer::start`] and
+/// [`FirehoseBlockTracer::mark_verified`]).
+pub fn run_wrapped_block<F, DB, Extras, Adjust, G>(
     evm_config: &F,
     db: &mut State<DB>,
     block: &RecoveredBlock<<F::Primitives as NodePrimitives>::Block>,
-    tracer_guard: &mut FirehoseBlockTracer,
+    tracer_guard: &mut FirehoseBlockTracer<G>,
     adjust: Adjust,
     extras: Extras,
 ) -> Result<BlockExecutionResult<<F::Primitives as NodePrimitives>::Receipt>, BlockExecutionError>
 where
     F: ConfigureEvm,
     DB: reth_evm::Database,
+    G: std::ops::DerefMut<Target = firehose_tracer::Tracer>,
     BlockTy<F::Primitives>: BlockTrait,
     <BlockTy<F::Primitives> as BlockTrait>::Header: BlockHeader + Sealable,
     <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,

@@ -15,10 +15,11 @@ pub mod prelude;
 /// Runner module for executing processing tasks.
 pub mod runner;
 
-pub use block_tracer::FirehoseBlockTracer;
+pub use block_tracer::{FirehoseBlockTracer, GlobalTracerGuard};
 pub use executor::{
-    ChainHooks, FirehoseBlockExecutor, FirehoseEvmConfig, FirehoseWrappedExecutor, NoChainHooks,
-    NoPostTxExtras, NoPreTxAdjust, PostTxExtras, PreTxAdjust,
+    run_wrapped_block, ChainHooks, FirehoseBlockExecutor, FirehoseEvmConfig,
+    FirehoseWrappedExecutor, NoChainHooks, NoPostTxExtras, NoPreTxAdjust, PostTxExtras,
+    PreTxAdjust,
 };
 pub use runner::run_exex;
 

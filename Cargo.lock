@@ -3992,7 +3992,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 [[package]]
 name = "firehose-tracer"
 version = "5.0.0-rc.0"
-source = "git+https://github.com/streamingfast/evm-firehose-tracer-rs.git?branch=main#483362cf5edb604dbb71df598582ceb1cde4ed55"
+source = "git+https://github.com/streamingfast/evm-firehose-tracer-rs.git?branch=main#142f38fb5fefb81fc4d019141f53adefec95f76a"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9000,6 +9000,32 @@ dependencies = [
  "reth-provider",
  "reth-revm",
  "reth-tracing",
+]
+
+[[package]]
+name = "reth-firehose-tests"
+version = "1.11.3"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-rlp",
+ "base64 0.22.1",
+ "eyre",
+ "firehose-tracer",
+ "hex",
+ "prost",
+ "reth-chainspec",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-firehose",
+ "reth-primitives-traits",
+ "reth-revm",
+ "revm",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
