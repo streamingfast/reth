@@ -13,14 +13,11 @@ fn nop_transfer() {
     assert_block_equals_golden(&outcome.block, &golden).expect("captured block must match golden");
 }
 
-/// Known divergence between reth and geth tracers: when an `SSTORE` runs out of gas inside a
-/// call frame that subsequently reverts, reth emits the would-have-been `StorageChange` record
-/// (with a shifted ordinal) while geth suppresses it. The captured Block matches the golden in
-/// every other respect.
-///
-/// Re-enable (drop `#[ignore]`) once both clients converge on a single behaviour.
+/// Regression: an `SSTORE` that runs out of gas on its dynamic cost must NOT emit a
+/// `StorageChange`. revm writes the `StorageChanged` journal entry before charging dynamic gas,
+/// so a naive journal scan would record the would-have-been change with a shifted ordinal even
+/// though the opcode halted and the write was reverted.
 #[test]
-#[ignore = "known reth/geth divergence: reverted-call StorageChange emission for SSTORE-OOG"]
 fn storage_sstore_oog() {
     let folder = case_dir("storage_sstore_oog");
     let outcome = run_prestate(&folder).expect("running storage_sstore_oog prestate must succeed");

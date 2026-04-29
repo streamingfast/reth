@@ -1088,18 +1088,25 @@ where
         use reth_revm::revm::context::JournalEntry;
 
         if step_ctx.opcode == Opcode::Sstore as u8 {
-            let journal = context.journal();
-            let new_entries = &journal.journal()[step_ctx.start_journal_idx..];
-            for entry in new_entries {
-                if let JournalEntry::StorageChanged { address, key, had_value } = entry {
-                    let new_value =
-                        context.journal().evm_state()[address].storage[key].present_value();
-                    self.tracer.on_storage_change(
-                        *address,
-                        B256::from(key.to_be_bytes::<32>()),
-                        B256::from(had_value.to_be_bytes::<32>()),
-                        B256::from(new_value.to_be_bytes::<32>()),
-                    );
+            // revm's SSTORE writes the `StorageChanged` journal entry inside `sstore_skip_cold_load`
+            // BEFORE charging dynamic gas. If dynamic gas then OOGs, the journal entry is already
+            // present even though the opcode halted and the storage write will be reverted. Geth's
+            // firehose tracer hooks the opcode body after the gas charge, so it never records that
+            // would-have-been change. Mirror that: skip emission when the interpreter halted.
+            if !interp.bytecode.is_end() {
+                let journal = context.journal();
+                let new_entries = &journal.journal()[step_ctx.start_journal_idx..];
+                for entry in new_entries {
+                    if let JournalEntry::StorageChanged { address, key, had_value } = entry {
+                        let new_value =
+                            context.journal().evm_state()[address].storage[key].present_value();
+                        self.tracer.on_storage_change(
+                            *address,
+                            B256::from(key.to_be_bytes::<32>()),
+                            B256::from(had_value.to_be_bytes::<32>()),
+                            B256::from(new_value.to_be_bytes::<32>()),
+                        );
+                    }
                 }
             }
         } else if step_ctx.opcode == Opcode::SelfDestruct as u8 {
