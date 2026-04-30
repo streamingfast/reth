@@ -1,0 +1,41 @@
+[package]
+name = "rbase64"
+version = "2.0.3"
+edition = "2021"
+description = "A fast multi-threaded base64 encoding library and CLI tool"
+authors = ["Marcel Riera <marcel.riera@outlook.com>"]
+license = "MIT OR Apache-2.0"
+keywords = ["base64", "encode", "decode"]
+categories = ["encoding", "command-line-utilities"]
+homepage = "https://github.com/uhmarcel/rbase64"
+repository = "https://github.com/uhmarcel/rbase64"
+readme = "README.md"
+
+[dependencies]
+mimalloc = { version = "0.1.32", default-features = false }
+clap = { version = "4.0", features = ["derive"], optional = true }
+rayon = { version = "1.6.0", optional = true }
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "2.1"
+chrono = { version = "0.4.23", default-features = false, features = ["clock"] }
+criterion = "0.4.0"
+rand = { version = "0.8.5", features = ["small_rng"] }
+
+[features]
+default = ["parallel"]
+cli = ["clap"]
+parallel = ["rayon"]
+
+[[bin]]
+name = "rbase64"
+required-features = ["cli"]
+
+[[test]]
+name = "cli-tests"
+required-features = ["cli"]
+
+[[bench]]
+name = "benchmarks"
+harness = false
