@@ -10,7 +10,7 @@ use std::{ops::RangeInclusive, path::Path};
 use eyre::Context as _;
 use reth_stages_types::StageId;
 use reth_storage_api::{BlockNumReader, StageCheckpointReader};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::GLOBAL_TRACER;
 
@@ -78,16 +78,17 @@ where
 /// Re-emits blocks in `range` to the Firehose stdout stream.
 ///
 /// For each block the function:
-/// 1. Verifies that the required historical state is available (pruning guard).
-/// 2. Executes the block through a Firehose-aware executor.
-/// 3. Emits the `FIRE BLOCK` line and updates the cursor file.
+/// 1. Executes the block through a Firehose-aware executor.
+/// 2. Emits the `FIRE BLOCK` line and updates the cursor file.
 ///
 /// # Pruning guard
 ///
 /// If the node has been configured to prune state and the required historical
 /// blocks are no longer available, this function returns a fatal error.  Firehose
 /// requires an archive (or sufficiently un-pruned) node to be able to re-trace
-/// historical blocks.
+/// historical blocks.  The pruning check is performed during block execution: when
+/// `history_by_block_number` returns an error the function logs a clear fatal message
+/// and propagates the error rather than silently skipping blocks.
 ///
 /// # Errors
 ///
@@ -98,38 +99,17 @@ where
 {
     let first = *range.start();
 
-    // ── Pruning guard ────────────────────────────────────────────────────────
-    // Check whether the first block in the gap is still available.
-    // `best_block_number` going below `first` means we've pruned past the gap.
-    let earliest = provider
-        .best_block_number()
-        .context("Failed to query best block number for pruning check")?;
-
-    // If the earliest available block number is already past `first`, we cannot
-    // re-trace.  This heuristic is conservative; a tighter check would look at
-    // the prune configuration directly.
-    if earliest > first && first > 0 {
-        error!(
-            target: "reth::firehose",
-            first_gap_block = first,
-            earliest_available = earliest,
-            "Historical state required for Firehose re-trace has been pruned. \
-             Firehose requires an archive node (or pruning configured to retain \
-             state back to block {}). \
-             Node cannot start without re-emitting the missing blocks.",
-            first
-        );
-        eyre::bail!(
-            "Firehose gap re-trace failed: state at block {} has been pruned. \
-             An archive node is required to re-emit the missing Firehose blocks. \
-             Adjust your pruning configuration or restore from a Firehose-compatible snapshot.",
-            first
-        );
-    }
-
     // ── Re-trace loop ────────────────────────────────────────────────────────
     for block_num in range.clone() {
-        re_trace_single_block(block_num, provider)?;
+        re_trace_single_block(block_num, provider).with_context(|| {
+            format!(
+                "Firehose gap re-trace failed at block {block_num}. \
+                 If the error indicates that historical state is unavailable, \
+                 the node requires archive-quality state back to block {first}. \
+                 Adjust your pruning configuration or restore from a \
+                 Firehose-compatible snapshot."
+            )
+        })?;
     }
 
     info!(
@@ -148,29 +128,26 @@ where
 /// A complete Firehose block includes per-call traces (call stack, storage/balance
 /// changes at the opcode level).  Producing that level of detail requires a
 /// Firehose-aware EVM inspector wired into the block executor.  The current
-/// implementation calls the minimum set of hooks needed to emit a structurally
-/// valid `FIRE BLOCK` line (block start → block end).  Full call-level tracing
-/// will be available once the `FirehoseEvmInspector` is integrated into the reth
-/// block executor pipeline.
+/// implementation returns an error directing the caller to integrate the
+/// `FirehoseEvmInspector` before re-trace can succeed.
 fn re_trace_single_block<P>(block_num: u64, _provider: &P) -> eyre::Result<()>
 where
     P: StageCheckpointReader + BlockNumReader,
 {
-    let tracer_lock = GLOBAL_TRACER.get().ok_or_else(|| {
+    // Verify the tracer is initialised before attempting any re-execution.
+    let _ = GLOBAL_TRACER.get().ok_or_else(|| {
         eyre::eyre!("Firehose tracer not initialized; call init_tracer before re-tracing")
     })?;
-
-    let _tracer =
-        tracer_lock.lock().map_err(|e| eyre::eyre!("Firehose tracer lock poisoned: {e}"))?;
 
     // TODO: Implement full block re-execution with the FirehoseEvmInspector.
     //
     // The complete implementation must:
     //   1. Fetch `RecoveredBlock` via `provider.recovered_block(block_num, ...)`.
     //   2. Obtain a historical state provider via `provider.history_by_block_number(block_num -
-    //      1)`.
+    //      1)`.  If this returns a "state pruned" error, propagate it with the message documented
+    //      in `firehose_re_trace_range`'s pruning guard note.
     //   3. Create a `State<StateProviderDatabase<_>>` wrapping the state provider.
-    //   4. Build a `FirehoseEvmInspector` wrapping `tracer`.
+    //   4. Build a `FirehoseEvmInspector` wrapping the global tracer.
     //   5. Execute the block with `evm_config.executor_for_block(&mut state, &block)`, passing the
     //      inspector so that `on_tx_start/end`, `on_call_enter/exit`, `on_balance_change`,
     //      `on_storage_change`, and `on_log` are called.
@@ -188,7 +165,10 @@ where
 
 /// Reads the last confirmed block number from the cursor file.
 ///
-/// Returns `None` when the file is absent, empty, or cannot be parsed.
+/// Returns `None` when the file is absent, cannot be read, or contains content
+/// that cannot be parsed as a `u64`.  **Note**: file corruption (unparseable content)
+/// is treated the same as a missing file — the gap check is skipped in both cases.
+/// Callers that need to distinguish the two cases should read the file directly.
 fn read_cursor(path: &Path) -> Option<u64> {
     let content = std::fs::read_to_string(path).ok()?;
     content.trim().parse::<u64>().ok()

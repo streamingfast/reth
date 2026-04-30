@@ -68,8 +68,10 @@ pub static GLOBAL_TRACER: OnceLock<Mutex<Tracer>> = OnceLock::new();
 ///
 /// # Panics
 ///
-/// Panics if called more than once in the same process, so that accidental
-/// double-initialisation is caught early during development.
+/// Panics if called more than once in the same process.  Double-initialisation is
+/// treated as a programming error because it would silently discard the first
+/// tracer (and any pending shutdown handle), so it is caught eagerly at startup
+/// rather than producing silent data loss later.
 pub fn init_tracer(config: Config) -> Option<ShutdownHandle> {
     info!(
         target: "reth::firehose",
