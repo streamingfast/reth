@@ -45,9 +45,7 @@ pub fn init_tracer(config: firehose_tracer::config::Config) -> Option<firehose_t
         "Firehose tracer created"
     );
 
-    GLOBAL_TRACER.set(Mutex::new(tracer)).unwrap_or_else(|_| {
-        panic!("init_tracer called more than once; Firehose tracer already initialised");
-    });
+    GLOBAL_TRACER.set(Mutex::new(tracer)).expect("init_tracer called more than once");
 
     shutdown_handle
 }

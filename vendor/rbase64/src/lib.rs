@@ -23,7 +23,8 @@ pub fn encode(input: &[u8]) -> String {
 
     buffer.truncate(ENC_CHUNK_SIZE * total_chunks * 4 + bytes_rem);
 
-    // Buffer built from UTF8 chars only. Safe to use and improves performance.
+    // SAFETY: The buffer only contains bytes from the base64 alphabet (A-Z, a-z, 0-9, +, /, =),
+    // which are all valid single-byte UTF-8 characters.
     unsafe { String::from_utf8_unchecked(buffer) }
 }
 
