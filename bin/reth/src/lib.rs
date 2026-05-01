@@ -219,4 +219,5 @@ use aquamarine as _;
 // used in main
 use clap as _;
 use reth_cli_util as _;
+use reth_firehose as _;
 use tracing as _;

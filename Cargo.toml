@@ -151,6 +151,7 @@ members = [
     "testing/testing-utils",
     "testing/runner",
     "crates/tracing-otlp",
+    "crates/firehose",
 ]
 default-members = ["bin/reth"]
 exclude = ["docs/cli"]
@@ -368,6 +369,7 @@ reth-execution-types = { path = "crates/evm/execution-types", default-features =
 reth-exex = { path = "crates/exex/exex" }
 reth-exex-test-utils = { path = "crates/exex/test-utils" }
 reth-exex-types = { path = "crates/exex/types" }
+reth-firehose = { path = "crates/firehose" }
 reth-fs-util = { path = "crates/fs-util" }
 reth-invalid-block-hooks = { path = "crates/engine/invalid-block-hooks" }
 reth-ipc = { path = "crates/rpc/ipc" }
@@ -569,6 +571,7 @@ tokio-util = { version = "0.7.4", features = ["codec"] }
 async-compression = { version = "0.4", default-features = false }
 async-stream = "0.3"
 async-trait = "0.1.68"
+firehose-tracer = "5.1.0"
 futures = "0.3"
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
@@ -700,3 +703,8 @@ vergen-git2 = "9.1.0"
 
 # networking
 ipnet = "2.11"
+
+[patch.crates-io]
+# rbase64 unconditionally sets #[global_allocator] (MiMalloc), conflicting with reth's jemalloc.
+# This vendor patch removes that declaration.
+rbase64 = { path = "vendor/rbase64" }
