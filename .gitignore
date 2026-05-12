@@ -76,3 +76,4 @@ __pycache__/
 .envrc
 .direnv/
 .dev/tasks.md
+/.worktrees
