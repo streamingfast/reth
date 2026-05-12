@@ -11,7 +11,7 @@ use reth_errors::{ProviderError, ProviderResult};
 use reth_execution_types::Chain;
 use reth_primitives_traits::{Block, BlockBody, NodePrimitives, RecoveredBlock};
 use reth_storage_api::{BlockReader, TransactionVariant};
-use reth_tasks::{TaskSpawner, TokioTaskExecutor};
+use reth_tasks::Runtime;
 use schnellru::{ByLength, Limiter, LruMap};
 use std::{
     future::Future,
@@ -76,15 +76,15 @@ impl<N: NodePrimitives> Clone for EthStateCache<N> {
 
 impl<N: NodePrimitives> EthStateCache<N> {
     /// Creates and returns both [`EthStateCache`] frontend and the memory bound service.
-    fn create<Provider, Tasks>(
+    fn create<Provider>(
         provider: Provider,
-        action_task_spawner: Tasks,
+        action_task_spawner: Runtime,
         max_blocks: u32,
         max_receipts: u32,
         max_headers: u32,
         max_concurrent_db_operations: usize,
         max_cached_tx_hashes: u32,
-    ) -> (Self, EthStateCacheService<Provider, Tasks>)
+    ) -> (Self, EthStateCacheService<Provider, Runtime>)
     where
         Provider: BlockReader<Block = N::Block, Receipt = N::Receipt>,
     {
@@ -105,29 +105,17 @@ impl<N: NodePrimitives> EthStateCache<N> {
         (cache, service)
     }
 
-    /// Creates a new async LRU backed cache service task and spawns it to a new task via
-    /// [`tokio::spawn`].
-    ///
-    /// See also [`Self::spawn_with`]
-    pub fn spawn<Provider>(provider: Provider, config: EthStateCacheConfig) -> Self
-    where
-        Provider: BlockReader<Block = N::Block, Receipt = N::Receipt> + Clone + Unpin + 'static,
-    {
-        Self::spawn_with(provider, config, TokioTaskExecutor::default())
-    }
-
     /// Creates a new async LRU backed cache service task and spawns it to a new task via the given
     /// spawner.
     ///
     /// The cache is memory limited by the given max bytes values.
-    pub fn spawn_with<Provider, Tasks>(
+    pub fn spawn_with<Provider>(
         provider: Provider,
         config: EthStateCacheConfig,
-        executor: Tasks,
+        executor: Runtime,
     ) -> Self
     where
         Provider: BlockReader<Block = N::Block, Receipt = N::Receipt> + Clone + Unpin + 'static,
-        Tasks: TaskSpawner + Clone + 'static,
     {
         let EthStateCacheConfig {
             max_blocks,
@@ -145,7 +133,7 @@ impl<N: NodePrimitives> EthStateCache<N> {
             max_concurrent_db_requests,
             max_cached_tx_hashes,
         );
-        executor.spawn_critical_task("eth state cache", Box::pin(service));
+        executor.spawn_critical_task("eth state cache", service);
         this
     }
 
@@ -215,7 +203,7 @@ impl<N: NodePrimitives> EthStateCache<N> {
     }
 
     /// Streams cached receipts and blocks for a list of block hashes, preserving input order.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     pub fn get_receipts_and_maybe_block_stream<'a>(
         &'a self,
         hashes: Vec<B256>,
@@ -343,10 +331,9 @@ pub(crate) struct EthStateCacheService<
     tx_hash_index: LruMap<TxHash, (B256, usize), ByLength>,
 }
 
-impl<Provider, Tasks> EthStateCacheService<Provider, Tasks>
+impl<Provider> EthStateCacheService<Provider, Runtime>
 where
     Provider: BlockReader + Clone + Unpin + 'static,
-    Tasks: TaskSpawner + Clone + 'static,
 {
     /// Indexes all transactions in a block by transaction hash.
     fn index_block_transactions(&mut self, block: &RecoveredBlock<Provider::Block>) {
@@ -357,17 +344,9 @@ where
     }
 
     /// Removes transaction index entries for a reorged block.
-    ///
-    /// Only removes entries that still point to this block, preserving mappings for transactions
-    /// that were re-mined in a new canonical block.
     fn remove_block_transactions(&mut self, block: &RecoveredBlock<Provider::Block>) {
-        let block_hash = block.hash();
         for tx in block.body().transactions() {
-            if let Some((mapped_hash, _)) = self.tx_hash_index.get(tx.tx_hash()) &&
-                *mapped_hash == block_hash
-            {
-                self.tx_hash_index.remove(tx.tx_hash());
-            }
+            self.tx_hash_index.remove(tx.tx_hash());
         }
     }
 
@@ -434,6 +413,15 @@ where
         }
     }
 
+    fn on_reorg_header(&mut self, block_hash: B256, res: ProviderResult<Provider::Header>) {
+        if let Some(queued) = self.headers_cache.remove(&block_hash) {
+            // send the response to queued senders
+            for tx in queued {
+                let _ = tx.send(res.clone());
+            }
+        }
+    }
+
     /// Shrinks the queues but leaves some space for the next requests
     fn shrink_queues(&mut self) {
         let min_capacity = 2;
@@ -449,10 +437,9 @@ where
     }
 }
 
-impl<Provider, Tasks> Future for EthStateCacheService<Provider, Tasks>
+impl<Provider> Future for EthStateCacheService<Provider, Runtime>
 where
     Provider: BlockReader + Clone + Unpin + 'static,
-    Tasks: TaskSpawner + Clone + 'static,
 {
     type Output = ();
 
@@ -494,21 +481,19 @@ where
                                 let rate_limiter = this.rate_limiter.clone();
                                 let mut action_sender =
                                     ActionSender::new(CacheKind::Block, block_hash, action_tx);
-                                this.action_task_spawner.spawn_blocking_task(Box::pin(
-                                    async move {
-                                        // Acquire permit
-                                        let _permit = rate_limiter.acquire().await;
-                                        // Only look in the database to prevent situations where we
-                                        // looking up the tree is blocking
-                                        let block_sender = provider
-                                            .sealed_block_with_senders(
-                                                BlockHashOrNumber::Hash(block_hash),
-                                                TransactionVariant::WithHash,
-                                            )
-                                            .map(|maybe_block| maybe_block.map(Arc::new));
-                                        action_sender.send_block(block_sender);
-                                    },
-                                ));
+                                this.action_task_spawner.spawn_blocking_task(async move {
+                                    // Acquire permit
+                                    let _permit = rate_limiter.acquire().await;
+                                    // Only look in the database to prevent situations where we
+                                    // looking up the tree is blocking
+                                    let block_sender = provider
+                                        .sealed_block_with_senders(
+                                            BlockHashOrNumber::Hash(block_hash),
+                                            TransactionVariant::WithHash,
+                                        )
+                                        .map(|maybe_block| maybe_block.map(Arc::new));
+                                    action_sender.send_block(block_sender);
+                                });
                             }
                         }
                         CacheAction::GetReceipts { block_hash, response_tx } => {
@@ -525,17 +510,15 @@ where
                                 let rate_limiter = this.rate_limiter.clone();
                                 let mut action_sender =
                                     ActionSender::new(CacheKind::Receipt, block_hash, action_tx);
-                                this.action_task_spawner.spawn_blocking_task(Box::pin(
-                                    async move {
-                                        // Acquire permit
-                                        let _permit = rate_limiter.acquire().await;
-                                        let res = provider
-                                            .receipts_by_block(block_hash.into())
-                                            .map(|maybe_receipts| maybe_receipts.map(Arc::new));
+                                this.action_task_spawner.spawn_blocking_task(async move {
+                                    // Acquire permit
+                                    let _permit = rate_limiter.acquire().await;
+                                    let res = provider
+                                        .receipts_by_block(block_hash.into())
+                                        .map(|maybe_receipts| maybe_receipts.map(Arc::new));
 
-                                        action_sender.send_receipts(res);
-                                    },
-                                ));
+                                    action_sender.send_receipts(res);
+                                });
                             }
                         }
                         CacheAction::GetHeader { block_hash, response_tx } => {
@@ -559,19 +542,16 @@ where
                                 let rate_limiter = this.rate_limiter.clone();
                                 let mut action_sender =
                                     ActionSender::new(CacheKind::Header, block_hash, action_tx);
-                                this.action_task_spawner.spawn_blocking_task(Box::pin(
-                                    async move {
-                                        // Acquire permit
-                                        let _permit = rate_limiter.acquire().await;
-                                        let header =
-                                            provider.header(block_hash).and_then(|header| {
-                                                header.ok_or_else(|| {
-                                                    ProviderError::HeaderNotFound(block_hash.into())
-                                                })
-                                            });
-                                        action_sender.send_header(header);
-                                    },
-                                ));
+                                this.action_task_spawner.spawn_blocking_task(async move {
+                                    // Acquire permit
+                                    let _permit = rate_limiter.acquire().await;
+                                    let header = provider.header(block_hash).and_then(|header| {
+                                        header.ok_or_else(|| {
+                                            ProviderError::HeaderNotFound(block_hash.into())
+                                        })
+                                    });
+                                    action_sender.send_header(header);
+                                });
                             }
                         }
                         CacheAction::ReceiptsResult { block_hash, res } => {
@@ -618,9 +598,12 @@ where
                         }
                         CacheAction::RemoveReorgedChain { chain_change } => {
                             for block in chain_change.blocks {
+                                let block_hash = block.hash();
+                                let header = block.clone_header();
                                 // Remove transaction index entries for reorged blocks
                                 this.remove_block_transactions(&block);
-                                this.on_reorg_block(block.hash(), Ok(Some(block)));
+                                this.on_reorg_block(block_hash, Ok(Some(block)));
+                                this.on_reorg_header(block_hash, Ok(header));
                             }
 
                             for block_receipts in chain_change.receipts {
@@ -844,5 +827,91 @@ pub async fn cache_new_blocks_task<St, N: NodePrimitives>(
 
         let _ =
             eth_state_cache.to_service.send(CacheAction::CacheNewCanonicalChain { chain_change });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::Header;
+    use alloy_primitives::{Address, Signature};
+    use reth_ethereum_primitives::{
+        Block, BlockBody, EthPrimitives, Transaction, TransactionSigned,
+    };
+    use reth_primitives_traits::RecoveredBlock;
+    use reth_storage_api::noop::NoopProvider;
+
+    fn test_service() -> EthStateCacheService<NoopProvider, Runtime> {
+        let (_cache, service) = EthStateCache::<EthPrimitives>::create(
+            NoopProvider::default(),
+            Runtime::test(),
+            4,
+            4,
+            4,
+            1,
+            16,
+        );
+        service
+    }
+
+    fn test_block() -> RecoveredBlock<Block> {
+        RecoveredBlock::new_unhashed(
+            Block {
+                header: Header { number: 1, ..Default::default() },
+                body: BlockBody {
+                    transactions: vec![TransactionSigned::new_unhashed(
+                        Transaction::Legacy(Default::default()),
+                        Signature::test_signature(),
+                    )],
+                    ..Default::default()
+                },
+            },
+            vec![Address::ZERO],
+        )
+    }
+
+    #[test]
+    fn reorg_evicts_cached_headers() {
+        let mut service = test_service();
+        let block_hash = B256::repeat_byte(0x11);
+
+        assert!(service
+            .headers_cache
+            .insert(block_hash, Header { number: 42, ..Default::default() }));
+        assert!(service.headers_cache.get(&block_hash).is_some());
+
+        service.on_reorg_header(block_hash, Ok(Header { number: 7, ..Default::default() }));
+
+        assert!(service.headers_cache.get(&block_hash).is_none());
+    }
+
+    #[test]
+    fn reorg_forwards_header_to_queued_requests() {
+        let mut service = test_service();
+        let block_hash = B256::repeat_byte(0x22);
+        let (response_tx, mut response_rx) = oneshot::channel();
+        let header = Header { number: 7, ..Default::default() };
+
+        assert!(service.headers_cache.queue(block_hash, response_tx));
+
+        service.on_reorg_header(block_hash, Ok(header));
+
+        let header =
+            response_rx.try_recv().expect("queued header response").expect("header result");
+
+        assert_eq!(header.number, 7);
+    }
+
+    #[test]
+    fn reorg_removes_tx_hash_index_entries_unconditionally() {
+        let mut service = test_service();
+        let block = test_block();
+        let tx_hash = *block.body().transactions().next().expect("test transaction").tx_hash();
+
+        service.tx_hash_index.insert(tx_hash, (B256::repeat_byte(0x33), 0));
+
+        service.remove_block_transactions(&block);
+
+        assert!(service.tx_hash_index.get(&tx_hash).is_none());
     }
 }

@@ -1,6 +1,7 @@
 //! Setup utilities for importing RLP chain data before starting nodes.
 
 use crate::{node::NodeTestContext, NodeHelperType, Wallet};
+use alloy_rpc_types_engine::PayloadAttributes;
 use reth_chainspec::ChainSpec;
 use reth_cli_commands::import_core::{import_blocks_from_file, ImportConfig};
 use reth_config::Config;
@@ -15,7 +16,6 @@ use reth_provider::{
 };
 use reth_rpc_server_types::RpcModuleSelection;
 use reth_stages_types::StageId;
-use reth_tasks::Runtime;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
 use tracing::{debug, info, span, Level};
@@ -60,13 +60,9 @@ pub async fn setup_engine_with_chain_import(
     is_dev: bool,
     tree_config: TreeConfig,
     rlp_path: &Path,
-    attributes_generator: impl Fn(u64) -> reth_payload_builder::EthPayloadBuilderAttributes
-        + Send
-        + Sync
-        + Copy
-        + 'static,
+    attributes_generator: impl Fn(u64) -> PayloadAttributes + Send + Sync + Copy + 'static,
 ) -> eyre::Result<ChainImportResult> {
-    let runtime = Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
+    let runtime = reth_tasks::Runtime::test();
 
     let network_config = NetworkArgs {
         discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default() },
@@ -149,6 +145,7 @@ pub async fn setup_engine_with_chain_import(
             &config,
             evm_config,
             consensus,
+            runtime.clone(),
         )
         .await?;
 
@@ -273,10 +270,11 @@ pub fn load_forkchoice_state(path: &Path) -> eyre::Result<alloy_rpc_types_engine
 mod tests {
     use super::*;
     use crate::test_rlp_utils::{create_fcu_json, generate_test_blocks, write_blocks_to_rlp};
+    use alloy_rpc_types_engine::PayloadAttributes;
     use reth_chainspec::{ChainSpecBuilder, MAINNET};
     use reth_db::mdbx::DatabaseArguments;
-    use reth_payload_builder::EthPayloadBuilderAttributes;
-    use reth_primitives::SealedBlock;
+    use reth_ethereum_primitives::Block;
+    use reth_primitives_traits::SealedBlock;
     use reth_provider::{
         test_utils::MockNodeTypesWithDB, BlockHashReader, BlockNumReader, BlockReaderIdExt,
     };
@@ -343,6 +341,7 @@ mod tests {
             let evm_config = reth_node_ethereum::EthEvmConfig::new(chain_spec.clone());
             // Use NoopConsensus to skip gas limit validation for test imports
             let consensus = reth_consensus::noop::NoopConsensus::arc();
+            let runtime = reth_tasks::Runtime::test();
 
             let result = import_blocks_from_file(
                 &rlp_path,
@@ -351,6 +350,7 @@ mod tests {
                 &config,
                 evm_config,
                 consensus,
+                runtime,
             )
             .await
             .unwrap();
@@ -389,8 +389,7 @@ mod tests {
             > = ProviderFactory::new(
                 db,
                 chain_spec.clone(),
-                reth_provider::providers::StaticFileProvider::read_only(static_files_path, false)
-                    .unwrap(),
+                reth_provider::providers::StaticFileProvider::read_only(static_files_path).unwrap(),
                 reth_provider::providers::RocksDBProvider::builder(rocksdb_dir_path)
                     .with_default_tables()
                     .build()
@@ -446,7 +445,7 @@ mod tests {
         chain_spec: &ChainSpec,
         block_count: u64,
         temp_dir: &Path,
-    ) -> (Vec<SealedBlock>, PathBuf) {
+    ) -> (Vec<SealedBlock<Block>>, PathBuf) {
         let test_blocks = generate_test_blocks(chain_spec, block_count);
         assert_eq!(
             test_blocks.len(),
@@ -509,6 +508,7 @@ mod tests {
         let evm_config = reth_node_ethereum::EthEvmConfig::new(chain_spec.clone());
         // Use NoopConsensus to skip gas limit validation for test imports
         let consensus = reth_consensus::noop::NoopConsensus::arc();
+        let runtime = reth_tasks::Runtime::test();
 
         let result = import_blocks_from_file(
             &rlp_path,
@@ -517,6 +517,7 @@ mod tests {
             &config,
             evm_config,
             consensus,
+            runtime,
         )
         .await
         .unwrap();
@@ -564,7 +565,7 @@ mod tests {
             false,
             TreeConfig::default(),
             &rlp_path,
-            |_| EthPayloadBuilderAttributes::default(),
+            |_| PayloadAttributes::default(),
         )
         .await
         .expect("Failed to setup nodes with chain import");

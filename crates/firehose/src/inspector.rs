@@ -1158,10 +1158,7 @@ where
         // in-block delegation set by any prior transaction.
         {
             if let Some(account) = context.journal().evm_state().get(&to) {
-                if let Some(eip7702) = account.info.code.as_ref().and_then(|code| match code {
-                    reth_revm::bytecode::Bytecode::Eip7702(eip) => Some(eip.address()),
-                    _ => None,
-                }) {
+                if let Some(eip7702) = account.info.code.as_ref().and_then(|code| code.eip7702_address()) {
                     self.tracer.set_current_call_address_delegates_to(eip7702);
                 }
             }
@@ -1221,7 +1218,7 @@ where
         let gas_used = if failed && !is_revert {
             outcome.result.gas.limit()
         } else {
-            outcome.result.gas.spent()
+            outcome.result.gas.total_gas_spent()
         };
 
         // At root call exit, capture nonce/code state for self-destructed contracts.
@@ -1324,7 +1321,7 @@ where
         let gas_used = if failed && !is_revert {
             outcome.result.gas.limit()
         } else {
-            outcome.result.gas.spent()
+            outcome.result.gas.total_gas_spent()
         };
 
         // At root create exit, capture nonce/code state for self-destructed contracts

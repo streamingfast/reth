@@ -35,7 +35,7 @@ use crate::{
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction, TxReceipt};
 use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::{
-    block::{BlockExecutor, CommitChanges, ExecutableTx},
+    block::{BlockExecutor, CommitChanges, ExecutableTx, GasOutput},
     RecoveredTx,
 };
 use alloy_primitives::{Address, Log, Sealable, U256};
@@ -252,12 +252,8 @@ where
     fn execute_transaction_with_commit_condition(
         &mut self,
         tx: impl ExecutableTx<Self>,
-        f: impl FnOnce(
-            &reth_revm::revm::context::result::ExecutionResult<
-                <Self::Evm as reth_evm::Evm>::HaltReason,
-            >,
-        ) -> CommitChanges,
-    ) -> Result<Option<u64>, BlockExecutionError> {
+        f: impl FnOnce(&Self::Result) -> CommitChanges,
+    ) -> Result<Option<GasOutput>, BlockExecutionError> {
         use alloy_evm::block::TxResult as _;
 
         let (tx_env, recovered) = tx.into_parts();
@@ -308,7 +304,7 @@ where
         // can run in between.
         let result = self.inner.execute_transaction_without_commit((tx_env, recovered))?;
 
-        let gas_used = result.result().result.gas_used();
+        let gas_used = result.result().result.tx_gas_used();
         // Committed log count: logs that survived after revert rollback; used to advance
         // the block-wide log counter inside `process_post_tx_balance_changes`.
         let committed_log_count = result.result().result.logs().len() as u32;
@@ -344,14 +340,14 @@ where
         // order: mainnet `reward_beneficiary` (coinbase) → OP `balance_incr` (fee vaults).
         self.extras.emit_post_tx_extras(self.inner.evm_mut(), gas_used, base_fee);
 
-        if !f(&result.result().result).should_commit() {
+        if !f(&result).should_commit() {
             // Preserve the invariant that every on_tx_start is paired with on_tx_end.
             let err = std::io::Error::other("transaction not committed");
             self.inner.evm_mut().inspector_mut().tracer_mut().on_tx_end(None, Some(&err));
             return Ok(None);
         }
 
-        let gas_used_u64 = self.inner.commit_transaction(result)?;
+        let gas_output = self.inner.commit_transaction(result);
 
         let log_index_start = self.log_index;
         let receipt_data = {
@@ -369,7 +365,7 @@ where
         };
         self.inner.evm_mut().inspector_mut().tracer_mut().on_tx_end(Some(&receipt_data), None);
 
-        Ok(Some(gas_used_u64))
+        Ok(Some(gas_output))
     }
 
     fn execute_transaction_without_commit(
@@ -379,7 +375,7 @@ where
         self.inner.execute_transaction_without_commit(tx)
     }
 
-    fn commit_transaction(&mut self, output: Self::Result) -> Result<u64, BlockExecutionError> {
+    fn commit_transaction(&mut self, output: Self::Result) -> GasOutput {
         self.inner.commit_transaction(output)
     }
 

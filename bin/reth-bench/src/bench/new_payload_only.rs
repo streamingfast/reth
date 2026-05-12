@@ -3,14 +3,16 @@
 use crate::{
     bench::{
         context::BenchContext,
+        helpers::fetch_block_access_list,
+        metrics_scraper::MetricsScraper,
         output::{
             NewPayloadResult, TotalGasOutput, TotalGasRow, GAS_OUTPUT_SUFFIX,
             NEW_PAYLOAD_OUTPUT_SUFFIX,
         },
     },
-    valid_payload::{block_to_new_payload, call_new_payload},
+    valid_payload::{block_to_new_payload, call_new_payload_with_reth},
 };
-use alloy_provider::Provider;
+use alloy_provider::{ext::DebugApi, Provider};
 use clap::Parser;
 use csv::Writer;
 use eyre::{Context, OptionExt};
@@ -48,18 +50,30 @@ impl Command {
             block_provider,
             auth_provider,
             mut next_block,
-            is_optimism,
+            use_reth_namespace,
+            rlp_blocks,
+            wait_for_persistence,
+            no_wait_for_caches,
             ..
         } = BenchContext::new(&self.benchmark, self.rpc_url).await?;
 
         let total_blocks = benchmark_mode.total_blocks();
+
+        let mut metrics_scraper = MetricsScraper::maybe_new(self.benchmark.metrics_url.clone());
+
+        if use_reth_namespace {
+            info!("Using reth_newPayload endpoint");
+        }
+
         let buffer_size = self.rpc_block_buffer_size;
 
         // Use a oneshot channel to propagate errors from the spawned task
         let (error_sender, mut error_receiver) = tokio::sync::oneshot::channel();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(buffer_size);
 
+        let block_provider_clone = block_provider.clone();
         tokio::task::spawn(async move {
+            let block_provider = block_provider_clone;
             while benchmark_mode.contains(next_block) {
                 let block_res = block_provider
                     .get_block_by_number(next_block.into())
@@ -75,8 +89,21 @@ impl Command {
                     }
                 };
 
+                let rlp = if rlp_blocks {
+                    let Ok(rlp) = block_provider.debug_get_raw_block(next_block.into()).await
+                    else {
+                        tracing::error!(target: "reth-bench", "Failed to fetch raw block {next_block}");
+                        let _ = error_sender
+                            .send(eyre::eyre!("Failed to fetch raw block {next_block}"));
+                        break;
+                    };
+                    Some(rlp)
+                } else {
+                    None
+                };
+
                 next_block += 1;
-                if let Err(e) = sender.send(block).await {
+                if let Err(e) = sender.send((block, rlp)).await {
                     tracing::error!(target: "reth-bench", "Failed to send block data: {e}");
                     break;
                 }
@@ -88,7 +115,7 @@ impl Command {
         let total_benchmark_duration = Instant::now();
         let mut total_wait_time = Duration::ZERO;
 
-        while let Some(block) = {
+        while let Some((block, rlp)) = {
             let wait_start = Instant::now();
             let result = receiver.recv().await;
             total_wait_time += wait_start.elapsed();
@@ -100,12 +127,43 @@ impl Command {
 
             debug!(target: "reth-bench", number=?block.header.number, "Sending payload to engine");
 
-            let (version, params) = block_to_new_payload(block, is_optimism)?;
+            let bal = if rlp.is_none() && block.header.block_access_list_hash.is_some() {
+                Some(fetch_block_access_list(&block_provider, block.header.number).await?)
+            } else {
+                None
+            };
+
+            let (version, params) = block_to_new_payload(
+                block,
+                rlp,
+                use_reth_namespace,
+                wait_for_persistence,
+                no_wait_for_caches,
+                bal,
+            )?;
 
             let start = Instant::now();
-            call_new_payload(&auth_provider, version, params).await?;
+            let server_timings =
+                call_new_payload_with_reth(&auth_provider, version, params).await?;
 
-            let new_payload_result = NewPayloadResult { gas_used, latency: start.elapsed() };
+            let latency =
+                server_timings.as_ref().map(|t| t.latency).unwrap_or_else(|| start.elapsed());
+            let new_payload_result = NewPayloadResult {
+                gas_used,
+                latency,
+                persistence_wait: server_timings
+                    .as_ref()
+                    .map(|t| t.persistence_wait)
+                    .unwrap_or_default(),
+                execution_cache_wait: server_timings
+                    .as_ref()
+                    .map(|t| t.execution_cache_wait)
+                    .unwrap_or_default(),
+                sparse_trie_wait: server_timings
+                    .as_ref()
+                    .map(|t| t.sparse_trie_wait)
+                    .unwrap_or_default(),
+            };
             blocks_processed += 1;
             let progress = match total_blocks {
                 Some(total) => format!("{blocks_processed}/{total}"),
@@ -121,6 +179,12 @@ impl Command {
             let row =
                 TotalGasRow { block_number, transaction_count, gas_used, time: current_duration };
             results.push((row, new_payload_result));
+
+            if let Some(scraper) = metrics_scraper.as_mut() &&
+                let Err(err) = scraper.scrape_after_block(block_number).await
+            {
+                tracing::warn!(target: "reth-bench", %err, block_number, "Failed to scrape metrics");
+            }
         }
 
         // Check if the spawned task encountered an error
@@ -150,6 +214,10 @@ impl Command {
                 writer.serialize(row)?;
             }
             writer.flush()?;
+
+            if let Some(scraper) = &metrics_scraper {
+                scraper.write_csv(&path)?;
+            }
 
             info!(target: "reth-bench", "Finished writing benchmark output files to {:?}.", path);
         }

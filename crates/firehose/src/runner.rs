@@ -149,7 +149,7 @@ where
         {
             let result_gas_used = {
                 use alloy_evm::block::TxResult as _;
-                tx_result.result().result.gas_used()
+                tx_result.result().result.tx_gas_used()
             };
             let sender = recovered_tx.signer();
             let coinbase = block.header().beneficiary();
@@ -182,13 +182,7 @@ where
             );
         }
 
-        executor.commit_transaction(tx_result).wrap_err_with(|| {
-            format!(
-                "Failed to commit transaction block={} tx_index={tx_index} tx_hash={}",
-                block.number(),
-                recovered_tx.tx_hash()
-            )
-        })?;
+        executor.commit_transaction(tx_result);
 
         let cumulative_gas = receipt.cumulative_gas_used();
         let gas_used = cumulative_gas - prev_cumulative_gas;

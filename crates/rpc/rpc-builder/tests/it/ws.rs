@@ -37,6 +37,14 @@ async fn test_eth_subscribe_all_supported_kinds_accept() {
                 serde_json::json!({"topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]}),
             ],
         ),
+        ("transactionReceipts", vec![]),
+        ("transactionReceipts", vec![serde_json::json!({"transactionHashes": []})]),
+        (
+            "transactionReceipts",
+            vec![
+                serde_json::json!({"transactionHashes": ["0x5c504ed432cb51138bcf09aa5e8a410dd4a1e204ef84bfed1be16dfba1b22060"]}),
+            ],
+        ),
     ];
 
     for (kind, params) in cases {
@@ -145,7 +153,7 @@ async fn test_eth_subscribe_pending_transactions_receives_tx() {
     use reth_network_api::noop::NoopNetwork;
     use reth_provider::test_utils::NoopProvider;
     use reth_rpc_builder::RpcModuleBuilder;
-    use reth_tasks::TokioTaskExecutor;
+    use reth_tasks::Runtime;
     use reth_transaction_pool::{
         test_utils::{TestPool, TestPoolBuilder},
         PoolTransaction, TransactionOrigin, TransactionPool,
@@ -160,7 +168,7 @@ async fn test_eth_subscribe_pending_transactions_receives_tx() {
         .with_provider(NoopProvider::default())
         .with_pool(pool)
         .with_network(NoopNetwork::default())
-        .with_executor(Box::new(TokioTaskExecutor::default()))
+        .with_executor(Runtime::test())
         .with_evm_config(EthEvmConfig::mainnet())
         .with_consensus(NoopConsensus::default());
 

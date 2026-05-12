@@ -116,7 +116,13 @@ pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
     // chain. Fork timings are derived from the prestate's genesis config.
     let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
         firehose_tracer::config::Config::default(),
-        firehose_tracer::config::ChainConfig::from_genesis(&prestate.genesis),
+        firehose_tracer::config::ChainConfig {
+            chain_id: prestate.genesis.config.chain_id,
+            shanghai_time: prestate.genesis.config.shanghai_time,
+            cancun_time: prestate.genesis.config.cancun_time,
+            prague_time: prestate.genesis.config.prague_time,
+            verkle_time: None,
+        },
         "reth-firehose-tests",
         env!("CARGO_PKG_VERSION"),
     );
