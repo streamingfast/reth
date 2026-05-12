@@ -343,6 +343,14 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         self
     }
 
+    /// Set the dev block time for the node.
+    ///
+    /// This sets the interval at which the dev miner produces new blocks.
+    pub const fn with_dev_block_time(mut self, block_time: std::time::Duration) -> Self {
+        self.dev.block_time = Some(block_time);
+        self
+    }
+
     /// Set the pruning args for the node
     pub fn with_pruning(mut self, pruning: PruningArgs) -> Self {
         self.pruning = pruning;
@@ -363,16 +371,16 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         self.pruning.prune_config(&self.chain)
     }
 
-    /// Returns the effective storage settings derived from `--storage.v2`.
+    /// Returns the effective storage settings for this node.
     ///
-    /// The base storage mode is determined by `--storage.v2`:
-    /// - When `--storage.v2` is set: uses [`StorageSettings::v2()`] defaults
-    /// - Otherwise: uses [`StorageSettings::base()`] defaults
+    /// Determined by the `--storage.v2` flag (defaults to `true`).
+    /// Existing databases retain whatever settings are persisted in their
+    /// metadata (checked during genesis init).
     pub const fn storage_settings(&self) -> StorageSettings {
         if self.storage.v2 {
             StorageSettings::v2()
         } else {
-            StorageSettings::base()
+            StorageSettings::v1()
         }
     }
 

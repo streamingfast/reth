@@ -30,7 +30,8 @@ workspace = true
 # reth
 reth-ethereum-cli.workspace = true
 reth-chainspec.workspace = true
-reth-primitives.workspace = true
+reth-primitives-traits.workspace = true
+reth-ethereum-primitives.workspace = true
 reth-db = { workspace = true, features = ["mdbx"] }
 reth-provider.workspace = true
 reth-revm.workspace = true
@@ -73,10 +74,9 @@ alloy-evm.workspace = true
 firehose-tracer.workspace = true
 reth-firehose.workspace = true
 reth-ethereum-forks.workspace = true
-reth-ethereum-primitives.workspace = true
 
 [dev-dependencies]
-alloy-node-bindings = "1.6.3"
+alloy-node-bindings = "2.0.0"
 alloy-provider = { workspace = true, features = ["reqwest"] }
 alloy-rpc-types-eth.workspace = true
 backon.workspace = true
@@ -95,7 +95,6 @@ default = [
     "keccak-cache-global",
     "asm-keccak",
     "min-debug-logs",
-    "rocksdb",
 ]
 
 otlp = [
@@ -117,7 +116,6 @@ dev = ["reth-ethereum-cli/dev"]
 
 asm-keccak = [
     "reth-node-core/asm-keccak",
-    "reth-primitives/asm-keccak",
     "reth-ethereum-cli/asm-keccak",
     "reth-node-ethereum/asm-keccak",
     "alloy-primitives/asm-keccak",
@@ -132,9 +130,10 @@ jemalloc = [
     "reth-node-core/jemalloc",
     "reth-node-metrics/jemalloc",
     "reth-ethereum-cli/jemalloc",
+    "reth-provider/jemalloc",
 ]
 jemalloc-prof = [
-    "reth-cli-util/jemalloc",
+    "jemalloc",
     "reth-cli-util/jemalloc-prof",
     "reth-ethereum-cli/jemalloc-prof",
     "reth-node-metrics/jemalloc-prof",
@@ -142,12 +141,6 @@ jemalloc-prof = [
 jemalloc-symbols = [
     "jemalloc-prof",
     "reth-ethereum-cli/jemalloc-symbols",
-]
-jemalloc-unprefixed = [
-    "reth-cli-util/jemalloc-unprefixed",
-    "reth-node-core/jemalloc",
-    "reth-node-metrics/jemalloc",
-    "reth-ethereum-cli/jemalloc",
 ]
 tracy-allocator = [
     "reth-cli-util/tracy-allocator",
@@ -197,8 +190,7 @@ min-trace-logs = [
     "reth-node-core/min-trace-logs",
 ]
 
-rocksdb = ["reth-ethereum-cli/rocksdb", "reth-node-core/rocksdb"]
-edge = ["rocksdb"]
+trie-debug = ["reth-node-builder/trie-debug", "reth-node-core/trie-debug"]
 
 [[bin]]
 name = "reth"

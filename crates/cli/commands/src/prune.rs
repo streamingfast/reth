@@ -12,7 +12,6 @@ use reth_node_metrics::{
     server::{MetricServer, MetricServerConfig},
     version::VersionInfo,
 };
-#[cfg(all(unix, feature = "rocksdb"))]
 use reth_provider::RocksDBProviderFactory;
 use reth_prune::PrunerBuilder;
 use reth_static_file::StaticFileProducer;
@@ -36,7 +35,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> PruneComma
         self,
         ctx: CliContext,
     ) -> eyre::Result<()> {
-        let env = self.env.init::<N>(AccessRights::RW)?;
+        let env = self.env.init::<N>(AccessRights::RW, ctx.task_executor.clone())?;
         let provider_factory = env.provider_factory;
         let config = env.config.prune;
         let data_dir = env.data_dir;
@@ -122,7 +121,6 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> PruneComma
         }
 
         // Flush and compact RocksDB to reclaim disk space after pruning
-        #[cfg(all(unix, feature = "rocksdb"))]
         {
             info!(target: "reth::cli", "Flushing and compacting RocksDB...");
             provider_factory.rocksdb_provider().flush_and_compact()?;

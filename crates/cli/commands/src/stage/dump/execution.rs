@@ -6,7 +6,7 @@ use reth_db_api::{
 };
 use reth_db_common::DbTool;
 use reth_evm::ConfigureEvm;
-use reth_node_builder::NodeTypesWithDB;
+use reth_node_api::{HeaderTy, TxTy};
 use reth_node_core::dirs::{ChainPath, DataDirPath};
 use reth_provider::{
     providers::{ProviderNodeTypes, RocksDBProvider, StaticFileProvider},
@@ -16,6 +16,7 @@ use reth_stages::{stages::ExecutionStage, Stage, StageCheckpoint, UnwindInput};
 use std::sync::Arc;
 use tracing::info;
 
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn dump_execution_stage<N, E, C>(
     db_tool: &DbTool<N>,
     from: u64,
@@ -24,6 +25,7 @@ pub(crate) async fn dump_execution_stage<N, E, C>(
     should_run: bool,
     evm_config: E,
     consensus: C,
+    runtime: reth_tasks::Runtime,
 ) -> eyre::Result<()>
 where
     N: ProviderNodeTypes<DB = DatabaseEnv>,
@@ -37,7 +39,6 @@ where
     unwind_and_copy(db_tool, from, tip_block_number, &output_db, evm_config.clone())?;
 
     if should_run {
-        let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
         dry_run(
             ProviderFactory::<N>::new(
                 output_db,
@@ -57,7 +58,7 @@ where
 }
 
 /// Imports all the tables that can be copied over a range.
-fn import_tables_with_range<N: NodeTypesWithDB>(
+fn import_tables_with_range<N: ProviderNodeTypes>(
     output_db: &DatabaseEnv,
     db_tool: &DbTool<N>,
     from: u64,
@@ -73,7 +74,7 @@ fn import_tables_with_range<N: NodeTypesWithDB>(
         )
     })??;
     output_db.update(|tx| {
-        tx.import_table_with_range::<tables::Headers, _>(
+        tx.import_table_with_range::<tables::Headers<HeaderTy<N>>, _>(
             &db_tool.provider_factory.db_ref().tx()?,
             Some(from),
             to,
@@ -87,7 +88,7 @@ fn import_tables_with_range<N: NodeTypesWithDB>(
         )
     })??;
     output_db.update(|tx| {
-        tx.import_table_with_range::<tables::BlockOmmers, _>(
+        tx.import_table_with_range::<tables::BlockOmmers<HeaderTy<N>>, _>(
             &db_tool.provider_factory.db_ref().tx()?,
             Some(from),
             to,
@@ -109,7 +110,7 @@ fn import_tables_with_range<N: NodeTypesWithDB>(
     })??;
 
     output_db.update(|tx| {
-        tx.import_table_with_range::<tables::Transactions, _>(
+        tx.import_table_with_range::<tables::Transactions<TxTy<N>>, _>(
             &db_tool.provider_factory.db_ref().tx()?,
             Some(from_tx),
             to_tx,

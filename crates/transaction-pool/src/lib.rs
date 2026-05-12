@@ -198,7 +198,7 @@
 //! ```
 //! use reth_chainspec::MAINNET;
 //! use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
-//! use reth_tasks::TokioTaskExecutor;
+//! use reth_tasks::Runtime;
 //! use reth_chainspec::ChainSpecProvider;
 //! use reth_transaction_pool::{TransactionValidationTaskExecutor, Pool, TransactionPool};
 //! use reth_transaction_pool::blobstore::InMemoryBlobStore;
@@ -211,8 +211,9 @@
 //!     Evm: ConfigureEvm<Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = Header>> + 'static,
 //! {
 //!     let blob_store = InMemoryBlobStore::default();
+//!     let runtime = Runtime::test();
 //!     let pool = Pool::eth_pool(
-//!         TransactionValidationTaskExecutor::eth(client, evm_config, blob_store.clone(), TokioTaskExecutor::default()),
+//!         TransactionValidationTaskExecutor::eth(client, evm_config, blob_store.clone(), runtime),
 //!         blob_store,
 //!         Default::default(),
 //!     );
@@ -235,8 +236,6 @@
 //! use reth_chain_state::CanonStateNotification;
 //! use reth_chainspec::{MAINNET, ChainSpecProvider, ChainSpec};
 //! use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
-//! use reth_tasks::TokioTaskExecutor;
-//! use reth_tasks::TaskSpawner;
 //! use reth_tasks::Runtime;
 //! use reth_transaction_pool::{TransactionValidationTaskExecutor, Pool};
 //! use reth_transaction_pool::blobstore::InMemoryBlobStore;
@@ -251,8 +250,7 @@
 //!     Evm: ConfigureEvm<Primitives = EthPrimitives> + 'static,
 //!     {
 //!     let blob_store = InMemoryBlobStore::default();
-//!     let rt = tokio::runtime::Runtime::new().unwrap();
-//!     let runtime = Runtime::with_existing_handle(rt.handle().clone()).unwrap();
+//!     let runtime = Runtime::test();
 //!     let pool = Pool::eth_pool(
 //!         TransactionValidationTaskExecutor::eth(client.clone(), evm_config, blob_store.clone(), runtime.clone()),
 //!         blob_store,
@@ -277,6 +275,8 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
+
+pub use imbl::OrdMap;
 
 pub use crate::{
     batcher::{BatchTxProcessor, BatchTxRequest},
@@ -303,10 +303,10 @@ pub use crate::{
 };
 use crate::{identifier::TransactionId, pool::PoolInner};
 use alloy_eips::{
-    eip4844::{BlobAndProofV1, BlobAndProofV2},
+    eip4844::{BlobAndProofV1, BlobAndProofV2, BlobCellsAndProofsV1},
     eip7594::BlobTransactionSidecarVariant,
 };
-use alloy_primitives::{map::AddressSet, Address, TxHash, B256, U256};
+use alloy_primitives::{map::AddressSet, Address, TxHash, B128, B256, U256};
 use aquamarine as _;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_eth_wire_types::HandleMempoolData;
@@ -427,7 +427,7 @@ where
     /// ```
     /// use reth_chainspec::MAINNET;
     /// use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
-    /// use reth_tasks::TokioTaskExecutor;
+    /// use reth_tasks::Runtime;
     /// use reth_chainspec::ChainSpecProvider;
     /// use reth_transaction_pool::{
     ///     blobstore::InMemoryBlobStore, Pool, TransactionValidationTaskExecutor,
@@ -435,7 +435,7 @@ where
     /// use reth_chainspec::EthereumHardforks;
     /// use reth_evm::ConfigureEvm;
     /// use alloy_consensus::Header;
-    /// # fn t<C, Evm>(client: C, evm_config: Evm)
+    /// # fn t<C, Evm>(client: C, evm_config: Evm, runtime: Runtime)
     /// # where
     /// #     C: ChainSpecProvider<ChainSpec: EthereumHardforks> + StateProviderFactory + BlockReaderIdExt<Header = Header> + Clone + 'static,
     /// #     Evm: ConfigureEvm<Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = Header>> + 'static,
@@ -446,7 +446,7 @@ where
     ///         client,
     ///         evm_config,
     ///         blob_store.clone(),
-    ///         TokioTaskExecutor::default(),
+    ///         runtime,
     ///     ),
     ///     blob_store,
     ///     Default::default(),
@@ -501,11 +501,26 @@ where
         results.pop().expect("result length is the same as the input")
     }
 
+    async fn add_transactions(
+        &self,
+        origin: TransactionOrigin,
+        transactions: Vec<Self::Transaction>,
+    ) -> Vec<PoolResult<AddedTransactionOutcome>> {
+        if transactions.is_empty() {
+            return Vec::new()
+        }
+        let validated = self
+            .pool
+            .validator()
+            .validate_transactions(transactions.into_iter().map(|tx| (origin, tx)))
+            .await;
+        self.pool.add_transactions(origin, validated)
+    }
+
     async fn add_transactions_with_origins(
         &self,
-        transactions: impl IntoIterator<Item = (TransactionOrigin, Self::Transaction)> + Send,
+        transactions: Vec<(TransactionOrigin, Self::Transaction)>,
     ) -> Vec<PoolResult<AddedTransactionOutcome>> {
-        let transactions: Vec<_> = transactions.into_iter().collect();
         if transactions.is_empty() {
             return Vec::new()
         }
@@ -727,7 +742,8 @@ where
         sender: Address,
         nonce: u64,
     ) -> Option<Arc<ValidPoolTransaction<Self::Transaction>>> {
-        let transaction_id = TransactionId::new(self.pool.get_sender_id(sender), nonce);
+        let sender_id = self.pool.sender_id(&sender)?;
+        let transaction_id = TransactionId::new(sender_id, nonce);
 
         self.inner().get_pool_data().all().get(&transaction_id).map(|tx| tx.transaction.clone())
     }
@@ -791,6 +807,14 @@ where
         versioned_hashes: &[B256],
     ) -> Result<Vec<Option<BlobAndProofV2>>, BlobStoreError> {
         self.pool.blob_store().get_by_versioned_hashes_v3(versioned_hashes)
+    }
+
+    fn get_blobs_for_versioned_hashes_v4(
+        &self,
+        versioned_hashes: &[B256],
+        indices_bitarray: B128,
+    ) -> Result<Vec<Option<BlobCellsAndProofsV1>>, BlobStoreError> {
+        self.pool.blob_store().get_by_versioned_hashes_v4(versioned_hashes, indices_bitarray)
     }
 }
 
