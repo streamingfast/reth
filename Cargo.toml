@@ -724,11 +724,9 @@ reth-firehose-tests = { path = "crates/firehose-tests" }
 
 [patch.crates-io]
 ## Firehose additions
-# TODO: The SF fork of alloy-evm that routes system calls (EIP-4788, EIP-2935, etc.)
-# through the Inspector needs to be updated for alloy-evm v0.34.0.
-# The old patch targeted v0.27.3 (sf/v0.27.3 branch) and is no longer compatible.
+# SF fork of alloy-evm that routes system calls (EIP-4788, EIP-2935, etc.) through the Inspector.
 # See https://github.com/alloy-rs/evm/pull/323 for the upstream PR.
-# alloy-evm = { git = "https://github.com/streamingfast/evm.git", branch = "sf/v0.34.0" }
+alloy-evm = { git = "https://github.com/streamingfast/evm.git", branch = "sf/v0.34.0" }
 
 ## Firehose additions
 # This is needed otherwise we get flooding of debug logs around a problem that seems to happen in Reth directly.
