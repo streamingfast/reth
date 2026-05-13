@@ -1,3 +1,20 @@
+# Open Up reth-firehose-tests for Reuse in Base
+
+mode: feature
+state: review
+root_git: .
+worktree: .worktrees/feature/open-up-reth-firehose-tests
+branch: feature/open-up-reth-firehose-tests
+target_branch: firehose/1.x
+
+> **Resume protocol:** read **Dev Feedback** and the **State Tracker** below first, then jump to the
+> step marked `Current`. Ensure that you are in the correct worktree and branch according to preamble here. Update current with Developer feedback and update the tracker after every meaningful change.
+> Do not mutate completed steps; append a new entry instead.
+
+---
+
+## Initial Description
+
 ### Part 1 — Changes to `reth-firehose-tests` (upstream PR to `streamingfast/reth`)
 
 #### What to expose
@@ -49,3 +66,28 @@ pub use prestate::{
     parse_fire_block_for, decode_hex,
 };
 ```
+
+## Dev Feedback
+
+## Spec & Implementation
+
+### Changes made
+
+**`crates/firehose-tests/src/prestate.rs`:**
+- `Prestate` struct → `pub struct Prestate` with all fields made `pub` and documented
+- `TraceContext` struct → `pub struct TraceContext` with all fields made `pub` and documented
+- `seed_cache_db` fn → `pub fn seed_cache_db` with doc comment
+- `build_account_info` fn → `pub fn build_account_info` with doc comment
+- `parse_fire_block_for` fn → `pub fn parse_fire_block_for` (already had doc comment)
+- `decode_hex` fn → `pub fn decode_hex` with doc comment
+- `deser_u64_str`, `deser_opt_u128_str`, `deser_opt_u256_str` → all made `pub fn` with doc comments
+- The inner `mod private` remains private (only contains `parse_decimal_or_hex_u128` and the `de_*` helpers called by the public serde functions)
+
+**`crates/firehose-tests/src/lib.rs`:**
+- Added re-exports: `Prestate`, `TraceContext`, `seed_cache_db`, `build_account_info`, `parse_fire_block_for`, `decode_hex`
+
+## State Tracker
+
+**Last Updated:** 2026-05-13
+**Current Step:** Step 2 — Implementation complete, ready for review
+**Status:** All items made public, documented, compiles clean (no warnings), formatted
