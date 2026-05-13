@@ -1088,10 +1088,11 @@ where
         use reth_revm::revm::context::JournalEntry;
 
         if step_ctx.opcode == Opcode::Sstore as u8 {
-            // revm's SSTORE writes the `StorageChanged` journal entry inside `sstore_skip_cold_load`
-            // BEFORE charging dynamic gas. If dynamic gas then OOGs, the journal entry is already
-            // present even though the opcode halted and the storage write will be reverted. Geth's
-            // firehose tracer hooks the opcode body after the gas charge, so it never records that
+            // revm's SSTORE writes the `StorageChanged` journal entry inside
+            // `sstore_skip_cold_load` BEFORE charging dynamic gas. If dynamic gas then
+            // OOGs, the journal entry is already present even though the opcode halted
+            // and the storage write will be reverted. Geth's firehose tracer hooks the
+            // opcode body after the gas charge, so it never records that
             // would-have-been change. Mirror that: skip emission when the interpreter halted.
             if !interp.bytecode.is_end() {
                 let journal = context.journal();
