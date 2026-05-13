@@ -48,29 +48,38 @@ pub struct RunOutcome {
 
 /// JSON shape of `prestate.json` (matches Go's `prestateData`).
 #[derive(Debug, Deserialize)]
-struct Prestate {
-    genesis: Genesis,
-    context: TraceContext,
+pub struct Prestate {
+    /// The genesis configuration, including the `alloc` used to seed the state DB.
+    pub genesis: Genesis,
+    /// The block context fields supplied by the test fixture (number, timestamp, miner, …).
+    pub context: TraceContext,
     /// Hex-encoded RLP-serialized signed transaction (with or without `0x` prefix).
     /// For typed (EIP-2718) transactions this is the RLP-byte-string-wrapped form, exactly
     /// matching `geth`'s `rlp.EncodeToBytes(types.Transaction)`.
-    input: String,
+    pub input: String,
 }
 
+/// Block context fields from the JSON fixture (mirrors Geth's `context` sub-object).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TraceContext {
+pub struct TraceContext {
+    /// Block number.
     #[serde(deserialize_with = "deser_u64_str")]
-    number: u64,
+    pub number: u64,
+    /// Block timestamp (Unix seconds).
     #[serde(deserialize_with = "deser_u64_str")]
-    timestamp: u64,
+    pub timestamp: u64,
+    /// Block gas limit.
     #[serde(deserialize_with = "deser_u64_str")]
-    gas_limit: u64,
-    miner: Address,
+    pub gas_limit: u64,
+    /// Block beneficiary (coinbase).
+    pub miner: Address,
+    /// EIP-1559 base fee per gas (absent on pre-London blocks).
     #[serde(default, deserialize_with = "deser_opt_u128_str")]
-    base_fee_per_gas: Option<u128>,
+    pub base_fee_per_gas: Option<u128>,
+    /// Block difficulty (absent on post-Merge blocks).
     #[serde(default, deserialize_with = "deser_opt_u256_str")]
-    difficulty: Option<U256>,
+    pub difficulty: Option<U256>,
 }
 
 /// Run the prestate-driven Firehose harness against `case_folder` and return the captured Block.
@@ -239,7 +248,8 @@ fn build_header(
     }
 }
 
-fn seed_cache_db(db: &mut CacheDB<EmptyDB>, genesis: &Genesis) -> eyre::Result<()> {
+/// Seed a [`CacheDB`] from a genesis `alloc` map, inserting account info and storage slots.
+pub fn seed_cache_db(db: &mut CacheDB<EmptyDB>, genesis: &Genesis) -> eyre::Result<()> {
     for (addr, account) in &genesis.alloc {
         let info = build_account_info(account);
         db.insert_account_info(*addr, info);
@@ -256,7 +266,8 @@ fn seed_cache_db(db: &mut CacheDB<EmptyDB>, genesis: &Genesis) -> eyre::Result<(
     Ok(())
 }
 
-fn build_account_info(account: &GenesisAccount) -> AccountInfo {
+/// Convert a [`GenesisAccount`] into a revm [`AccountInfo`].
+pub fn build_account_info(account: &GenesisAccount) -> AccountInfo {
     let code = account.code.as_ref().map(|c| Bytecode::new_raw(Bytes::copy_from_slice(c)));
     let code_hash = code.as_ref().map(|c| keccak256(c.original_byte_slice()));
     AccountInfo {
@@ -272,7 +283,7 @@ fn build_account_info(account: &GenesisAccount) -> AccountInfo {
 ///
 /// `FIRE BLOCK` line format: `FIRE BLOCK <num> <flash_idx> <hash> <prev_num> <prev_hash> <lib_num>
 /// <ts_ns> <payload_b64>\n`.
-fn parse_fire_block_for(raw: &[u8], block_number: u64) -> eyre::Result<FirehoseBlock> {
+pub fn parse_fire_block_for(raw: &[u8], block_number: u64) -> eyre::Result<FirehoseBlock> {
     let text = std::str::from_utf8(raw).context("captured tracer output is not UTF-8")?;
     for line in text.lines() {
         let mut parts = line.split(' ');
@@ -299,7 +310,8 @@ fn parse_fire_block_for(raw: &[u8], block_number: u64) -> eyre::Result<FirehoseB
     Err(eyre::eyre!("no FIRE BLOCK line found for block #{block_number}"))
 }
 
-fn decode_hex(s: &str) -> eyre::Result<Vec<u8>> {
+/// Decode a hex string (with or without `0x` prefix) into raw bytes.
+pub fn decode_hex(s: &str) -> eyre::Result<Vec<u8>> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     hex::decode(s).context("hex-decoding")
 }
@@ -356,21 +368,26 @@ mod private {
     }
 }
 
-fn deser_u64_str<'de, D>(d: D) -> Result<u64, D::Error>
+/// Deserialise a decimal-or-hex string as `u64` (for use with `#[serde(deserialize_with = …)]`).
+pub fn deser_u64_str<'de, D>(d: D) -> Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     private::de_u64(d)
 }
 
-fn deser_opt_u128_str<'de, D>(d: D) -> Result<Option<u128>, D::Error>
+/// Deserialise an optional decimal-or-hex string as `Option<u128>` (for `#[serde(deserialize_with =
+/// …)]`).
+pub fn deser_opt_u128_str<'de, D>(d: D) -> Result<Option<u128>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     private::de_opt_u128(d)
 }
 
-fn deser_opt_u256_str<'de, D>(d: D) -> Result<Option<U256>, D::Error>
+/// Deserialise an optional decimal-or-hex string as `Option<U256>` (for `#[serde(deserialize_with =
+/// …)]`).
+pub fn deser_opt_u256_str<'de, D>(d: D) -> Result<Option<U256>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
