@@ -144,6 +144,26 @@ In the `streamingfast/reth` repository:
 
 ## Dev Feedback
 
+```
+/// Initialize the process-wide tracer instance using a [`SynchronizedStdout`] writer.
+///
+/// Also initialises the stdout lock (via [`init_stdout_lock`]) if it has not been done yet,
+/// so callers that create additional tracers (e.g. a flashblock tracer) can retrieve the
+/// same lock via [`stdout_lock`] and wrap it in their own [`SynchronizedStdout`].
+```
+
+This is an added comment on `init_tracer` but the actual method is not changed. We should think about have `init()` call that does both at the same time maybe.
+
+In the current state, it's unclear who should call init_stdout_lock.
+
+### Resolution
+
+`init_tracer` now accepts `firehose_tracer::config::Config` directly (not a pre-built `Tracer`). It internally calls `init_stdout_lock()`, wraps the result in `SynchronizedStdout`, and constructs the `Tracer` via `new_with_writer`. This single entry point eliminates the ambiguity: the caller only passes a config, and both the lock and the tracer are initialised atomically.
+
+`bin/reth/src/main.rs` is updated to pass the config directly.
+
+`init_stdout_lock` doc comment updated to clarify it is called automatically by `init_tracer`; `stdout_lock` panic message updated to point to `init_tracer`.
+
 ## Spec & Implementation
 
 ### Changes Made
@@ -164,6 +184,18 @@ In the `streamingfast/reth` repository:
 ## State Tracker
 
 **Last Updated:** 2026-05-20
-**Current Step:** Step 1 — Implementation complete
+**Current Step:** Step 2 — Dev feedback addressed
 **Status:** Ready for review
 
+### Step 1 — Initial implementation (completed)
+
+- Added `start_flashblock_local` and `mark_flashblock` to `block_tracer.rs`
+- Added `SynchronizedStdout`, `STDOUT_LOCK`, `init_stdout_lock`, `stdout_lock` to `lib.rs`
+- Updated `init_tracer` doc comment (but not implementation — flagged in dev feedback)
+
+### Step 2 — Address dev feedback (current)
+
+- Changed `init_tracer` signature to accept `firehose_tracer::config::Config` instead of a pre-built `Tracer`
+- `init_tracer` now calls `init_stdout_lock()` internally, creates `SynchronizedStdout`, and builds the tracer via `new_with_writer` — single unified entry point
+- Updated `bin/reth/src/main.rs` to pass config directly
+- Clarified `init_stdout_lock` and `stdout_lock` doc comments to reflect that `init_tracer` is the canonical entry point
