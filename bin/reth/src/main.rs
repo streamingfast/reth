@@ -25,10 +25,10 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    reth_firehose::init_tracer(firehose_tracer::Tracer::new(firehose_tracer::config::Config {
+    reth_firehose::init_tracer(firehose_tracer::config::Config {
         chain_client: firehose_tracer::config::ChainClient::Reth,
         ..Default::default()
-    }));
+    });
 
     if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
         info!(target: "reth::cli", "Launching node");

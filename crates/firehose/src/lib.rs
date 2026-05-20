@@ -40,20 +40,21 @@ static GLOBAL_TRACER: OnceLock<Arc<Mutex<firehose_tracer::Tracer>>> = OnceLock::
 /// Initialized by [`init_stdout_lock`] and retrieved by [`stdout_lock`].
 static STDOUT_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
-/// Initialize the process-wide stdout write lock.
+/// Initialize the process-wide stdout write lock, or return the existing one.
 ///
-/// Must be called once at startup, before any tracer is constructed. Subsequent calls are
-/// silently ignored (idempotent). Returns the lock so callers can pass it to additional
-/// tracers they construct (e.g. the flashblock tracer).
+/// Idempotent: subsequent calls return the same lock. Called automatically by [`init_tracer`];
+/// there is no need to call this directly unless constructing a tracer outside of that path.
+/// Returns the lock so callers can wrap it in a [`SynchronizedStdout`] for additional tracers
+/// (e.g. a flashblock tracer).
 pub fn init_stdout_lock() -> Arc<Mutex<()>> {
     STDOUT_LOCK.get_or_init(|| Arc::new(Mutex::new(()))).clone()
 }
 
 /// Returns the process-wide stdout write lock.
 ///
-/// Panics if [`init_stdout_lock`] has not been called yet.
+/// Panics if [`init_tracer`] (or [`init_stdout_lock`]) has not been called yet.
 pub fn stdout_lock() -> Arc<Mutex<()>> {
-    STDOUT_LOCK.get().expect("stdout lock not initialized — call init_stdout_lock first").clone()
+    STDOUT_LOCK.get().expect("stdout lock not initialized — call init_tracer first").clone()
 }
 
 /// A `Write` implementation that serialises stdout writes across multiple tracer instances.
@@ -97,15 +98,22 @@ pub fn is_tracer_initialized() -> bool {
     GLOBAL_TRACER.get().is_some()
 }
 
-/// Initialize the process-wide tracer instance using a [`SynchronizedStdout`] writer.
+/// Initialize the process-wide tracer and stdout lock in a single call.
 ///
-/// Also initialises the stdout lock (via [`init_stdout_lock`]) if it has not been done yet,
-/// so callers that create additional tracers (e.g. a flashblock tracer) can retrieve the
-/// same lock via [`stdout_lock`] and wrap it in their own [`SynchronizedStdout`].
+/// Initialises the shared [`STDOUT_LOCK`], wraps it in a [`SynchronizedStdout`], and constructs
+/// the [`firehose_tracer::Tracer`] with that writer. Callers that create additional tracers
+/// (e.g. a flashblock tracer) can retrieve the same lock via [`stdout_lock`] and wrap it in
+/// their own [`SynchronizedStdout`], ensuring all tracer writes are serialised.
 ///
 /// Must be called exactly once before any call to [`tracer`]. Panics if called more than once.
-pub fn init_tracer(t: firehose_tracer::Tracer) {
-    GLOBAL_TRACER.set(Arc::new(Mutex::new(t))).ok().expect("init_tracer called more than once");
+pub fn init_tracer(config: firehose_tracer::config::Config) {
+    let lock = init_stdout_lock();
+    let writer = SynchronizedStdout::new(lock);
+    let tracer = firehose_tracer::Tracer::new_with_writer(config, Box::new(writer));
+    GLOBAL_TRACER
+        .set(Arc::new(Mutex::new(tracer)))
+        .ok()
+        .expect("init_tracer called more than once");
 }
 
 /// Acquire exclusive access to the process-wide tracer.
