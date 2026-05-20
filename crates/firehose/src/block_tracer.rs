@@ -139,6 +139,39 @@ impl<'a> FirehoseBlockTracer<&'a mut firehose_tracer::Tracer> {
         }
         Self { guard: tracer, status: Status::Started, is_genesis }
     }
+
+    /// Borrow-based variant of the flashblock constructor that drives the block lifecycle
+    /// through a caller-supplied tracer instead of the process-wide global.
+    ///
+    /// Emits `on_block_start` with a [`firehose_tracer::types::FlashBlockData`] annotation so
+    /// the downstream Firehose consumer knows this is a partial (pre-canonical) block emission.
+    ///
+    /// Use this when the flashblock processor owns its own dedicated tracer instance. Callers
+    /// must keep the tracer alive for the lifetime of the returned guard.
+    pub fn start_flashblock_local<N>(
+        tracer: &'a mut firehose_tracer::Tracer,
+        block: &SealedBlock<N::Block>,
+        finalized: Option<firehose_tracer::types::FinalizedBlockRef>,
+        flash_block_idx: u64,
+        is_final: bool,
+    ) -> Self
+    where
+        N: NodePrimitives,
+        N::Block: BlockTrait,
+        <N::Block as BlockTrait>::Header: BlockHeader + Sealable,
+        <N::Block as BlockTrait>::Body: BlockBody,
+        <<N::Block as BlockTrait>::Body as BlockBody>::OmmerHeader: BlockHeader + Sealable,
+    {
+        tracer.on_block_start(firehose_tracer::types::BlockEvent {
+            block: mapper::to_block_data(block),
+            finalized,
+            flash_block: Some(firehose_tracer::types::FlashBlockData {
+                idx: flash_block_idx,
+                is_final,
+            }),
+        });
+        Self { guard: tracer, status: Status::Started, is_genesis: false }
+    }
 }
 
 impl<G> FirehoseBlockTracer<G>
@@ -178,6 +211,21 @@ where
         if !self.is_genesis {
             self.guard.on_block_end(None);
         }
+        self.status = Status::Consumed;
+    }
+
+    /// Consumes the guard and immediately emits `on_block_end(None)`, flushing the partial
+    /// flashblock to stdout.
+    ///
+    /// Unlike [`Self::mark_verified`], this method does **not** gate on post-execution
+    /// validation. Flashblock partial emissions are intentionally pre-canonical — there is no
+    /// state-root to validate — so the flush is unconditional.
+    ///
+    /// Do not call this on a guard created by [`Self::start`] or [`Self::start_local`]; use
+    /// [`Self::mark_verified`] for normal blocks and reserve this for guards created by
+    /// [`Self::start_flashblock_local`].
+    pub fn mark_flashblock(mut self) {
+        self.guard.on_block_end(None);
         self.status = Status::Consumed;
     }
 
