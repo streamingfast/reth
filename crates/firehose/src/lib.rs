@@ -116,6 +116,49 @@ pub fn init_tracer(config: firehose_tracer::config::Config) {
         .expect("init_tracer called more than once");
 }
 
+/// Initialize the process-wide tracer to capture all output into an in-memory buffer, returning a
+/// handle to read it back.
+///
+/// This is the buffer-backed counterpart to [`init_tracer`] (which writes to stdout): it builds a
+/// fully blockchain-initialized [`firehose_tracer::Tracer`] over a
+/// [`firehose_tracer::InMemoryBuffer`] and installs it as the process-wide tracer, so the live
+/// engine path — [`is_tracer_initialized`] plus [`block_tracer::FirehoseBlockTracer::start`] —
+/// becomes active and every `FIRE BLOCK` line is captured instead of printed.
+///
+/// Intended for integration tests that drive the real validation path and need to assert on the
+/// emitted Firehose blocks. Like [`init_tracer`], it must be called at most once per process.
+///
+/// `shanghai_time` / `cancun_time` / `prague_time` are the timestamp-based fork activations the
+/// tracer uses when mapping block contents (`Some(0)` = active from genesis, `None` = never). They
+/// do not gate whether a block is emitted.
+pub fn init_tracer_with_buffer(
+    chain_id: u64,
+    shanghai_time: Option<u64>,
+    cancun_time: Option<u64>,
+    prague_time: Option<u64>,
+) -> firehose_tracer::InMemoryBuffer {
+    // Mirror `init_tracer`: ensure the shared stdout lock exists so any code path that later
+    // reaches for it (e.g. an additional flashblock tracer) does not panic.
+    let _ = init_stdout_lock();
+    let (tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+        firehose_tracer::config::Config::default(),
+        firehose_tracer::config::ChainConfig {
+            chain_id,
+            shanghai_time,
+            cancun_time,
+            prague_time,
+            verkle_time: None,
+        },
+        "reth-firehose",
+        env!("CARGO_PKG_VERSION"),
+    );
+    GLOBAL_TRACER
+        .set(Arc::new(Mutex::new(tracer)))
+        .ok()
+        .expect("init_tracer/init_tracer_with_buffer called more than once");
+    buffer
+}
+
 /// Acquire exclusive access to the process-wide tracer.
 ///
 /// Panics if [`init_tracer`] has not been called yet, or if the mutex is poisoned.
