@@ -21,3 +21,7 @@ First Firehose-instrumented release on top of upstream reth v2.2.0.
 
 - `init_tracer` now accepts `Config` directly and sets up the stdout lock internally, removing the need for callers to manage stdout coordination themselves.
 - Update `firehose-tracer` dependency to version 5.1.1.
+
+### Fixed
+
+- Restore the Firehose live-path hooks in the engine-tree payload validator so blocks arriving through the engine API (`newPayload` / `forkchoiceUpdated`) are traced again. The hooks had been dropped during a merge, leaving only the historical/stage execution path instrumented.
