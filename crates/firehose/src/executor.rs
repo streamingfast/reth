@@ -661,6 +661,10 @@ where
     fn size_hint(&self) -> usize {
         self.db.bundle_state.size_hint()
     }
+
+    fn take_bal(&mut self) -> Option<alloy_eips::eip7928::BlockAccessList> {
+        None
+    }
 }
 
 /// Runs a single block through a [`FirehoseWrappedExecutor`] using the existing tracer guard for

@@ -1159,7 +1159,9 @@ where
         // in-block delegation set by any prior transaction.
         {
             if let Some(account) = context.journal().evm_state().get(&to) {
-                if let Some(eip7702) = account.info.code.as_ref().and_then(|code| code.eip7702_address()) {
+                if let Some(eip7702) =
+                    account.info.code.as_ref().and_then(|code| code.eip7702_address())
+                {
                     self.tracer.set_current_call_address_delegates_to(eip7702);
                 }
             }
