@@ -43,7 +43,7 @@ use reth_evm::{
     execute::{BlockExecutionError, Executor},
     ConfigureEvm, Evm as _, OnStateHook,
 };
-use reth_execution_types::BlockExecutionResult;
+use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_node_api::NodePrimitives;
 use reth_primitives_traits::{Block as BlockTrait, BlockBody, BlockTy, RecoveredBlock, TxTy};
 use reth_revm::{
@@ -628,6 +628,28 @@ where
                 Err(e)
             }
         }
+    }
+
+    /// Overrides the trait default so that `execute()` — the single-block convenience method used
+    /// by the pipeline and any other call site that doesn't know about Firehose — automatically
+    /// routes through [`Self::execute_and_trace_one`] when the global tracer is active.
+    ///
+    /// Without this override, the provided `execute()` calls `execute_one()` unconditionally,
+    /// which skips inspector attachment and produces no `FIRE BLOCK` output for historical blocks.
+    fn execute(
+        mut self,
+        block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
+    ) -> Result<
+        BlockExecutionOutput<<Self::Primitives as NodePrimitives>::Receipt>,
+        Self::Error,
+    > {
+        let result = if crate::is_tracer_initialized() {
+            self.execute_and_trace_one(block)?
+        } else {
+            self.execute_one(block)?
+        };
+        let mut state = self.into_state();
+        Ok(BlockExecutionOutput { state: state.take_bundle(), result })
     }
 
     fn execute_one_with_state_hook<S>(
