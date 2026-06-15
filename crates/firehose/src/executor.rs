@@ -401,10 +401,6 @@ where
         Ok((evm, exec_result))
     }
 
-    fn set_state_hook(&mut self, hook: Option<Box<dyn OnStateHook>>) {
-        self.inner.set_state_hook(hook);
-    }
-
     fn evm_mut(&mut self) -> &mut Self::Evm {
         self.inner.evm_mut()
     }
@@ -660,12 +656,16 @@ where
     where
         S: OnStateHook + 'static,
     {
-        let result = self
+        let mut executor = self
             .strategy_factory
             .executor_for_block(&mut self.db, block)
-            .map_err(BlockExecutionError::other)?
-            .with_state_hook(Some(Box::new(state_hook)))
-            .execute_block(block.transactions_recovered())?;
+            .map_err(BlockExecutionError::other)?;
+        // State hooks moved from the executor to the revm State (alloy-evm #366); set on the db.
+        executor
+            .evm_mut()
+            .db_mut()
+            .set_state_hook(Some(Box::new(state_hook) as Box<dyn OnStateHook + 'static>));
+        let result = executor.execute_block(block.transactions_recovered())?;
         self.db.merge_transitions(BundleRetention::Reverts);
         Ok(result)
     }
@@ -682,6 +682,10 @@ where
 
     fn size_hint(&self) -> usize {
         self.db.bundle_state.size_hint()
+    }
+
+    fn take_bal(&mut self) -> Option<Vec<alloy_eip7928::account_changes::AccountChanges>> {
+        None
     }
 }
 

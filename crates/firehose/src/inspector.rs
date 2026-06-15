@@ -427,7 +427,7 @@ impl<'a> FirehoseInspector<'a> {
 
         self.tracer.on_balance_change(
             caller,
-            account.original_info.balance,
+            account.original_info().balance,
             account.info.balance,
             reason,
         );
@@ -439,7 +439,7 @@ impl<'a> FirehoseInspector<'a> {
         // and `process_eip7702_auth_list` (called below) emits those bumps
         // separately. Letting the live nonce through here would double-count.
         if let Some((old, new)) =
-            deduct_caller_nonce_emission(account.original_info.nonce, account.info.nonce)
+            deduct_caller_nonce_emission(account.original_info().nonce, account.info.nonce)
         {
             self.tracer.on_nonce_change(caller, old, new);
         }
@@ -640,8 +640,8 @@ impl<'a> FirehoseInspector<'a> {
                 let (mut nonce, code_hash, code_loaded) = if let Some(acc) =
                     context.journal().evm_state().get(&authority)
                 {
-                    let code = acc.original_info.code.as_ref().map(|b| b.original_bytes().to_vec());
-                    (acc.original_info.nonce, acc.original_info.code_hash, code)
+                    let code = acc.original_info().code.as_ref().map(|b| b.original_bytes().to_vec());
+                    (acc.original_info().nonce, acc.original_info().code_hash, code)
                 } else {
                     (0, KECCAK_EMPTY, Some(Vec::new()))
                 };
@@ -1159,7 +1159,9 @@ where
         // in-block delegation set by any prior transaction.
         {
             if let Some(account) = context.journal().evm_state().get(&to) {
-                if let Some(eip7702) = account.info.code.as_ref().and_then(|code| code.eip7702_address()) {
+                if let Some(eip7702) =
+                    account.info.code.as_ref().and_then(|code| code.eip7702_address())
+                {
                     self.tracer.set_current_call_address_delegates_to(eip7702);
                 }
             }
