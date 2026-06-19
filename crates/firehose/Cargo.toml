@@ -39,3 +39,8 @@ alloy-rlp.workspace = true
 eyre.workspace = true
 futures.workspace = true
 rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+revm.workspace = true
+base64 = "0.22"
+prost = "0.14"
