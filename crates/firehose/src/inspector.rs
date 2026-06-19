@@ -106,6 +106,11 @@ pub struct FirehoseInspector<'a> {
 
     // last seen number of logs in a given transaction
     trx_logs_count: u32,
+
+    // per-tx journal index up to which StorageChanged entries have been emitted (by the
+    // SSTORE opcode in step_end, or by the precompile gather in call_end). Prevents the
+    // call_end precompile-storage gather from re-emitting opcode SSTOREs.
+    storage_processed_up_to: usize,
 }
 
 impl<'a> Debug for FirehoseInspector<'a> {
@@ -144,6 +149,7 @@ impl<'a> FirehoseInspector<'a> {
             root_balance_reason_override: None,
             log_block_index: 0,
             trx_logs_count: 0,
+            storage_processed_up_to: 0,
         }
     }
 
@@ -329,6 +335,101 @@ impl<'a> FirehoseInspector<'a> {
                     self.tracer.on_nonce_change(address, 0, 1);
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// Emit logs appended to the journal directly by native precompiles.
+    ///
+    /// Custom precompiles (B-20 tokens, the activation/policy registries, ...)
+    /// push event logs straight onto the journal via `EvmInternals::log`
+    /// instead of executing a LOG opcode, so revm never fires `log_full` for
+    /// them — see the `Inspector::log_full` rustdoc: "This will not happen only
+    /// if custom precompiles where logs will be gathered after precompile
+    /// call." Without gathering them here the call frame carries 0 logs while
+    /// the receipt carries the precompile's logs, and
+    /// `assign_ordinal_and_index_to_receipt_logs` panics with a call/receipt
+    /// log count mismatch.
+    ///
+    /// Called from `call_end` before the frame is popped, so the logs attach to
+    /// the precompile call that emitted them and land in execution order
+    /// (just before the call exit, mirroring where they were produced). A
+    /// reverted call has already had its journal logs truncated by revm, so the
+    /// gap is empty and nothing is emitted — matching the (empty) receipt logs.
+    fn gather_precompile_logs<CTX>(&mut self, context: &mut CTX)
+    where
+        CTX: ContextTr,
+        CTX::Journal: JournalExt,
+    {
+        let total = context.journal().logs().len() as u32;
+        if total <= self.trx_logs_count {
+            return;
+        }
+
+        // Clone the unemitted tail: `on_log` borrows `self.tracer` mutably while
+        // the slice borrows `context`, mirroring `process_journal_changes`.
+        let new_logs: Vec<AlloyLog> =
+            context.journal().logs()[self.trx_logs_count as usize..total as usize].to_vec();
+        for (offset, log) in new_logs.iter().enumerate() {
+            // Same block_index formula as `log_full`: a log at per-tx journal
+            // index `i` gets `i + log_block_index`. Here `i = trx_logs_count + offset`.
+            let block_index = self.trx_logs_count + offset as u32 + self.log_block_index;
+            self.tracer.on_log(log.address, log.topics(), &log.data.data, block_index);
+        }
+        self.trx_logs_count = total;
+    }
+
+    /// Emit storage writes a native precompile made directly on the journal.
+    ///
+    /// Storage changes are normally captured in `step_end` gated on the SSTORE
+    /// opcode. Native precompiles write via `EvmInternals::sstore` without an
+    /// opcode, so `step_end` never fires and the `StorageChanged` journal entry
+    /// is silently dropped (`process_journal_changes` skips it via its `_` arm).
+    /// Unlike logs there is no call/receipt validator, so the loss is silent —
+    /// a B-20 token transfer's balance-slot writes would vanish from firehose.
+    ///
+    /// Called from `call_end` before the frame is popped, so the changes attach
+    /// to the precompile call that made them. `storage_processed_up_to` (advanced
+    /// by `step_end` for opcode SSTOREs) bounds the scan so opcode writes are
+    /// never re-emitted. Reverted precompile calls have their journal entries
+    /// truncated by revm, so the clamp drops them — matching final state.
+    fn gather_precompile_storage_changes<CTX>(&mut self, context: &mut CTX)
+    where
+        CTX: ContextTr,
+        CTX::Journal: JournalExt,
+    {
+        use reth_revm::revm::context::JournalEntry;
+
+        let journal_len = context.journal().journal().len();
+        if self.storage_processed_up_to > journal_len {
+            self.storage_processed_up_to = journal_len;
+        }
+        if self.storage_processed_up_to == journal_len {
+            return;
+        }
+
+        let entries: Vec<_> = context.journal().journal()
+            [self.storage_processed_up_to..journal_len]
+            .iter()
+            .cloned()
+            .collect();
+        self.storage_processed_up_to = journal_len;
+
+        for entry in entries {
+            if let JournalEntry::StorageChanged { address, key, had_value } = entry {
+                let new_value = context
+                    .journal()
+                    .evm_state()
+                    .get(&address)
+                    .and_then(|a| a.storage.get(&key))
+                    .map(|s| s.present_value())
+                    .unwrap_or_default();
+                self.tracer.on_storage_change(
+                    address,
+                    B256::from(key.to_be_bytes::<32>()),
+                    B256::from(had_value.to_be_bytes::<32>()),
+                    B256::from(new_value.to_be_bytes::<32>()),
+                );
             }
         }
     }
@@ -932,6 +1033,7 @@ impl<'a> FirehoseInspector<'a> {
 
         self.selfdestruct_addresses.clear();
         self.journal_processed_up_to = 0;
+        self.storage_processed_up_to = 0;
         self.tx_journal_snapshot.clear();
 
         // Advance the block-wide log counter by the COMMITTED log count, not by the
@@ -1109,6 +1211,9 @@ where
                         );
                     }
                 }
+                // Mark these journal entries as storage-processed so the call_end
+                // precompile-storage gather does not re-emit this opcode's SSTOREs.
+                self.storage_processed_up_to = context.journal().journal().len();
             }
         } else if step_ctx.opcode == Opcode::SelfDestruct as u8 {
             self.process_selfdestruct_balance_changes(context, step_ctx.start_journal_idx);
@@ -1193,6 +1298,12 @@ where
         // Scan journal entries accumulated during this call's execution BEFORE popping it,
         // so changes are attributed to the call that caused them.
         self.process_journal_changes(context);
+
+        // Gather state changes a native precompile made straight on the journal (no
+        // opcode fired, so step_end/log_full were never called) and attach them to this
+        // call frame. Storage before logs to match the usual effects-then-event order.
+        self.gather_precompile_storage_changes(context);
+        self.gather_precompile_logs(context);
 
         // Emit synthetic balance changes for a pending self-transfer if the call succeeded
         // (no-code target: step never fires but the transfer did happen). On failure
@@ -1948,5 +2059,198 @@ mod tests {
         let consumed = inspector.root_balance_reason_override.take();
         assert_eq!(consumed, Some(Reason::IncreaseMint));
         assert_eq!(inspector.root_balance_reason_override, None);
+    }
+
+    // ---- Native-precompile state-change capture (B-20 et al.) ----------------------------
+
+    /// A native precompile writes one storage slot and emits one log directly on the journal
+    /// (no SSTORE/LOG opcode). Driving the inspector's real `call` / `call_end` hooks around
+    /// those writes must attach both to the precompile's call frame: the log so the call-log
+    /// count matches the receipt (otherwise the tracer panics), and the storage change so it
+    /// is not silently dropped.
+    #[test]
+    fn precompile_journal_storage_and_logs_are_captured() {
+        let block = decode_fire_block(&drive_precompile_call());
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        let call = trx.calls.first().expect("one call");
+
+        assert_eq!(call.logs.len(), 1, "precompile log must be attached to the call");
+        assert_eq!(call.logs[0].address, PRECOMPILE.to_vec());
+        assert_eq!(call.logs[0].block_index, 0);
+
+        assert_eq!(
+            call.storage_changes.len(),
+            1,
+            "precompile storage write must be attached to the call"
+        );
+        let change = &call.storage_changes[0];
+        assert_eq!(change.address, PRECOMPILE.to_vec());
+        assert_eq!(change.key, B256::from(U256::from(7u64)).to_vec());
+        assert_eq!(change.new_value, B256::from(U256::from(42u64)).to_vec());
+        assert_eq!(change.old_value, B256::ZERO.to_vec());
+    }
+
+    /// Address of the B-20 activation registry precompile, used here as a stand-in for any
+    /// native precompile that writes storage / emits logs directly on the journal.
+    const PRECOMPILE: Address = Address::new([
+        0x84, 0x53, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    ]);
+    const SENDER: Address = Address::repeat_byte(0xaa);
+
+    /// Drives one transaction whose only call targets a native precompile, going through the
+    /// inspector's real `call` / `call_end` hooks (which run the precompile gathers). The
+    /// precompile body is simulated by writing the storage slot and log directly on the
+    /// journal between the two hooks — exactly what `EvmInternals` does for a real precompile,
+    /// with no SSTORE/LOG opcode in between. Write order mirrors a B-20 transfer: mutate
+    /// state, then emit the event. Returns the raw FIRE output buffer.
+    fn drive_precompile_call() -> Vec<u8> {
+        use reth_revm::{
+            bytecode::Bytecode,
+            revm::{
+                context::Context,
+                database::{CacheDB, EmptyDB},
+                interpreter::{
+                    CallInput, CallValue, Gas, InstructionResult, InterpreterResult,
+                },
+                interpreter::interpreter_action::CallScheme,
+                state::AccountInfo,
+                MainContext,
+            },
+        };
+
+        let storage_key = U256::from(7u64);
+        let storage_value = U256::from(42u64);
+        let log_topic = B256::repeat_byte(0xcc);
+        let log_data = Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]);
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(PRECOMPILE, AccountInfo::default());
+        let mut ctx = Context::mainnet().with_db(db);
+
+        let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+            firehose_tracer::config::Config::default(),
+            firehose_tracer::config::ChainConfig {
+                chain_id: 8453,
+                shanghai_time: Some(0),
+                cancun_time: Some(0),
+                prague_time: None,
+                verkle_time: None,
+            },
+            "reth-firehose-test",
+            "0",
+        );
+
+        {
+            // `with_buffer` already performed `on_blockchain_init`.
+            let mut insp = FirehoseInspector::new(&mut tracer);
+            insp.tracer_mut().on_block_start(firehose_tracer::types::BlockEvent {
+                block: firehose_tracer::types::BlockData { number: 2, ..Default::default() },
+                finalized: None,
+                flash_block: None,
+            });
+            insp.tracer_mut().on_tx_start(legacy_tx_event(), None);
+
+            let mut inputs = CallInputs {
+                input: CallInput::Bytes(Bytes::new()),
+                return_memory_offset: 0..0,
+                gas_limit: 100_000,
+                reservoir: 0,
+                bytecode_address: PRECOMPILE,
+                known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
+                target_address: PRECOMPILE,
+                caller: SENDER,
+                value: CallValue::Transfer(U256::ZERO),
+                scheme: CallScheme::Call,
+                is_static: false,
+                charged_new_account_state_gas: false,
+            };
+
+            // Enter the precompile frame through the production hook.
+            let _ = insp.call(&mut ctx, &mut inputs);
+
+            // The precompile body: SSTORE-equivalent then a log, both straight on the journal
+            // with no opcode. Warm the account and slot first so `sstore` does not attempt a
+            // cold DB load against the empty test DB.
+            ctx.journal_mut().load_account(PRECOMPILE).expect("load account");
+            ctx.journal_mut().sload(PRECOMPILE, storage_key).expect("sload");
+            ctx.journal_mut().sstore(PRECOMPILE, storage_key, storage_value).expect("sstore");
+            ctx.journal_mut().log(AlloyLog {
+                address: PRECOMPILE,
+                data: alloy_primitives::LogData::new_unchecked(vec![log_topic], log_data.clone()),
+            });
+
+            // Exit through the production hook — this is where the precompile gathers run.
+            let mut outcome = CallOutcome {
+                result: InterpreterResult {
+                    result: InstructionResult::Return,
+                    output: Bytes::new(),
+                    gas: Gas::new(100_000),
+                },
+                memory_offset: 0..0,
+                was_precompile_called: true,
+                precompile_call_logs: Vec::new(),
+                charged_new_account_state_gas: false,
+            };
+            insp.call_end(&mut ctx, &inputs, &mut outcome);
+
+            let mut receipt = firehose_tracer::types::ReceiptData::new(0, 21_000, 1, 21_000);
+            receipt.add_log(firehose_tracer::types::LogData::new(
+                PRECOMPILE,
+                vec![log_topic],
+                log_data,
+                0,
+            ));
+            // Panics ("mismatch between call logs and receipt logs") if the call carries fewer
+            // logs than the receipt — i.e. if the log gather in `call_end` regressed.
+            insp.tracer_mut().on_tx_end(Some(&receipt), None);
+        }
+
+        tracer.on_block_end(None);
+        drop(tracer);
+
+        buffer.get_bytes()
+    }
+
+    fn legacy_tx_event() -> firehose_tracer::types::TxEvent {
+        firehose_tracer::types::TxEvent {
+            tx_type: firehose_tracer::types::TxType::Legacy,
+            hash: B256::repeat_byte(0x11),
+            from: SENDER,
+            to: Some(PRECOMPILE),
+            input: Bytes::new(),
+            value: U256::ZERO,
+            gas: 100_000,
+            gas_price: U256::from(7u64),
+            nonce: 0,
+            index: 0,
+            v: None,
+            r: B256::ZERO,
+            s: B256::ZERO,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
+            blob_gas_fee_cap: None,
+            blob_hashes: Vec::new(),
+            set_code_authorizations: Vec::new(),
+        }
+    }
+
+    /// firehose-tracer exposes no FIRE BLOCK parser (only `InMemoryBuffer::get_bytes`), so
+    /// pull the base64 protobuf payload off the single FIRE BLOCK line and decode it here.
+    fn decode_fire_block(raw: &[u8]) -> pb::sf::ethereum::r#type::v2::Block {
+        use base64::Engine as _;
+        use prost::Message as _;
+
+        let text = std::str::from_utf8(raw).expect("FIRE output is UTF-8");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("FIRE BLOCK "))
+            .expect("a FIRE BLOCK line");
+        let payload = line.split(' ').next_back().expect("payload token");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .expect("base64 payload");
+        pb::sf::ethereum::r#type::v2::Block::decode(bytes.as_slice()).expect("protobuf Block")
     }
 }
