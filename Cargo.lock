@@ -8881,9 +8881,11 @@ dependencies = [
  "alloy-genesis 2.0.4",
  "alloy-primitives",
  "alloy-rlp",
+ "base64 0.22.1",
  "eyre",
  "firehose-tracer",
  "futures",
+ "prost",
  "rayon",
  "reth-chainspec",
  "reth-ethereum-forks",
@@ -8896,6 +8898,7 @@ dependencies = [
  "reth-provider",
  "reth-revm",
  "reth-tracing",
+ "revm",
 ]
 
 [[package]]
