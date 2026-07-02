@@ -499,6 +499,16 @@ impl<'a> FirehoseInspector<'a> {
 
         self.journal_processed_up_to = context.journal().journal().len();
 
+        // Clear the previous tx's journal snapshot at the start of this tx. It is re-seeded
+        // at this tx's root call/create exit (see `call_end` / `create_end`) and read by
+        // `process_post_tx_balance_changes` and the chain-specific post-tx extras hook that
+        // follow. Clearing here (rather than at the end of the previous tx's post-processing)
+        // keeps the snapshot alive across the extras hook while guaranteeing that, should a
+        // future refactor ever drop the root-exit re-seed, `resolve_post_tx_balance` falls
+        // back to the pre-tx DB balance instead of reading a STALE previous-tx snapshot.
+        // Do NOT remove during refactors. See `resolve_post_tx_balance_*` tests.
+        self.tx_journal_snapshot.clear();
+
         let Some(account) = context.journal().evm_state().get(&caller) else { return };
 
         // REGRESSION GUARD: snapshot the live post-pre-exec sender balance so
@@ -925,6 +935,32 @@ impl<'a> FirehoseInspector<'a> {
         balance.unwrap_or_else(|| get_pre_tx_balance(address))
     }
 
+    /// Resolves the post-execution balance of `address` from this transaction's journal
+    /// snapshot, falling back to `get_pre_tx_balance` when the account had no
+    /// balance-affecting journal entry this tx.
+    ///
+    /// This is the same derivation the coinbase reward uses (`initial_balance = None`,
+    /// `gas_buy_cost = 0`): it reflects intra-tx value transfers and self-destructs, so an
+    /// account drained mid-execution (e.g. an OP Stack FeeVault withdrawal) resolves to its
+    /// drained balance rather than the stale pre-tx balance. Chain-specific post-tx extras
+    /// use it as the `old_balance` for their credits.
+    ///
+    /// Must be called after `execute_transaction_without_commit` returns and before the
+    /// snapshot is re-seeded by the next transaction.
+    pub fn post_tx_balance(
+        &self,
+        address: Address,
+        get_pre_tx_balance: &mut impl FnMut(Address) -> U256,
+    ) -> U256 {
+        Self::resolve_post_tx_balance(
+            address,
+            None,
+            U256::ZERO,
+            &self.tx_journal_snapshot,
+            get_pre_tx_balance,
+        )
+    }
+
     /// Emit post-execution balance changes: gas refund to sender and miner fee to coinbase.
     ///
     /// In Geth, these are emitted by `OnBalanceChange` hooks inside `reimburse_caller` and
@@ -935,8 +971,10 @@ impl<'a> FirehoseInspector<'a> {
     /// journal snapshot (captured at root call/create exit) to derive correct balances even
     /// when the root call reverted and `balance_tracker` would be stale.
     ///
-    /// Resets `balance_tracker`, `tx_journal_snapshot`, and `journal_processed_up_to`
-    /// so the inspector is ready for the next transaction.
+    /// Resets `balance_tracker` and `journal_processed_up_to` so the inspector is ready for
+    /// the next transaction. `tx_journal_snapshot` is deliberately left in place here (the
+    /// post-tx extras hook, which runs after this method, still needs it) and is instead
+    /// cleared at the start of the next tx in `enter_frame_pre_hook` (depth 0).
     pub fn process_post_tx_balance_changes<F>(
         &mut self,
         sender: Address,
@@ -1034,7 +1072,13 @@ impl<'a> FirehoseInspector<'a> {
         self.selfdestruct_addresses.clear();
         self.journal_processed_up_to = 0;
         self.storage_processed_up_to = 0;
-        self.tx_journal_snapshot.clear();
+        // NOTE: `tx_journal_snapshot` is intentionally NOT cleared here. Chain-specific
+        // post-tx extras (OP Stack fee-vault credits, see `PostTxExtras`) run *after* this
+        // method and need the snapshot to resolve their `old_balance` via
+        // `resolve_post_tx_balance` — otherwise a FeeVault-withdrawal tx that drains the
+        // vault mid-execution would report a stale pre-tx balance. It is cleared at the start
+        // of the next tx in `enter_frame_pre_hook` (depth 0) and re-seeded at that tx's root
+        // exit before it is read again.
 
         // Advance the block-wide log counter by the COMMITTED log count, not by the
         // cached `trx_logs_count` which reflects `journal.logs().len()` at the last log
@@ -1532,6 +1576,18 @@ pub trait FirehoseInspectorApi {
         committed_log_count: u32,
         get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
     );
+
+    /// Type-erased version of [`FirehoseInspector::post_tx_balance`].
+    ///
+    /// Chain-specific [`PostTxExtras`](crate::PostTxExtras) impls call this to obtain the
+    /// post-execution balance of an account they credit, so their `old_balance` reflects any
+    /// intra-tx modification (e.g. an OP Stack FeeVault withdrawal draining the vault before
+    /// the fee reward is applied) instead of the stale pre-tx balance read from the DB.
+    fn post_tx_balance_erased(
+        &self,
+        address: Address,
+        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
+    ) -> U256;
 }
 
 impl<'a> FirehoseInspectorApi for FirehoseInspector<'a> {
@@ -1567,6 +1623,14 @@ impl<'a> FirehoseInspectorApi for FirehoseInspector<'a> {
             committed_log_count,
             |addr| get_pre_tx_balance(addr),
         );
+    }
+
+    fn post_tx_balance_erased(
+        &self,
+        address: Address,
+        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
+    ) -> U256 {
+        self.post_tx_balance(address, &mut |addr| get_pre_tx_balance(addr))
     }
 }
 
@@ -1899,6 +1963,54 @@ mod tests {
             &mut get_pre,
         );
         assert_eq!(resolved, pre_tx_coinbase);
+    }
+
+    /// Fee-vault credit path (`post_tx_balance`): the OP Stack post-tx extras hook resolves
+    /// a fee vault's `old_balance` via the same `initial_balance = None, gas_buy_cost = 0`
+    /// derivation the coinbase reward uses. On a FeeVault-withdrawal tx the vault is drained
+    /// mid-execution (a `BalanceTransfer` from the vault), so the resolved balance must be the
+    /// post-drain value — NOT the pre-tx balance a `db.basic` read would return.
+    ///
+    /// Live-block regression (base-mainnet block 52115535, tx c7febd63): BaseFeeVault
+    /// (0x…19) held 0x74500df8c2f300, was fully withdrawn during the tx, then credited the
+    /// tx fee reward. Pre-fix reth reported old=0x74500df8c2f300 / new=pre+reward; geth
+    /// reported old=0 / new=reward. This pins the resolver to geth's behaviour.
+    #[test]
+    fn resolve_post_tx_balance_fee_vault_drained_before_reward() {
+        let vault = addr(0x19);
+        let bridge = addr(0x16);
+        let pre_tx = U256::from(0x74500df8c2f300_u64); // vault balance entering the tx
+
+        // FeeVault.withdraw() sends the entire balance out during execution.
+        let journal = vec![balance_transfer(vault, bridge, pre_tx)];
+        let mut get_pre = |_: Address| pre_tx;
+
+        let resolved = FirehoseInspector::resolve_post_tx_balance(
+            vault,
+            None,
+            U256::ZERO,
+            &journal,
+            &mut get_pre,
+        );
+        assert_eq!(
+            resolved,
+            U256::ZERO,
+            "vault drained to 0 during execution → reward old_balance must be 0, not pre-tx"
+        );
+
+        // Sanity: with no withdrawal (untouched vault) it falls back to the pre-tx balance,
+        // preserving the common-case behaviour for every non-withdrawal tx.
+        let untouched: Vec<JournalEntry> = vec![];
+        assert_eq!(
+            FirehoseInspector::resolve_post_tx_balance(
+                vault,
+                None,
+                U256::ZERO,
+                &untouched,
+                &mut get_pre,
+            ),
+            pre_tx,
+        );
     }
 
     // ----------------------------------------------------------------------
