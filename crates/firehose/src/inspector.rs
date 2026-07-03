@@ -201,6 +201,23 @@ impl<'a> FirehoseInspector<'a> {
         } else {
             // Memory not yet resized (step fires before resize_memory!).
             // Zero-pad like Geth's Memory.GetPtr to produce a complete preimage.
+            //
+            // `size` is an untrusted stack operand. Growing memory to cover it
+            // costs quadratic gas (3*w + w^2/512, w = words). Anything the
+            // remaining gas can't pay for OOG-reverts before the opcode runs, so
+            // step_end never emits this preimage. Cap the zero-pad allocation to
+            // that gas-affordable bound so a beefy machine doesn't allocate GBs
+            // for a keccak Ethereum would reject anyway (and never overflows).
+            //
+            // From 3*w + w^2/512 <= gas, a generous bound is w <= floor(sqrt(512*gas))
+            // (dropping the +3*w term only makes the cap larger, never rejecting a
+            // keccak that would actually execute).
+            let gas = interp.gas.remaining() as u128;
+            let max_words = (512u128.saturating_mul(gas)).isqrt();
+            let max_len = max_words.saturating_mul(32).min(usize::MAX as u128) as usize;
+            if len > max_len {
+                return None;
+            }
             let mut buf = vec![0u8; len];
             if offset < mem_len {
                 let copy_len = (mem_len - offset).min(len);
