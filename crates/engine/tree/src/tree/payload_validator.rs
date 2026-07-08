@@ -580,9 +580,10 @@ where
         // If any early return is taken between here and `mark_verified()`, the guard's Drop emits
         // `on_block_end(Some(err))` so invalid blocks are never flushed downstream.
         //
-        // `finalized` is `None` on the live engine path: the consensus layer hasn't necessarily
-        // advanced the finalized head by the time we're validating a payload. The pipeline
-        // (staged-sync) path advertises the finalized ref itself.
+        // `finalized` advertises the last finalized head known to the node. On the live engine
+        // path this is set by forkchoiceUpdated (via `set_finalized` on the in-memory state), so
+        // it may lag the block being validated by a few slots — that's the correct Firehose
+        // semantics: each block carries the finalized head as of its execution.
         //
         // We resolve the block eagerly here and rebuild `input` as a `Block` variant so the later
         // `convert_to_block(input)?` site becomes a cheap unwrap of the already-sealed block.
@@ -594,7 +595,10 @@ where
         let (mut fh_tracer, input): (Option<reth_firehose::FirehoseBlockTracer>, _) =
             if reth_firehose::is_tracer_initialized() {
                 let sealed = convert_to_block(input)?;
-                let tracer = reth_firehose::FirehoseBlockTracer::start::<N>(&sealed, None);
+                let finalized = reth_firehose::mapper::finalized_ref_from_num_hash(
+                    ctx.canonical_in_memory_state().get_finalized_num_hash(),
+                );
+                let tracer = reth_firehose::FirehoseBlockTracer::start::<N>(&sealed, finalized);
                 let fh_tracer = (!tracer.is_genesis()).then_some(tracer);
                 (fh_tracer, BlockOrPayload::Block(sealed))
             } else {
