@@ -13,6 +13,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Add StreamingFast Docker image build, push and release CI (`Dockerfile.sf`, `.github/workflows/sf-release.yml`). Pushing the `firehose/*` branch or a `*-fh*` tag builds the Firehose-instrumented `reth` and publishes it to `ghcr.io/streamingfast/reth`; tag builds use the `maxperf` profile and attach a `reth_linux_amd64` release asset. The runtime image bundles `fireeth`, which drives `reth` as its reader node.
 
+### Fixed
+
+- Emit the value-transfer balance changes when a transaction sends value to a precompile and then fails (e.g. the precompile runs out of gas). The transfer creates a revm `BalanceTransfer` journal entry that is normally read in `call_end`, but a reverted no-step callee has that entry truncated by the checkpoint rollback before the journal walk runs, so both balance changes were dropped. They are now captured at call-enter and re-emitted synthetically on revert, matching geth (which records the transfer that happened before the revert). Aborts that occur *before* the transfer (`OutOfFunds` / `CallTooDeep`) correctly emit nothing.
+
 ## v2.3.0-fh-3
 
 ### Fixed

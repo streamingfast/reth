@@ -56,6 +56,15 @@ pub struct FirehoseInspector<'a> {
     /// without any opcode run (call_end on a no-code target).
     pending_self_transfer: Option<(Address, U256)>,
 
+    /// Value transfer `(from, to, value)` for the current non-self `call`, captured at
+    /// call-enter. `process_journal_changes` clears it once revm's BalanceTransfer journal
+    /// entry has been emitted (stepping callee, or a successful no-step callee). If it
+    /// survives to `call_end`, the call reverted and revm truncated the entry before our
+    /// journal walk could read it. For a no-step callee (a precompile) the transfer would
+    /// otherwise be lost, so `call_end` re-emits it synthetically to match Geth, which
+    /// records the transfer that happened before the revert.
+    pending_value_transfer: Option<(Address, Address, U256)>,
+
     /// Addresses that executed SELFDESTRUCT and were truly destroyed (AccountDestroyed
     /// journal entry) during the current transaction.
     selfdestruct_addresses: HashSet<Address>,
@@ -119,6 +128,7 @@ impl<'a> Debug for FirehoseInspector<'a> {
             .field("last_step", &self.last_step.as_ref().map(|s| s.opcode))
             .field("journal_processed_up_to", &self.journal_processed_up_to)
             .field("pending_value_transfer_check", &self.pending_value_transfer_check)
+            .field("pending_value_transfer", &self.pending_value_transfer)
             .field("selfdestruct_addresses", &self.selfdestruct_addresses)
             .field("tx_journal_snapshot_len", &self.tx_journal_snapshot.len())
             .finish()
@@ -142,6 +152,7 @@ impl<'a> FirehoseInspector<'a> {
             journal_processed_up_to: 0,
             pending_value_transfer_check: false,
             pending_self_transfer: None,
+            pending_value_transfer: None,
             selfdestruct_addresses: HashSet::new(),
             pending_selfdestruct_cleanups: Vec::new(),
             tx_journal_snapshot: Vec::new(),
@@ -288,6 +299,13 @@ impl<'a> FirehoseInspector<'a> {
 
                         self.tracer.on_balance_change(from, old_from, new_from, reason);
                         self.tracer.on_balance_change(to, old_to, new_to, reason);
+                    }
+                    // Mark the current call's own value transfer as emitted so call_end
+                    // does not synthesize a duplicate (see `pending_value_transfer`).
+                    if let Some((pf, pt, pv)) = self.pending_value_transfer {
+                        if pf == from && pt == to && pv == balance {
+                            self.pending_value_transfer = None;
+                        }
                     }
                 }
                 JournalEntry::NonceChange { address, previous_nonce } => {
@@ -475,6 +493,29 @@ impl<'a> FirehoseInspector<'a> {
 
         self.tracer.on_balance_change(address, current, intermediate, reason);
         self.tracer.on_balance_change(address, intermediate, current, reason);
+    }
+
+    /// Emit the sender-debit + recipient-credit balance changes for a value transfer that
+    /// revm reverted (a no-step callee such as a precompile that ran out of gas). The
+    /// checkpoint rollback already restored both balances, so `evm_state` shows the
+    /// pre-transfer values: the debit runs `bal → bal - value`, the credit `bal → bal +
+    /// value`, matching what Geth reported at transfer time before the revert.
+    fn emit_reverted_value_transfer<CTX>(
+        &mut self,
+        context: &mut CTX,
+        from: Address,
+        to: Address,
+        value: U256,
+    ) where
+        CTX: ContextTr,
+        CTX::Journal: JournalExt,
+    {
+        let reason = pb::sf::ethereum::r#type::v2::balance_change::Reason::Transfer;
+        let evm_state = context.journal().evm_state();
+        let from_bal = evm_state.get(&from).map(|a| a.info.balance).unwrap_or(U256::ZERO);
+        let to_bal = evm_state.get(&to).map(|a| a.info.balance).unwrap_or(U256::ZERO);
+        self.tracer.on_balance_change(from, from_bal, from_bal.saturating_sub(value), reason);
+        self.tracer.on_balance_change(to, to_bal, to_bal.saturating_add(value), reason);
     }
 
     /// Shared pre-`on_call_enter` bookkeeping for the `call` and `create` hooks.
@@ -1347,6 +1388,15 @@ where
                     self.pending_self_transfer = Some((inputs.caller, value));
                 }
             }
+        } else if let Some(value) = inputs.value.transfer() {
+            // Non-self value transfer. revm pushes a BalanceTransfer entry we normally read
+            // from the journal, but on a reverted no-step callee (precompile) that entry is
+            // truncated before call_end. Record it so call_end can re-emit it (see
+            // `pending_value_transfer`). `inputs.value.transfer()` is None for
+            // DELEGATECALL/CALLCODE (apparent value), so those never set it.
+            if !value.is_zero() {
+                self.pending_value_transfer = Some((inputs.caller, inputs.target_address, value));
+            }
         }
 
         None
@@ -1373,6 +1423,22 @@ where
         if let Some((address, value)) = self.pending_self_transfer.take() {
             if outcome.result.is_ok() {
                 self.emit_self_transfer_balance_changes(context, address, value);
+            }
+        }
+
+        // A non-self value transfer still pending here means process_journal_changes never
+        // saw its BalanceTransfer entry: the call reverted and revm truncated it before we
+        // could read it. For a no-step callee (precompile) the transfer is otherwise lost,
+        // so re-emit it to match Geth — unless the call aborted BEFORE the transfer
+        // (OutOfFunds / CallTooDeep), in which case no transfer ever happened.
+        if let Some((from, to, value)) = self.pending_value_transfer.take() {
+            use reth_revm::revm::interpreter::InstructionResult;
+            let aborted_pre_transfer = matches!(
+                outcome.result.result,
+                InstructionResult::OutOfFunds | InstructionResult::CallTooDeep
+            );
+            if !aborted_pre_transfer {
+                self.emit_reverted_value_transfer(context, from, to, value);
             }
         }
 
@@ -2220,6 +2286,35 @@ mod tests {
         assert_eq!(change.old_value, B256::ZERO.to_vec());
     }
 
+    #[test]
+    fn reverted_precompile_value_transfer_emits_balance_changes() {
+        let block = decode_fire_block(&drive_reverted_precompile_value_transfer());
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        let call = trx.calls.first().expect("one call");
+        assert!(call.state_reverted, "precompile call must be reverted");
+
+        let transfers: Vec<_> = call
+            .balance_changes
+            .iter()
+            .filter(|b| {
+                b.reason == pb::sf::ethereum::r#type::v2::balance_change::Reason::Transfer as i32
+            })
+            .collect();
+
+        assert_eq!(
+            transfers.len(),
+            2,
+            "reverted precompile value transfer must emit sender-debit + precompile-credit"
+        );
+        assert_eq!(transfers[0].address, SENDER.to_vec(), "first transfer is the sender debit");
+        assert_eq!(
+            transfers[1].address,
+            PRECOMPILE.to_vec(),
+            "second transfer is the precompile credit"
+        );
+    }
+
     /// Address of the B-20 activation registry precompile, used here as a stand-in for any
     /// native precompile that writes storage / emits logs directly on the journal.
     const PRECOMPILE: Address = Address::new([
@@ -2332,6 +2427,108 @@ mod tests {
             ));
             // Panics ("mismatch between call logs and receipt logs") if the call carries fewer
             // logs than the receipt — i.e. if the log gather in `call_end` regressed.
+            insp.tracer_mut().on_tx_end(Some(&receipt), None);
+        }
+
+        tracer.on_block_end(None);
+        drop(tracer);
+
+        buffer.get_bytes()
+    }
+
+    /// Drives one transaction sending value to a native precompile whose frame then fails
+    /// (out of gas) after the value transfer, so revm truncated the BalanceTransfer journal
+    /// entry on rollback. Mirrors Hoodi 3171397: geth still reports the transfer, so the
+    /// inspector must re-emit it from `pending_value_transfer` in call_end. Returns the raw
+    /// FIRE output buffer.
+    fn drive_reverted_precompile_value_transfer() -> Vec<u8> {
+        use reth_revm::{
+            bytecode::Bytecode,
+            revm::{
+                context::Context,
+                database::{CacheDB, EmptyDB},
+                interpreter::interpreter_action::CallScheme,
+                interpreter::{CallInput, CallValue, Gas, InstructionResult, InterpreterResult},
+                state::AccountInfo,
+                MainContext,
+            },
+        };
+
+        let value = U256::from(1000u64);
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            SENDER,
+            AccountInfo { balance: U256::from(1_000_000u64), ..Default::default() },
+        );
+        db.insert_account_info(
+            PRECOMPILE,
+            AccountInfo { balance: U256::from(500u64), ..Default::default() },
+        );
+        let mut ctx = Context::mainnet().with_db(db);
+
+        let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+            firehose_tracer::config::Config::default(),
+            firehose_tracer::config::ChainConfig {
+                chain_id: 8453,
+                shanghai_time: Some(0),
+                cancun_time: Some(0),
+                prague_time: None,
+                verkle_time: None,
+            },
+            "reth-firehose-test",
+            "0",
+        );
+
+        {
+            let mut insp = FirehoseInspector::new(&mut tracer);
+            insp.tracer_mut().on_block_start(firehose_tracer::types::BlockEvent {
+                block: firehose_tracer::types::BlockData { number: 2, ..Default::default() },
+                finalized: None,
+                flash_block: None,
+            });
+            insp.tracer_mut().on_tx_start(legacy_tx_event(), None);
+
+            let mut inputs = CallInputs {
+                input: CallInput::Bytes(Bytes::new()),
+                return_memory_offset: 0..0,
+                gas_limit: 0,
+                reservoir: 0,
+                bytecode_address: PRECOMPILE,
+                known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
+                target_address: PRECOMPILE,
+                caller: SENDER,
+                value: CallValue::Transfer(value),
+                scheme: CallScheme::Call,
+                is_static: false,
+                charged_new_account_state_gas: false,
+            };
+
+            // Enter the precompile frame through the production hook (records the pending
+            // value transfer).
+            let _ = insp.call(&mut ctx, &mut inputs);
+
+            // Simulate the post-rollback state: revm did the transfer then the precompile ran
+            // out of gas and the checkpoint was reverted, truncating the BalanceTransfer. The
+            // accounts are loaded at their pre-transfer balances and no BalanceTransfer entry
+            // remains in the journal for call_end to find.
+            ctx.journal_mut().load_account(SENDER).expect("load sender");
+            ctx.journal_mut().load_account(PRECOMPILE).expect("load precompile");
+
+            let mut outcome = CallOutcome {
+                result: InterpreterResult {
+                    result: InstructionResult::OutOfGas,
+                    output: Bytes::new(),
+                    gas: Gas::new(0),
+                },
+                memory_offset: 0..0,
+                was_precompile_called: true,
+                precompile_call_logs: Vec::new(),
+                charged_new_account_state_gas: false,
+            };
+            insp.call_end(&mut ctx, &inputs, &mut outcome);
+
+            let receipt = firehose_tracer::types::ReceiptData::new(0, 21_000, 0, 21_000);
             insp.tracer_mut().on_tx_end(Some(&receipt), None);
         }
 
