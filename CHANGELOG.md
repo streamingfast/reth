@@ -7,6 +7,38 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## v2.3.0-fh-4
+
+### Added
+
+- Add StreamingFast Docker image build, push and release CI (`Dockerfile.sf`, `.github/workflows/sf-release.yml`). Pushing the `firehose/*` branch or a `*-fh*` tag builds the Firehose-instrumented `reth` and publishes it to `ghcr.io/streamingfast/reth`; tag builds use the `maxperf` profile and attach a `reth_linux_amd64` release asset. The runtime image bundles `fireeth`, which drives `reth` as its reader node.
+
+## v2.3.0-fh-3
+
+### Fixed
+
+- Add a gas-bound cap on `step_keccak256` to prevent an out-of-memory panic for operations that would out-of-gas anyway.
+
+## v2.3.0-fh-2
+
+### Added
+
+- Expose the post-tx balance resolver so chains can supply post-tx balance extras.
+
+## v2.3.0-fh-1
+
+### Added
+
+- Capture native-precompile state changes in the Firehose tracer.
+
+### Changed
+
+- Drive the precompile test through the real `call` / `call_end` hooks.
+
+## v2.3.0-fh
+
+Rebase the Firehose fork onto upstream reth v2.3.0, keeping Firehose tracing intact.
+
 ## v2.2.0-fh
 
 First Firehose-instrumented release on top of upstream reth v2.2.0.
