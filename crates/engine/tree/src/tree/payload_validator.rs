@@ -576,8 +576,10 @@ where
         // If any early return is taken between here and `mark_verified()`, the guard's Drop
         // emits `on_block_end(Some(err))` so invalid blocks are never flushed downstream.
         //
-        // `finalized` is `None` on the live engine path: the consensus layer hasn't necessarily
-        // advanced the finalized head by the time we're validating a payload.
+        // `finalized` advertises the last finalized head known to the node. On the live engine
+        // path this is set by forkchoiceUpdated (via `set_finalized` on the in-memory state), so
+        // it may lag the block being validated by a few slots — that's the correct Firehose
+        // semantics: each block carries the finalized head as of its execution.
         //
         // Block 1 is the genesis marker: `start` emits `on_genesis_block` as a
         // standalone event and does NOT leave the tracer in "block state", so wrapping the
@@ -589,7 +591,11 @@ where
                 // returns a reference to the Result<SealedBlock, _>.
                 match validated_block.get().as_ref() {
                     Ok(sealed) => {
-                        let tracer = reth_firehose::FirehoseBlockTracer::start::<N>(sealed, None);
+                        let finalized = reth_firehose::mapper::finalized_ref_from_num_hash(
+                            ctx.canonical_in_memory_state().get_finalized_num_hash(),
+                        );
+                        let tracer =
+                            reth_firehose::FirehoseBlockTracer::start::<N>(sealed, finalized);
                         (!tracer.is_genesis()).then_some(tracer)
                     }
                     Err(_) => None,

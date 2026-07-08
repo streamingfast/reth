@@ -123,7 +123,18 @@ where
 pub(crate) fn to_finalized_ref(
     block_ref: ProviderResult<Option<alloy_eips::BlockNumHash>>,
 ) -> Option<firehose_tracer::types::FinalizedBlockRef> {
-    block_ref.ok().flatten().map(|num_hash| firehose_tracer::types::FinalizedBlockRef {
+    finalized_ref_from_num_hash(block_ref.ok().flatten())
+}
+
+/// Builds a Firehose [`FinalizedBlockRef`](firehose_tracer::types::FinalizedBlockRef) from the
+/// finalized block's number/hash, if known.
+///
+/// Callers on the live engine path read this from the in-memory canonical state (updated by
+/// forkchoiceUpdated); a `None` num_hash means no finalized head is known yet.
+pub fn finalized_ref_from_num_hash(
+    num_hash: Option<alloy_eips::BlockNumHash>,
+) -> Option<firehose_tracer::types::FinalizedBlockRef> {
+    num_hash.map(|num_hash| firehose_tracer::types::FinalizedBlockRef {
         number: num_hash.number,
         hash: Some(num_hash.hash),
     })
