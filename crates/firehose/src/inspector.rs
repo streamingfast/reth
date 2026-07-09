@@ -379,7 +379,18 @@ impl<'a> FirehoseInspector<'a> {
         CTX::Journal: JournalExt,
     {
         let total = context.journal().logs().len() as u32;
-        if total <= self.trx_logs_count {
+
+        // revm truncates journal logs when a call reverts. If an earlier opcode LOG
+        // advanced `trx_logs_count` (via `log_full`) and was then rolled back, the
+        // watermark is now stale-high relative to the shrunken journal. Clamp it down
+        // so a subsequent precompile log that reuses the freed index is not skipped as
+        // "already emitted". Mirrors the clamp in `gather_precompile_storage_changes`.
+        // Runs on every `call_end`, including the reverting frames, so the watermark is
+        // corrected before the next call appends at the reused index.
+        if self.trx_logs_count > total {
+            self.trx_logs_count = total;
+        }
+        if total == self.trx_logs_count {
             return;
         }
 
@@ -2332,6 +2343,154 @@ mod tests {
             ));
             // Panics ("mismatch between call logs and receipt logs") if the call carries fewer
             // logs than the receipt — i.e. if the log gather in `call_end` regressed.
+            insp.tracer_mut().on_tx_end(Some(&receipt), None);
+        }
+
+        tracer.on_block_end(None);
+        drop(tracer);
+
+        buffer.get_bytes()
+    }
+
+    #[test]
+    fn precompile_log_after_reverted_opcode_log_is_captured() {
+        let block = decode_fire_block(&drive_precompile_log_after_reverted_opcode_log());
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        let call = trx.calls.first().expect("one call");
+
+        assert_eq!(
+            call.logs.len(),
+            1,
+            "precompile log reusing a reverted log's journal index must still be captured"
+        );
+        assert_eq!(call.logs[0].address, PRECOMPILE.to_vec());
+        assert_eq!(call.logs[0].block_index, 0);
+    }
+
+    /// Regression for the Base mainnet block 48387796 panic (tx 0xc2cf3e23…): a Uniswap V4
+    /// revert-based quote emitted a `Swap` *opcode* log inside a sub-call that then reverted.
+    /// `log_full` had advanced `trx_logs_count`; revm truncated the log on revert but left the
+    /// watermark stale-high. A B-20 token's committed precompile log then reused the freed
+    /// journal index, so `gather_precompile_logs` skipped it as "already emitted" — the call
+    /// carried one fewer log than the receipt and `assign_ordinal_and_index_to_receipt_logs`
+    /// panicked ("6 call logs but 7 receipt logs").
+    ///
+    /// Drives the real hooks: emit an opcode log and revert it (with a manual
+    /// `gather_precompile_logs` standing in for the reverting child frame's `call_end`, which
+    /// is where the watermark must be re-clamped to the live log count), then emit a native
+    /// precompile log at the reused index — it must still be gathered.
+    fn drive_precompile_log_after_reverted_opcode_log() -> Vec<u8> {
+        use reth_revm::{
+            bytecode::Bytecode,
+            revm::{
+                context::Context,
+                database::{CacheDB, EmptyDB},
+                interpreter::{
+                    CallInput, CallValue, Gas, InstructionResult, InterpreterResult,
+                },
+                interpreter::interpreter_action::CallScheme,
+                state::AccountInfo,
+                MainContext,
+            },
+        };
+
+        let reverted_topic = B256::repeat_byte(0xab);
+        let precompile_topic = B256::repeat_byte(0xcc);
+        let precompile_data = Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]);
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(PRECOMPILE, AccountInfo::default());
+        let mut ctx = Context::mainnet().with_db(db);
+
+        let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+            firehose_tracer::config::Config::default(),
+            firehose_tracer::config::ChainConfig {
+                chain_id: 8453,
+                shanghai_time: Some(0),
+                cancun_time: Some(0),
+                prague_time: None,
+                verkle_time: None,
+            },
+            "reth-firehose-test",
+            "0",
+        );
+
+        {
+            let mut insp = FirehoseInspector::new(&mut tracer);
+            insp.tracer_mut().on_block_start(firehose_tracer::types::BlockEvent {
+                block: firehose_tracer::types::BlockData { number: 2, ..Default::default() },
+                finalized: None,
+                flash_block: None,
+            });
+            insp.tracer_mut().on_tx_start(legacy_tx_event(), None);
+
+            let mut inputs = CallInputs {
+                input: CallInput::Bytes(Bytes::new()),
+                return_memory_offset: 0..0,
+                gas_limit: 100_000,
+                reservoir: 0,
+                bytecode_address: PRECOMPILE,
+                known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
+                target_address: PRECOMPILE,
+                caller: SENDER,
+                value: CallValue::Transfer(U256::ZERO),
+                scheme: CallScheme::Call,
+                is_static: false,
+                charged_new_account_state_gas: false,
+            };
+
+            // Enter the precompile frame through the production hook.
+            let _ = insp.call(&mut ctx, &mut inputs);
+
+            // A sub-call emits a LOG opcode, then reverts. Replicate `log_full`'s side effect
+            // (advance the watermark to the journal log count), then revert the checkpoint so
+            // revm truncates the log back off the journal — leaving the watermark stale-high.
+            let checkpoint = ctx.journal_mut().checkpoint();
+            ctx.journal_mut().log(AlloyLog {
+                address: SENDER,
+                data: alloy_primitives::LogData::new_unchecked(vec![reverted_topic], Bytes::new()),
+            });
+            insp.trx_logs_count = ctx.journal().logs().len() as u32; // == 1, what log_full sets
+            ctx.journal_mut().checkpoint_revert(checkpoint);
+
+            // The reverting child frame's `call_end` runs the gather against the truncated
+            // journal — this is where the watermark must be re-clamped down to the live count.
+            insp.gather_precompile_logs(&mut ctx);
+
+            // The B-20 precompile body: a log straight on the journal (no LOG opcode), landing
+            // at the index the reverted log just freed.
+            ctx.journal_mut().log(AlloyLog {
+                address: PRECOMPILE,
+                data: alloy_primitives::LogData::new_unchecked(
+                    vec![precompile_topic],
+                    precompile_data.clone(),
+                ),
+            });
+
+            // Exit through the production hook — gather must now emit the precompile log.
+            let mut outcome = CallOutcome {
+                result: InterpreterResult {
+                    result: InstructionResult::Return,
+                    output: Bytes::new(),
+                    gas: Gas::new(100_000),
+                },
+                memory_offset: 0..0,
+                was_precompile_called: true,
+                precompile_call_logs: Vec::new(),
+                charged_new_account_state_gas: false,
+            };
+            insp.call_end(&mut ctx, &inputs, &mut outcome);
+
+            let mut receipt = firehose_tracer::types::ReceiptData::new(0, 21_000, 1, 21_000);
+            receipt.add_log(firehose_tracer::types::LogData::new(
+                PRECOMPILE,
+                vec![precompile_topic],
+                precompile_data,
+                0,
+            ));
+            // Panics ("mismatch between call logs and receipt logs") if the precompile log was
+            // skipped — the pre-fix behaviour.
             insp.tracer_mut().on_tx_end(Some(&receipt), None);
         }
 
