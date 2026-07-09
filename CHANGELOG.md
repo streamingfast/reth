@@ -7,6 +7,12 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## v2.3.0-fh-5
+
+### Fixed
+
+- Fix a call/receipt log-count mismatch panic (`assign_ordinal_and_index_to_receipt_logs`: "N call logs but N+1 receipt logs") when a native-precompile log (e.g. a B-20 token event) is emitted at a journal index just freed by a reverted opcode `LOG`. The opcode log advanced the `gather_precompile_logs` watermark via `log_full`; revm truncated it on revert but left the watermark stale-high, so the precompile log was skipped as already-emitted. `gather_precompile_logs` now re-clamps the watermark to the live journal log count, mirroring `gather_precompile_storage_changes`. First seen on Base mainnet block 48387796 (a Uniswap V4 revert-based quote hiding a B-20 log).
+
 ## v2.3.0-fh-4
 
 ### Added
