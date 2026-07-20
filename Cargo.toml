@@ -34,6 +34,7 @@ members = [
     "crates/era-downloader",
     "crates/era-utils",
     "crates/errors/",
+    "crates/firehose/",
     "crates/ethereum/hardforks/",
     "crates/ethereum/cli/",
     "crates/ethereum/consensus/",
@@ -351,6 +352,7 @@ reth-era = { path = "crates/era" }
 reth-era-downloader = { path = "crates/era-downloader" }
 reth-era-utils = { path = "crates/era-utils" }
 reth-errors = { path = "crates/errors" }
+reth-firehose = { path = "crates/firehose" }
 reth-eth-wire = { path = "crates/net/eth-wire" }
 reth-eth-wire-types = { path = "crates/net/eth-wire-types" }
 reth-ethereum-payload-builder = { path = "crates/ethereum/payload" }
@@ -505,6 +507,7 @@ dirs-next = "2.0.0"
 dyn-clone = "1.0.17"
 eyre = "0.6"
 fdlimit = "0.3.0"
+firehose-tracer = "5.1.0"
 fixed-map = { version = "0.9", default-features = false }
 humantime = "2.1"
 imbl = "7"
@@ -700,3 +703,11 @@ vergen-git2 = "9.1.0"
 
 # networking
 ipnet = "2.11"
+
+[patch.crates-io]
+# Patch rbase64 to remove its #[global_allocator] declaration, which conflicts
+# with reth's own global allocator (jemalloc / snmalloc).
+# The original rbase64 crate sets MiMalloc as the global allocator in its lib.rs,
+# which is a library-level bug.  This local copy removes that declaration while
+# keeping all encoding/decoding behaviour unchanged.
+rbase64 = { path = "vendor/rbase64" }

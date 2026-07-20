@@ -1,0 +1,28 @@
+[package]
+name = "reth-firehose"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Firehose integration for Reth: async emission, shutdown wiring, and gap detection"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-stages-types.workspace = true
+reth-storage-api.workspace = true
+
+# firehose
+firehose-tracer.workspace = true
+
+# misc
+clap = { workspace = true, features = ["derive", "env"] }
+eyre.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
