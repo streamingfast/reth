@@ -1,0 +1,16 @@
+# Patched rbase64: removed mimalloc global allocator that conflicts with reth's jemalloc.
+# See the workspace [patch.crates-io] section.
+
+[package]
+edition = "2021"
+name = "rbase64"
+version = "2.0.3"
+authors = ["Marcel Riera <marcel.riera@outlook.com>"]
+description = "A fast multi-threaded base64 encoding library and CLI tool (patched: no global allocator)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/uhmarcel/rbase64"
+
+[dependencies]
+
+[dev-dependencies]
+rand = { version = "0.8.5", features = ["small_rng"] }
