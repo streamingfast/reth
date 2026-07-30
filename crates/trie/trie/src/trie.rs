@@ -618,13 +618,16 @@ where
         let mut hashed_storage_cursor =
             self.hashed_cursor_factory.hashed_storage_cursor(self.hashed_address)?;
 
-        // short circuit on empty storage
-        if hashed_storage_cursor.is_storage_empty()? {
+        // Empty storage only needs to be walked when changed prefixes must produce trie updates.
+        if self.previous_state.is_none() &&
+            (!retain_updates || self.prefix_set.is_empty()) &&
+            hashed_storage_cursor.is_storage_empty()?
+        {
             Span::current().record("storage_root", format!("{EMPTY_ROOT_HASH:?}"));
             return Ok(StorageRootProgress::Complete(
                 EMPTY_ROOT_HASH,
                 0,
-                StorageTrieUpdates::deleted(),
+                StorageTrieUpdates::default(),
             ))
         }
 
