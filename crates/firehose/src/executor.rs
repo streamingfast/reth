@@ -629,9 +629,9 @@ where
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
         if !crate::is_tracer_initialized() {
-            return Err(BlockExecutionError::msg(
-                "FirehoseBlockExecutor requires the global tracer to be initialized for execute_and_trace_one",
-            ));
+            // Tracing disabled (e.g. FIREHOSE_DISABLED kill-switch): run the plain untraced
+            // executor so the node behaves exactly like the un-instrumented upstream.
+            return self.execute_one(block);
         }
 
         // The previous block has reached a point where the caller would have returned early on
