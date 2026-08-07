@@ -817,14 +817,14 @@ impl<'a> FirehoseInspector<'a> {
             // Initialize tracker for this authority from original_info on first encounter.
             if !auth_tracker.contains_key(&authority) {
                 // First, read nonce and code_hash from evm_state (immutable borrow on journal).
-                let (mut nonce, code_hash, code_loaded) = if let Some(acc) =
-                    context.journal().evm_state().get(&authority)
-                {
-                    let code = acc.original_info().code.as_ref().map(|b| b.original_bytes().to_vec());
-                    (acc.original_info().nonce, acc.original_info().code_hash, code)
-                } else {
-                    (0, KECCAK_EMPTY, Some(Vec::new()))
-                };
+                let (mut nonce, code_hash, code_loaded) =
+                    if let Some(acc) = context.journal().evm_state().get(&authority) {
+                        let code =
+                            acc.original_info().code.as_ref().map(|b| b.original_bytes().to_vec());
+                        (acc.original_info().nonce, acc.original_info().code_hash, code)
+                    } else {
+                        (0, KECCAK_EMPTY, Some(Vec::new()))
+                    };
 
                 // Sender's nonce was already incremented by deduct_caller.
                 if authority == tx_sender {
@@ -990,7 +990,21 @@ impl<'a> FirehoseInspector<'a> {
                         *b = b.saturating_add(*amount);
                     }
                 }
-                // SELFDESTRUCT: contract's balance was zeroed.
+                // SELFDESTRUCT beneficiary: revm credits `target` in place and records the
+                // move only inside `AccountDestroyed` — no `BalanceTransfer` entry is pushed
+                // on the truly-destroyed path (EIP-6780: contract created in the same tx, or
+                // pre-Cancun). Without this arm a coinbase/sender that received a suicide
+                // refund resolves to its stale pre-refund balance, so the following
+                // RewardTransactionFee/GasRefund event reports an `old_balance` that
+                // contradicts the SuicideRefund event emitted moments earlier.
+                JournalEntry::AccountDestroyed {
+                    address: destroyed, target, had_balance, ..
+                } if *target == address && *destroyed != address => {
+                    let b = balance.get_or_insert_with(|| get_pre_tx_balance(address));
+                    *b = b.saturating_add(*had_balance);
+                }
+                // SELFDESTRUCT: contract's balance was zeroed. Also covers the
+                // self-beneficiary case (`target == address`), where the balance is burned.
                 JournalEntry::AccountDestroyed { address: a, .. } if *a == address => {
                     balance = Some(U256::ZERO);
                 }
@@ -2107,6 +2121,87 @@ mod tests {
         );
     }
 
+    /// SELFDESTRUCT refund into the coinbase (or the sender): on the truly-destroyed path
+    /// revm credits `target` in place and pushes only `AccountDestroyed` — no
+    /// `BalanceTransfer`. The resolver must replay that credit, otherwise the
+    /// `RewardTransactionFee` event that follows carries a stale `old_balance`.
+    ///
+    /// Live-block regression (mainnet block 25690108): 0x8707c2bd… selfdestructed to the
+    /// coinbase 0x4838b106… for 0x690f7d1c42ce88. Geth reported
+    /// `SuicideRefund 0x46e9d5e2f034f0bb → 0x4752e5600c77bf43` followed by
+    /// `RewardTransactionFee old=0x4752e5600c77bf43`; pre-fix reth resolved the reward's
+    /// `old_balance` back to 0x46e9d5e2f034f0bb, silently dropping the refund.
+    #[test]
+    fn resolve_post_tx_balance_credits_selfdestruct_beneficiary() {
+        use reth_revm::revm::context_interface::journaled_state::entry::SelfdestructionRevertStatus;
+
+        let coinbase = addr(0x48);
+        let destroyed = addr(0x87);
+        let pre_tx = U256::from(0x46e9d5e2f034f0bb_u64);
+        let refund = U256::from(0x690f7d1c42ce88_u64);
+
+        let journal = vec![JournalEntry::AccountDestroyed {
+            had_balance: refund,
+            address: destroyed,
+            target: coinbase,
+            destroyed_status: SelfdestructionRevertStatus::GloballySelfdestroyed,
+        }];
+        let mut get_pre = |_: Address| pre_tx;
+
+        assert_eq!(
+            FirehoseInspector::resolve_post_tx_balance(
+                coinbase,
+                None,
+                U256::ZERO,
+                &journal,
+                &mut get_pre,
+            ),
+            U256::from(0x4752e5600c77bf43_u64),
+            "coinbase reward old_balance must include the suicide refund"
+        );
+
+        // The destroyed account itself still resolves to zero.
+        assert_eq!(
+            FirehoseInspector::resolve_post_tx_balance(
+                destroyed,
+                None,
+                U256::ZERO,
+                &journal,
+                &mut get_pre,
+            ),
+            U256::ZERO,
+        );
+    }
+
+    /// Self-beneficiary SELFDESTRUCT (`target == address`): the balance is burned, not
+    /// credited. The beneficiary arm must not fire and re-add it.
+    #[test]
+    fn resolve_post_tx_balance_selfdestruct_to_self_burns() {
+        use reth_revm::revm::context_interface::journaled_state::entry::SelfdestructionRevertStatus;
+
+        let account = addr(0x87);
+        let pre_tx = U256::from(0x1000_u64);
+
+        let journal = vec![JournalEntry::AccountDestroyed {
+            had_balance: pre_tx,
+            address: account,
+            target: account,
+            destroyed_status: SelfdestructionRevertStatus::GloballySelfdestroyed,
+        }];
+        let mut get_pre = |_: Address| pre_tx;
+
+        assert_eq!(
+            FirehoseInspector::resolve_post_tx_balance(
+                account,
+                None,
+                U256::ZERO,
+                &journal,
+                &mut get_pre,
+            ),
+            U256::ZERO,
+        );
+    }
+
     // ----------------------------------------------------------------------
     // Regression guards for the `tx_post_pre_exec_sender_balance` snapshot
     // path (`enter_frame_pre_hook` → `resolve_post_tx_balance`).
@@ -2328,9 +2423,8 @@ mod tests {
 
     /// Address of the B-20 activation registry precompile, used here as a stand-in for any
     /// native precompile that writes storage / emits logs directly on the journal.
-    const PRECOMPILE: Address = Address::new([
-        0x84, 0x53, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-    ]);
+    const PRECOMPILE: Address =
+        Address::new([0x84, 0x53, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
     const SENDER: Address = Address::repeat_byte(0xaa);
 
     /// Drives one transaction whose only call targets a native precompile, going through the
@@ -2346,9 +2440,9 @@ mod tests {
                 context::Context,
                 database::{CacheDB, EmptyDB},
                 interpreter::{
-                    CallInput, CallValue, Gas, InstructionResult, InterpreterResult,
+                    interpreter_action::CallScheme, CallInput, CallValue, Gas, InstructionResult,
+                    InterpreterResult,
                 },
-                interpreter::interpreter_action::CallScheme,
                 state::AccountInfo,
                 MainContext,
             },
@@ -2458,8 +2552,10 @@ mod tests {
             revm::{
                 context::Context,
                 database::{CacheDB, EmptyDB},
-                interpreter::interpreter_action::CallScheme,
-                interpreter::{CallInput, CallValue, Gas, InstructionResult, InterpreterResult},
+                interpreter::{
+                    interpreter_action::CallScheme, CallInput, CallValue, Gas, InstructionResult,
+                    InterpreterResult,
+                },
                 state::AccountInfo,
                 MainContext,
             },
@@ -2584,9 +2680,9 @@ mod tests {
                 context::Context,
                 database::{CacheDB, EmptyDB},
                 interpreter::{
-                    CallInput, CallValue, Gas, InstructionResult, InterpreterResult,
+                    interpreter_action::CallScheme, CallInput, CallValue, Gas, InstructionResult,
+                    InterpreterResult,
                 },
-                interpreter::interpreter_action::CallScheme,
                 state::AccountInfo,
                 MainContext,
             },
@@ -2728,14 +2824,10 @@ mod tests {
         use prost::Message as _;
 
         let text = std::str::from_utf8(raw).expect("FIRE output is UTF-8");
-        let line = text
-            .lines()
-            .find(|l| l.starts_with("FIRE BLOCK "))
-            .expect("a FIRE BLOCK line");
+        let line = text.lines().find(|l| l.starts_with("FIRE BLOCK ")).expect("a FIRE BLOCK line");
         let payload = line.split(' ').next_back().expect("payload token");
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(payload)
-            .expect("base64 payload");
+        let bytes =
+            base64::engine::general_purpose::STANDARD.decode(payload).expect("base64 payload");
         pb::sf::ethereum::r#type::v2::Block::decode(bytes.as_slice()).expect("protobuf Block")
     }
 }
