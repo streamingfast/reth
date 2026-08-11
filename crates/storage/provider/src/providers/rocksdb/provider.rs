@@ -28,7 +28,7 @@ use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, CompactionPri, DBCompressionType,
     DBRawIteratorWithThreadMode, IteratorMode, OptimisticTransactionDB,
     OptimisticTransactionOptions, Options, SnapshotWithThreadMode, Transaction,
-    WriteBatchWithTransaction, WriteBufferManager, WriteOptions, DB,
+    WriteBatchWithTransaction, WriteBufferManager, WriteOptions, DB, DEFAULT_COLUMN_FAMILY_NAME,
 };
 use std::{
     collections::BTreeMap,
@@ -345,7 +345,7 @@ impl RocksDBBuilder {
         let options =
             Self::default_options(self.log_level, &self.block_cache, self.enable_statistics);
 
-        let cf_descriptors: Vec<ColumnFamilyDescriptor> = self
+        let mut cf_descriptors: Vec<ColumnFamilyDescriptor> = self
             .column_families
             .iter()
             .map(|name| {
@@ -357,6 +357,36 @@ impl RocksDBBuilder {
                 ColumnFamilyDescriptor::new(name.clone(), cf_options)
             })
             .collect();
+
+        // RocksDB requires every existing column family to be opened. Preserve column families
+        // unknown to this configuration so databases remain openable after a downgrade.
+        if RocksDBProvider::exists(&self.path) {
+            let existing_column_families = DB::list_cf(&options, &self.path).map_err(|e| {
+                ProviderError::Database(DatabaseError::Open(DatabaseErrorInfo {
+                    message: e.to_string().into(),
+                    code: -1,
+                }))
+            })?;
+            let unknown_column_families: Vec<String> = existing_column_families
+                .into_iter()
+                .filter(|name| {
+                    name != DEFAULT_COLUMN_FAMILY_NAME && !self.column_families.contains(name)
+                })
+                .collect();
+            if !unknown_column_families.is_empty() {
+                tracing::debug!(
+                    target: "providers::rocksdb",
+                    column_families = ?unknown_column_families,
+                    "Preserving unknown column families"
+                );
+                cf_descriptors.extend(unknown_column_families.into_iter().map(|name| {
+                    ColumnFamilyDescriptor::new(
+                        name,
+                        Self::default_column_family_options(&self.block_cache),
+                    )
+                }));
+            }
+        }
 
         let metrics = self.enable_metrics.then(RocksDBMetrics::default);
 
@@ -2810,6 +2840,23 @@ mod tests {
         const DUPSORT: bool = false;
         type Key = u64;
         type Value = Vec<u8>;
+    }
+
+    #[test]
+    fn test_reopens_with_unknown_column_family() {
+        let temp_dir = TempDir::new().unwrap();
+        let value = b"test_value".to_vec();
+
+        let provider = RocksDBBuilder::new(temp_dir.path())
+            .with_default_tables()
+            .with_table::<TestTable>()
+            .build()
+            .unwrap();
+        provider.put::<TestTable>(42, &value).unwrap();
+        drop(provider);
+
+        let provider = RocksDBBuilder::new(temp_dir.path()).with_default_tables().build().unwrap();
+        assert_eq!(provider.get::<TestTable>(42).unwrap(), Some(value));
     }
 
     #[test]
