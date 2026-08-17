@@ -220,3 +220,8 @@ use aquamarine as _;
 use clap as _;
 use reth_cli_util as _;
 use tracing as _;
+
+// Firehose
+mod firehose;
+pub use firehose::FirehoseExecutorBuilder;
+use firehose_tracer as _;
