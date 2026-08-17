@@ -227,6 +227,48 @@ impl<Inner, Extras, Adjust> FirehoseWrappedExecutor<Inner, Extras, Adjust> {
     }
 }
 
+// GUARD (not enforceable by the compiler — `alloy_evm::block::BlockExecutor`'s defaulted methods
+// are backward-compatible by construction, so Rust cannot flag "a new default was silently
+// inherited" the way it flags a missing *required* method): whenever `alloy-evm` is bumped, diff
+// its `BlockExecutor` trait (`crates/evm/src/block/mod.rs`) against this list of the methods it
+// currently defines a default body for, as of alloy-evm 0.37.0 (streamingfast/evm.git tag
+// v0.37.0-sf):
+//   execute_transaction, execute_transaction_with_index,
+//   execute_transaction_with_index_and_result_closure, execute_transaction_with_result_closure,
+//   execute_transaction_with_commit_condition, apply_post_execution_changes, execute_block.
+// Of these, `execute_transaction_with_commit_condition` is the sole point chain integrators
+// (e.g. an OP Stack producer wrapped as `Inner`) hook to change per-tx commit/decline behavior,
+// and the rest of the defaulted family (`execute_transaction`,
+// `execute_transaction_with_index[_and_result_closure]`, `execute_transaction_with_result_closure`)
+// all bottom out in it via the trait's own default bodies.
+// `apply_post_execution_changes` and `execute_block` are deliberately NOT forwarded to
+// `self.inner` — their defaults route back through `Self::finish`/`Self::apply_pre_execution_changes`/
+// `Self::execute_transaction`, i.e. through *our* overrides; forwarding them to `self.inner`
+// instead would bypass this wrapper entirely.
+//
+// KNOWN GAP, deliberately not "fixed" by forwarding: below, `execute_transaction_with_commit_condition`
+// still manually composes `execute_transaction_without_commit` + `commit_transaction` rather than
+// calling `self.inner.execute_transaction_with_commit_condition` directly. A prior attempt at full
+// delegation was reverted because it is not achievable without breaking tracing correctness — see
+// the long comment inside the method body for why (it is a proven, not theoretical, regression:
+// caught by `crates/firehose-tests`' golden files, every `RewardTransactionFee.old_value` came out
+// wrong). Practical effect: if a wrapped `Inner` overrides `execute_transaction_with_commit_condition`
+// (e.g. OP Stack refund-policy snapshot/restore around a *declined* candidate — CommitChanges::No),
+// that override does not run through this wrapper. This does not affect canonical/traced block
+// execution, which always commits (`CommitChanges::Yes`) via the `execute_transaction`/`execute_block`
+// convenience path; it only matters for callers that invoke `execute_transaction_with_commit_condition`
+// directly with a real decline condition (e.g. speculative/candidate execution during block building).
+// Closing this gap properly requires changing alloy-evm's `execute_transaction_with_commit_condition`
+// closure signature (in the streamingfast/evm.git fork) to also hand the closure `&mut Self::Evm`,
+// so wrapper accounting can run from inside it without violating Rust's aliasing rules. That is a
+// public-trait change affecting every `BlockExecutor` implementor and is out of scope here — flag it
+// to whoever owns the OP Stack producer/candidate-execution path if the decline branch is reachable
+// with Firehose tracing enabled.
+//
+// If a future alloy-evm version adds a new defaulted method to `BlockExecutor`, or changes what an
+// existing default composes, re-run this triage: does the new/changed default matter for a wrapped
+// `Inner` that might override it, and if so, is it safely forwardable (does it need EVM/inspector
+// access from inside a closure `self.inner` already holds — if so, expect the same wall).
 impl<Inner, Extras, Adjust> BlockExecutor for FirehoseWrappedExecutor<Inner, Extras, Adjust>
 where
     Inner: BlockExecutor,
@@ -300,8 +342,29 @@ where
 
         self.inner.evm_mut().inspector_mut().tracer_mut().on_tx_start(tx_event, None);
 
-        // Split execute_transaction into without_commit + commit so post-tx balance accounting
-        // can run in between.
+        // NOTE on `execute_transaction_with_commit_condition`: alloy-evm's `BlockExecutor` gives
+        // it a default body composing `execute_transaction_without_commit` + `commit_transaction`,
+        // and chain integrators (e.g. an OP Stack producer) can override it — e.g. to snapshot and
+        // restore refund-policy state around a declined candidate. Delegating this whole method to
+        // `self.inner.execute_transaction_with_commit_condition` was tried here and reverted: the
+        // closure passed to it cannot re-borrow `self.inner` (already held by the outer call), so
+        // all EVM/inspector-dependent accounting below would have to move to *after* that call
+        // returns. `process_post_tx_balance_changes`'s `get_pre_tx_balance` fallback is the
+        // *primary* source of the coinbase `RewardTransactionFee` `old_value` (mainnet gas-refund
+        // and coinbase-tip crediting produce no `JournalEntry`), and it must read pre-commit DB
+        // state — reading it after `self.inner`'s delegated call returns means the DB already
+        // reflects this tx's own `commit_transaction`, which produced a demonstrably wrong
+        // `old_value` (verified against `crates/firehose-tests`' golden files: every
+        // `RewardTransactionFee` reported the post-reward balance as its own pre-reward baseline).
+        // `PostTxExtras::emit_post_tx_extras` (OP Stack fee-vault credits) has the identical
+        // requirement for chain-specific addresses this crate cannot enumerate, so pre-capturing a
+        // fixed address set does not generalize either. Splitting into
+        // `execute_transaction_without_commit` + `commit_transaction` remains the only safe option
+        // until alloy-evm's `execute_transaction_with_commit_condition` closure signature is
+        // changed (in the streamingfast/evm.git fork) to also hand the closure `&mut Self::Evm`.
+        // KNOWN GAP: because of this, an `Inner` override of `execute_transaction_with_commit_condition`
+        // does not run through this wrapper — see the GUARD comment above `impl BlockExecutor for
+        // FirehoseWrappedExecutor` for what that means in practice.
         let result = self.inner.execute_transaction_without_commit((tx_env, recovered))?;
 
         let gas_used = result.result().result.tx_gas_used();
