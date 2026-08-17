@@ -700,10 +700,8 @@ where
         // it may lag the block being validated by a few slots — that's the correct Firehose
         // semantics: each block carries the finalized head as of its execution.
         //
-        // Block 1 is the genesis marker: `start` emits `on_genesis_block` as a
-        // standalone event and does NOT leave the tracer in "block state", so wrapping the
-        // executor would panic in `on_system_call_start`. When the converted block is not yet
-        // available (get() not ready or error), fall through to the non-Firehose path.
+        // When the converted block is not yet available (get() not ready or error), fall through
+        // to the non-Firehose path.
         let mut fh_tracer: Option<reth_firehose::FirehoseBlockTracer> =
             if reth_firehose::is_tracer_initialized() {
                 // get() blocks until the background conversion/validation task completes and
@@ -713,9 +711,7 @@ where
                         let finalized = reth_firehose::mapper::finalized_ref_from_num_hash(
                             ctx.canonical_in_memory_state().get_finalized_num_hash(),
                         );
-                        let tracer =
-                            reth_firehose::FirehoseBlockTracer::start::<N>(sealed, finalized);
-                        (!tracer.is_genesis()).then_some(tracer)
+                        Some(reth_firehose::FirehoseBlockTracer::start::<N>(sealed, finalized))
                     }
                     Err(_) => None,
                 }

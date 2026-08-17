@@ -21,7 +21,7 @@ pub use executor::{
     FirehoseWrappedExecutor, NoChainHooks, NoPostTxExtras, NoPreTxAdjust, PostTxExtras,
     PreTxAdjust,
 };
-pub use runner::run_exex;
+pub use runner::{emit_genesis_block_if_empty, emit_genesis_block_on_empty_chain, run_exex};
 
 use std::{
     io::Write,
