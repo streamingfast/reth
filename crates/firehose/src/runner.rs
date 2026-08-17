@@ -7,7 +7,9 @@ use reth_chainspec::EthChainSpec;
 use reth_ethereum_forks::EthereumHardforks;
 use reth_evm::execute::BlockExecutor;
 use reth_exex::{ExExContext, ExExEvent};
-use reth_provider::{BlockIdReader, BlockReader, StateProviderBox, StateProviderFactory};
+use reth_provider::{
+    BlockIdReader, BlockNumReader, BlockReader, StateProviderBox, StateProviderFactory,
+};
 use reth_revm::{
     database::StateProviderDatabase,
     revm::{context::Block as _, Database as _},
@@ -33,18 +35,6 @@ where
     use alloy_consensus::TxReceipt;
 
     let tracer = &mut *crate::tracer();
-
-    if block.number() == 1 {
-        tracer.on_genesis_block(
-            firehose_tracer::types::BlockEvent {
-                block: mapper::to_block_data(block.sealed_block()),
-                finalized: None,
-                flash_block: None,
-            },
-            mapper::to_genesis_alloc(ctx.config.chain.genesis()),
-        );
-        return Ok(());
-    }
 
     tracer.on_block_start(firehose_tracer::types::BlockEvent {
         block: mapper::to_block_data(block.sealed_block()),
@@ -241,6 +231,8 @@ where
         firehose_tracer::config::ChainConfig::new(chain_id),
     );
 
+    emit_genesis_block_if_empty(&ctx)?;
+
     while let Some(notification) = ctx.notifications.next().await {
         let notification = notification?;
 
@@ -275,6 +267,66 @@ where
             }
         }
     }
+
+    Ok(())
+}
+
+/// Emits the genesis block (block 0) to the Firehose stream if the chain is empty (head still
+/// at genesis).
+///
+/// Reth never executes the genesis block — it is written straight to the database during init —
+/// so no execution hook ever fires for it. Without this, a Firehose stream started from scratch
+/// begins at block 1 and downstream consumers waiting for block 0 stall forever. Mirrors geth's
+/// `OnGenesisBlock` hook: emitted with the full genesis alloc, only when starting on an empty
+/// chain.
+pub fn emit_genesis_block_if_empty<Node>(ctx: &ExExContext<Node>) -> eyre::Result<()>
+where
+    Node: FullNodeComponents,
+    Node::Provider: BlockReader,
+    ChainSpec<Node>: EthereumHardforks + EthChainSpec,
+{
+    emit_genesis_block_on_empty_chain(ctx.provider(), ctx.config.chain.genesis())
+}
+
+/// Provider-based variant of [`emit_genesis_block_if_empty`] for embedders (op-reth, base) that
+/// wire Firehose through their own engine validator instead of this crate's ExEx. Call it once
+/// at node startup, after `on_blockchain_init` and before any block is traced.
+pub fn emit_genesis_block_on_empty_chain<P>(
+    provider: &P,
+    genesis: &alloy_genesis::Genesis,
+) -> eyre::Result<()>
+where
+    P: BlockReader,
+    <P::Block as reth_primitives_traits::Block>::Header: BlockHeader + alloy_primitives::Sealable,
+    <<P::Block as reth_primitives_traits::Block>::Body as reth_primitives_traits::BlockBody>::OmmerHeader:
+        BlockHeader + alloy_primitives::Sealable,
+{
+    use reth_primitives_traits::Block as _;
+
+    // OP-stack chains may place their genesis at a non-zero height (e.g. OP mainnet's
+    // post-bedrock genesis); `genesis.number` carries it, defaulting to 0.
+    let genesis_number = genesis.number.unwrap_or(0);
+    if provider.best_block_number()? != genesis_number {
+        return Ok(());
+    }
+
+    let genesis_block = provider
+        .block(genesis_number.into())?
+        .ok_or_else(|| eyre::eyre!("genesis block {genesis_number} not found in database"))?
+        .seal_slow();
+
+    crate::tracer().on_genesis_block(
+        firehose_tracer::types::BlockEvent {
+            block: mapper::to_block_data(&genesis_block),
+            // Genesis is finalized by definition.
+            finalized: Some(firehose_tracer::types::FinalizedBlockRef {
+                number: genesis_number,
+                hash: Some(genesis_block.hash()),
+            }),
+            flash_block: None,
+        },
+        mapper::to_genesis_alloc(genesis),
+    );
 
     Ok(())
 }

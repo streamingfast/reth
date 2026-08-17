@@ -587,11 +587,6 @@ where
         //
         // We resolve the block eagerly here and rebuild `input` as a `Block` variant so the later
         // `convert_to_block(input)?` site becomes a cheap unwrap of the already-sealed block.
-        //
-        // Block 1 is the genesis marker: `start` emits `on_genesis_block` as a standalone event and
-        // does NOT leave the tracer in "block state", so wrapping the executor would panic in
-        // `on_system_call_start`. Let the guard drop (a no-op for genesis) and fall through to the
-        // non-Firehose execution path.
         let (mut fh_tracer, input): (Option<reth_firehose::FirehoseBlockTracer>, _) =
             if reth_firehose::is_tracer_initialized() {
                 let sealed = convert_to_block(input)?;
@@ -599,8 +594,7 @@ where
                     ctx.canonical_in_memory_state().get_finalized_num_hash(),
                 );
                 let tracer = reth_firehose::FirehoseBlockTracer::start::<N>(&sealed, finalized);
-                let fh_tracer = (!tracer.is_genesis()).then_some(tracer);
-                (fh_tracer, BlockOrPayload::Block(sealed))
+                (Some(tracer), BlockOrPayload::Block(sealed))
             } else {
                 (None, input)
             };
