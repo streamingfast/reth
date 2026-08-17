@@ -242,28 +242,30 @@ impl<Inner, Extras, Adjust> FirehoseWrappedExecutor<Inner, Extras, Adjust> {
 // `execute_transaction_with_index[_and_result_closure]`, `execute_transaction_with_result_closure`)
 // all bottom out in it via the trait's own default bodies.
 // `apply_post_execution_changes` and `execute_block` are deliberately NOT forwarded to
-// `self.inner` — their defaults route back through `Self::finish`/`Self::apply_pre_execution_changes`/
-// `Self::execute_transaction`, i.e. through *our* overrides; forwarding them to `self.inner`
-// instead would bypass this wrapper entirely.
+// `self.inner` — their defaults route back through
+// `Self::finish`/`Self::apply_pre_execution_changes`/ `Self::execute_transaction`, i.e. through
+// *our* overrides; forwarding them to `self.inner` instead would bypass this wrapper entirely.
 //
-// KNOWN GAP, deliberately not "fixed" by forwarding: below, `execute_transaction_with_commit_condition`
-// still manually composes `execute_transaction_without_commit` + `commit_transaction` rather than
-// calling `self.inner.execute_transaction_with_commit_condition` directly. A prior attempt at full
-// delegation was reverted because it is not achievable without breaking tracing correctness — see
-// the long comment inside the method body for why (it is a proven, not theoretical, regression:
-// caught by `crates/firehose-tests`' golden files, every `RewardTransactionFee.old_value` came out
-// wrong). Practical effect: if a wrapped `Inner` overrides `execute_transaction_with_commit_condition`
-// (e.g. OP Stack refund-policy snapshot/restore around a *declined* candidate — CommitChanges::No),
-// that override does not run through this wrapper. This does not affect canonical/traced block
-// execution, which always commits (`CommitChanges::Yes`) via the `execute_transaction`/`execute_block`
-// convenience path; it only matters for callers that invoke `execute_transaction_with_commit_condition`
-// directly with a real decline condition (e.g. speculative/candidate execution during block building).
-// Closing this gap properly requires changing alloy-evm's `execute_transaction_with_commit_condition`
-// closure signature (in the streamingfast/evm.git fork) to also hand the closure `&mut Self::Evm`,
-// so wrapper accounting can run from inside it without violating Rust's aliasing rules. That is a
-// public-trait change affecting every `BlockExecutor` implementor and is out of scope here — flag it
-// to whoever owns the OP Stack producer/candidate-execution path if the decline branch is reachable
-// with Firehose tracing enabled.
+// KNOWN GAP, deliberately not "fixed" by forwarding: below,
+// `execute_transaction_with_commit_condition` still manually composes
+// `execute_transaction_without_commit` + `commit_transaction` rather than calling `self.inner.
+// execute_transaction_with_commit_condition` directly. A prior attempt at full delegation was
+// reverted because it is not achievable without breaking tracing correctness — see the long comment
+// inside the method body for why (it is a proven, not theoretical, regression: caught by `crates/
+// firehose-tests`' golden files, every `RewardTransactionFee.old_value` came out wrong). Practical
+// effect: if a wrapped `Inner` overrides `execute_transaction_with_commit_condition` (e.g. OP Stack
+// refund-policy snapshot/restore around a *declined* candidate — CommitChanges::No), that override
+// does not run through this wrapper. This does not affect canonical/traced block execution, which
+// always commits (`CommitChanges::Yes`) via the `execute_transaction`/`execute_block` convenience
+// path; it only matters for callers that invoke `execute_transaction_with_commit_condition`
+// directly with a real decline condition (e.g. speculative/candidate execution during block
+// building). Closing this gap properly requires changing alloy-evm's
+// `execute_transaction_with_commit_condition` closure signature (in the streamingfast/evm.git fork)
+// to also hand the closure `&mut Self::Evm`, so wrapper accounting can run from inside it without
+// violating Rust's aliasing rules. That is a public-trait change affecting every `BlockExecutor`
+// implementor and is out of scope here — flag it to whoever owns the OP Stack
+// producer/candidate-execution path if the decline branch is reachable with Firehose tracing
+// enabled.
 //
 // If a future alloy-evm version adds a new defaulted method to `BlockExecutor`, or changes what an
 // existing default composes, re-run this triage: does the new/changed default matter for a wrapped
@@ -362,9 +364,10 @@ where
         // `execute_transaction_without_commit` + `commit_transaction` remains the only safe option
         // until alloy-evm's `execute_transaction_with_commit_condition` closure signature is
         // changed (in the streamingfast/evm.git fork) to also hand the closure `&mut Self::Evm`.
-        // KNOWN GAP: because of this, an `Inner` override of `execute_transaction_with_commit_condition`
-        // does not run through this wrapper — see the GUARD comment above `impl BlockExecutor for
-        // FirehoseWrappedExecutor` for what that means in practice.
+        // KNOWN GAP: because of this, an `Inner` override of
+        // `execute_transaction_with_commit_condition` does not run through this wrapper —
+        // see the GUARD comment above `impl BlockExecutor for FirehoseWrappedExecutor` for
+        // what that means in practice.
         let result = self.inner.execute_transaction_without_commit((tx_env, recovered))?;
 
         let gas_used = result.result().result.tx_gas_used();
@@ -647,32 +650,6 @@ where
         let mut tracer =
             FirehoseBlockTracer::start::<F::Primitives>(block.sealed_block(), finalized);
 
-        // Genesis (block 1): on_genesis_block has already been flushed by start and
-        // there are no mid-block events to emit. Execute the block normally (for state mutations)
-        // without going through the wrapper; the tracer guard has `is_genesis() == true` and
-        // mark_verified is a no-op.
-        if tracer.is_genesis() {
-            let result = (|| -> Result<_, BlockExecutionError> {
-                let r = self
-                    .strategy_factory
-                    .executor_for_block(&mut self.db, block)
-                    .map_err(BlockExecutionError::other)?
-                    .execute_block(block.transactions_recovered())?;
-                self.db.merge_transitions(BundleRetention::Reverts);
-                Ok(r)
-            })();
-            return match result {
-                Ok(r) => {
-                    self.pending_tracer = Some(tracer);
-                    Ok(r)
-                }
-                Err(e) => {
-                    tracer.mark_failed(&e);
-                    Err(e)
-                }
-            };
-        }
-
         let block_result =
             self.hooks.execute_one_traced(&self.strategy_factory, &mut self.db, block, &mut tracer);
 
@@ -698,10 +675,8 @@ where
     fn execute(
         mut self,
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
-    ) -> Result<
-        BlockExecutionOutput<<Self::Primitives as NodePrimitives>::Receipt>,
-        Self::Error,
-    > {
+    ) -> Result<BlockExecutionOutput<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
+    {
         let result = if crate::is_tracer_initialized() {
             self.execute_and_trace_one(block)?
         } else {
