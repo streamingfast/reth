@@ -737,7 +737,14 @@ where
             // path never produces a BlockAccessList.
             match make_state_provider(false) {
                 Ok(state_provider) => self
-                    .execute_and_trace_block(state_provider, env, &input, &mut handle, tracer)
+                    .execute_and_trace_block(
+                        state_provider,
+                        env,
+                        &input,
+                        &mut handle,
+                        execution_state_hook,
+                        tracer,
+                    )
                     .map(|(output, senders, receipt_root_rx)| {
                         (output, senders, receipt_root_rx, None)
                     }),
@@ -1144,12 +1151,19 @@ where
     /// be mirrored here. The intent of duplicating rather than branching is to keep the diff
     /// against upstream minimal and localized: upstream's `execute_block` stays pristine, and the
     /// Firehose-specific wiring lives here.
+    ///
+    /// Deliberate divergence: unlike `execute_block`, this function does NOT call
+    /// `self.evm_config.clone().with_jit_support()` before building the EVM. JIT-compiled
+    /// (revmc) execution paths are not guaranteed to preserve fine-grained Inspector callbacks
+    /// (`step`, `log`, `selfdestruct`, etc.), so the Firehose tracing path always runs the plain
+    /// interpreter via `evm_with_env_and_inspector` to guarantee full tracing fidelity.
     fn execute_and_trace_block<S, Err, T>(
         &mut self,
         state_provider: S,
         env: ExecutionEnv<Evm>,
         input: &BlockOrPayload<T>,
         handle: &mut PayloadHandle<impl ExecutableTxFor<Evm>, Err, N::Receipt>,
+        state_hook: Option<Box<dyn OnStateHook + 'static>>,
         tracer: &mut reth_firehose::FirehoseBlockTracer,
     ) -> Result<
         (BlockExecutionOutput<N::Receipt>, Vec<Address>, ReceiptRootReceiver),
@@ -1218,9 +1232,7 @@ where
         let transaction_count = input.transaction_count();
         let (receipt_tx, result_rx) = self.spawn_receipt_root_task(transaction_count);
         let executed_tx_index = Arc::clone(handle.executed_tx_index());
-        executor.evm_mut().db_mut().set_state_hook(
-            handle.state_hook().map(|hook| Box::new(hook) as Box<dyn OnStateHook + 'static>),
-        );
+        executor.evm_mut().db_mut().set_state_hook(state_hook);
 
         let execution_start = Instant::now();
 
