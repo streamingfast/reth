@@ -584,32 +584,6 @@ where
         let mut tracer =
             FirehoseBlockTracer::start::<F::Primitives>(block.sealed_block(), finalized);
 
-        // Genesis (block 1): on_genesis_block has already been flushed by start and
-        // there are no mid-block events to emit. Execute the block normally (for state mutations)
-        // without going through the wrapper; the tracer guard has `is_genesis() == true` and
-        // mark_verified is a no-op.
-        if tracer.is_genesis() {
-            let result = (|| -> Result<_, BlockExecutionError> {
-                let r = self
-                    .strategy_factory
-                    .executor_for_block(&mut self.db, block)
-                    .map_err(BlockExecutionError::other)?
-                    .execute_block(block.transactions_recovered())?;
-                self.db.merge_transitions(BundleRetention::Reverts);
-                Ok(r)
-            })();
-            return match result {
-                Ok(r) => {
-                    self.pending_tracer = Some(tracer);
-                    Ok(r)
-                }
-                Err(e) => {
-                    tracer.mark_failed(&e);
-                    Err(e)
-                }
-            };
-        }
-
         let block_result =
             self.hooks.execute_one_traced(&self.strategy_factory, &mut self.db, block, &mut tracer);
 
@@ -635,10 +609,8 @@ where
     fn execute(
         mut self,
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
-    ) -> Result<
-        BlockExecutionOutput<<Self::Primitives as NodePrimitives>::Receipt>,
-        Self::Error,
-    > {
+    ) -> Result<BlockExecutionOutput<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
+    {
         let result = if crate::is_tracer_initialized() {
             self.execute_and_trace_one(block)?
         } else {
