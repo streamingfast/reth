@@ -226,6 +226,23 @@ where
 
     /// Handler for `reth_jit`
     async fn reth_jit(&self, action: RethJitAction) -> RpcResult<()> {
+        // Firehose addition: a JIT-compiled frame only calls `log`/`selfdestruct`/`frame_end` on
+        // the Inspector — `step`/`step_end` never fire, so per-opcode storage writes and gas-reason
+        // data silently vanish from Firehose output while producing no error. `--jit`/build-time
+        // wiring already keeps JIT off when the Firehose tracer is active, but this RPC method is
+        // a second, independent way to flip it on at runtime — reject any action that would leave
+        // JIT enabled (or resumed) while Firehose is tracing, rather than silently degrading.
+        if reth_firehose::is_tracer_initialized()
+            && matches!(action, RethJitAction::Enable | RethJitAction::Unpause)
+        {
+            return Err(EthApiError::Internal(RethError::msg(
+                "reth_jit: refusing to enable/unpause JIT while the Firehose tracer is active — \
+                 JIT-compiled execution does not fire the Inspector step/step_end hooks Firehose \
+                 relies on for per-opcode tracing",
+            ))
+            .into());
+        }
+
         let Some(jit_backend) = self.evm_config().jit_backend() else {
             return Ok(());
         };

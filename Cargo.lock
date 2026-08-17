@@ -9905,6 +9905,7 @@ dependencies = [
  "reth-evm",
  "reth-evm-ethereum",
  "reth-execution-types",
+ "reth-firehose",
  "reth-metrics",
  "reth-network-api",
  "reth-network-peers",
