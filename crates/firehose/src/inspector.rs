@@ -331,7 +331,7 @@ impl<'a> FirehoseInspector<'a> {
                     let old_nonce = new_nonce.saturating_sub(1);
                     self.tracer.on_nonce_change(address, old_nonce, new_nonce);
                 }
-                JournalEntry::CodeChange { address } => {
+                JournalEntry::CodeChange { address, had_code_hash, had_code } => {
                     let account = context.journal().evm_state().get(&address);
                     if let Some(account) = account {
                         let new_hash = account.info.code_hash;
@@ -341,13 +341,13 @@ impl<'a> FirehoseInspector<'a> {
                             .as_ref()
                             .map(|b| b.original_bytes())
                             .unwrap_or_default();
-                        // CodeChange is always from empty code to new code (revert restores to
-                        // KECCAK_EMPTY)
+                        let old_code =
+                            had_code.as_ref().map(|b| b.original_bytes()).unwrap_or_default();
                         self.tracer.on_code_change(
                             address,
-                            KECCAK_EMPTY,
+                            had_code_hash,
                             new_hash,
-                            &[],
+                            old_code.as_ref(),
                             new_code.as_ref(),
                         );
                     }
@@ -1803,7 +1803,7 @@ where
                     "  [{i}] StorageChanged addr={address} key={key} had={had_value}"
                 );
             }
-            JournalEntry::CodeChange { address } => {
+            JournalEntry::CodeChange { address, .. } => {
                 firehose_tracer::firehose_debug!("  [{i}] CodeChange addr={address}");
             }
             // Skip warm/cold tracking and transient storage — not relevant for Firehose
