@@ -3,25 +3,20 @@
 # Maintained by StreamingFast and intentionally kept separate from upstream CI
 # so that upstream merges stay clean.
 #
-# Triggers: `firehose/*` branch pushes, `*-fh*` tags, pull requests and manual
-# dispatch. Pull requests opened from a fork get a read-only GITHUB_TOKEN, so the
-# login/push steps are skipped for them (the image still builds, to validate the
-# Dockerfile); same-repo ("inner") PRs, branch pushes and tag pushes authenticate
-# and push normally. Only tag builds use the full-LTO `maxperf` profile.
+# Triggers: manual dispatch only. The `release/optimism-2.x` branch exists so downstream
+# projects can pin a git ref; it must never publish a Docker image or a GitHub
+# release on its own. Only `release/reth-2.x` ships artifacts. GitHub Actions
+# requires at least one event, so `workflow_dispatch` is the closest thing to
+# "never"; the file is kept rather than deleted so upstream merges stay
+# conflict-free.
 #
 # Single architecture (linux/amd64): the `reth` `maxperf` full-node build is too
 # heavy to reliably build on GitHub-hosted arm64 runners, so we do not produce a
 # multi-arch manifest. Re-introduce a matrix + manifest-merge job here if arm64
 # becomes worthwhile.
-name: Build, push and release (if tag)
+name: Build image (manual only)
 
 on:
-  push:
-    branches:
-      - "firehose/*"
-    tags:
-      - "*-fh*"
-  pull_request:
   workflow_dispatch:
     inputs:
       firehose_ethereum:
@@ -124,7 +119,10 @@ jobs:
             BUILD_PROFILE=${{ startsWith(github.ref, 'refs/tags/') && 'maxperf' || 'release' }}
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
+    # Disabled on this branch: tags here are reference points for downstream
+    # projects, not shippable artifacts. Releases are cut from
+    # `release/reth-2.x` only.
+    if: false
     needs: build
     runs-on: ubuntu-24.04
 
