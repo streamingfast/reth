@@ -7,6 +7,50 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## reth-v2.5.0-fh3.1
+
+Rebase of the Firehose fork onto upstream reth v2.5.0. Covers everything since
+`v2.3.0-fh-7`, including the untagged `v2.4.1-fh`, `v2.4.1-fh-1` and
+`reth-v2.5.0-fh3.0` builds.
+
+### Added
+
+- Emit the genesis block (block 0) at ExEx startup when the head is still at
+  genesis. Genesis is written to the DB without execution, so no tracing hook
+  ever fired for it and streams began at block 1. The old block-1 "genesis
+  marker" hack is gone: it emitted block 1 through `on_genesis_block` with an
+  empty alloc and never traced its transactions. Block 1 now takes the normal
+  tracing path.
+
+### Changed
+
+- Rebase onto upstream reth v2.5.0 (from v2.3.0, via v2.4.1).
+- Reject `reth_jit` `Enable`/`Unpause` over RPC while the Firehose tracer is
+  active, and refuse to start `FirehoseExecutorBuilder::build_evm` when `--jit`
+  was passed. JIT-compiled frames only call `log`/`selfdestruct`/`frame_end` on
+  the Inspector — `step`/`step_end` never fire — so per-opcode storage and
+  gas-reason data silently vanishes under JIT. `--jit` at startup was already
+  inert for the Firehose executor builder, but the RPC method is a second,
+  independent way to flip JIT on at runtime.
+
+### Fixed
+
+- Collapse the duplicate `alloy-evm` entry left in `Cargo.lock` by the v2.4.1
+  merge. With both the unpatched 0.37.1 crate and our `streamingfast/evm` patch
+  in the graph, most of the executor pipeline linked against the unpatched copy,
+  which does not route system calls through the Inspector — silently dropping
+  the block's EIP-4788/EIP-2935 `system_calls` from Firehose output.
+
+### Build
+
+- `Dockerfile.sf`: bump the cargo-chef base image to Rust 1.95 and install LLVM
+  in the build stage.
+- `sf-release.yml` now builds on `release/*` branch pushes (the fork's branches
+  were renamed from `firehose/*`). The sibling release branches
+  (`release/optimism-2.x`, `release/base-2.x`, `release/bnb-0.x`) no longer
+  publish images or releases — their tags exist only as refs for downstream
+  projects to pin.
+
 ## v2.3.0-fh-7
 
 ### Fixed

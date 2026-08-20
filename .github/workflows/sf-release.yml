@@ -3,7 +3,7 @@
 # Maintained by StreamingFast and intentionally kept separate from upstream CI
 # so that upstream merges stay clean.
 #
-# Triggers: `firehose/*` branch pushes, `*-fh*` tags, pull requests and manual
+# Triggers: `release/*` branch pushes, `*-fh*` tags, pull requests and manual
 # dispatch. Pull requests opened from a fork get a read-only GITHUB_TOKEN, so the
 # login/push steps are skipped for them (the image still builds, to validate the
 # Dockerfile); same-repo ("inner") PRs, branch pushes and tag pushes authenticate
@@ -18,7 +18,7 @@ name: Build, push and release (if tag)
 on:
   push:
     branches:
-      - "firehose/*"
+      - "release/*"
     tags:
       - "*-fh*"
   pull_request:
