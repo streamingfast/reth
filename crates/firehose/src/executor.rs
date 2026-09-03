@@ -287,6 +287,10 @@ where
         };
 
         let base_fee = self.inner.evm().block().basefee();
+        // What the beneficiary does *not* receive per unit of gas. Mainnet burns the base fee;
+        // chains that credit it to the beneficiary report `base_fee_burned: false` via
+        // `ChainSemantics`, in which case the whole effective gas price counts as reward.
+        let burned_base_fee = crate::burned_base_fee(base_fee, crate::chain_semantics());
         let coinbase = self.inner.evm().block().beneficiary();
         // EIP-4844 blob gas price is a block-level property (derived from `excess_blob_gas`).
         // `blob_gasprice()` returns `None` for pre-Cancun blocks, matching Geth's omission of
@@ -329,7 +333,7 @@ where
                 gas_limit,
                 gas_used,
                 effective_gas_price,
-                base_fee,
+                burned_base_fee,
                 committed_log_count,
                 &mut get_pre,
             );

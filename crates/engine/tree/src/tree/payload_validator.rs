@@ -605,8 +605,8 @@ where
         //
         // Two entry points exist for the same work: `execute_block` is the upstream-pristine path
         // and `execute_and_trace_block` is its Firehose-enabled twin. We pick based on whether a
-        // live tracer guard is available for this block (see the Firehose preamble above for when
-        // the guard is `None` — notably the block-1 genesis marker).
+        // live tracer guard is available for this block (see the Firehose preamble above: the guard
+        // is `None` whenever the tracer is not initialized).
         let execute_block_start = Instant::now();
         let (output, senders, receipt_root_rx) = match fh_tracer.as_mut() {
             Some(tracer) => {

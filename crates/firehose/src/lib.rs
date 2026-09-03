@@ -30,6 +30,65 @@ use std::{
 
 static GLOBAL_TRACER: OnceLock<Arc<Mutex<firehose_tracer::Tracer>>> = OnceLock::new();
 
+/// Chain-level fee semantics that the generic Firehose accounting cannot infer from the EVM.
+///
+/// The `FirehoseWrappedExecutor` derives the post-transaction `RewardTransactionFee` balance
+/// change for the block beneficiary from `gas_used × (effective_gas_price − burned_base_fee)`.
+/// On Ethereum mainnet the EIP-1559 base fee is burned, so the beneficiary only receives the
+/// priority fee. Chains whose handler credits the *whole* effective gas price to the beneficiary
+/// (no burn — e.g. Arc's `reward_beneficiary`) must report `base_fee_burned: false`, otherwise
+/// every coinbase reward is under-reported by `gas_used × base_fee` and the emitted
+/// `new_value` disagrees with the account's on-chain balance.
+///
+/// Set once per process through [`init_tracer_with_semantics`] (or the buffer-backed variant);
+/// [`init_tracer`] keeps the mainnet default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainSemantics {
+    /// Whether the EIP-1559 base fee is burned (`true`, Ethereum mainnet) or credited to the
+    /// block beneficiary together with the priority fee (`false`).
+    pub base_fee_burned: bool,
+}
+
+impl ChainSemantics {
+    /// Ethereum mainnet semantics: the base fee is burned.
+    pub const MAINNET: Self = Self { base_fee_burned: true };
+    /// Chains that credit the full effective gas price (base + priority fee) to the beneficiary.
+    pub const BASE_FEE_TO_BENEFICIARY: Self = Self { base_fee_burned: false };
+}
+
+impl Default for ChainSemantics {
+    fn default() -> Self {
+        Self::MAINNET
+    }
+}
+
+static CHAIN_SEMANTICS: OnceLock<ChainSemantics> = OnceLock::new();
+
+/// Returns the process-wide [`ChainSemantics`], falling back to [`ChainSemantics::MAINNET`]
+/// when the tracer was initialized without an explicit value (or not at all).
+pub fn chain_semantics() -> ChainSemantics {
+    CHAIN_SEMANTICS.get().copied().unwrap_or_default()
+}
+
+/// Records the process-wide [`ChainSemantics`]. Called by the `init_tracer*` functions; must
+/// run at most once per process.
+fn set_chain_semantics(semantics: ChainSemantics) {
+    CHAIN_SEMANTICS
+        .set(semantics)
+        .ok()
+        .expect("chain semantics already initialized (init_tracer called more than once)");
+}
+
+/// The portion of `base_fee` that leaves circulation on this chain, i.e. what the beneficiary
+/// does **not** receive. This is the `base_fee` argument the post-tx balance accounting expects.
+pub(crate) const fn burned_base_fee(base_fee: u64, semantics: ChainSemantics) -> u64 {
+    if semantics.base_fee_burned {
+        base_fee
+    } else {
+        0
+    }
+}
+
 /// Process-wide stdout write lock.
 ///
 /// When two [`firehose_tracer::Tracer`] instances exist simultaneously (e.g. the global
@@ -107,6 +166,18 @@ pub fn is_tracer_initialized() -> bool {
 ///
 /// Must be called exactly once before any call to [`tracer`]. Panics if called more than once.
 pub fn init_tracer(config: firehose_tracer::config::Config) {
+    init_tracer_with_semantics(config, ChainSemantics::default())
+}
+
+/// [`init_tracer`] with explicit [`ChainSemantics`] for chains whose fee distribution differs
+/// from Ethereum mainnet (see [`ChainSemantics`]).
+///
+/// Must be called exactly once before any call to [`tracer`]. Panics if called more than once.
+pub fn init_tracer_with_semantics(
+    config: firehose_tracer::config::Config,
+    semantics: ChainSemantics,
+) {
+    set_chain_semantics(semantics);
     let lock = init_stdout_lock();
     let writer = SynchronizedStdout::new(lock);
     let tracer = firehose_tracer::Tracer::new_with_writer(config, Box::new(writer));
@@ -137,6 +208,25 @@ pub fn init_tracer_with_buffer(
     cancun_time: Option<u64>,
     prague_time: Option<u64>,
 ) -> firehose_tracer::InMemoryBuffer {
+    init_tracer_with_buffer_and_semantics(
+        chain_id,
+        shanghai_time,
+        cancun_time,
+        prague_time,
+        ChainSemantics::default(),
+    )
+}
+
+/// [`init_tracer_with_buffer`] with explicit [`ChainSemantics`], for integration tests of chains
+/// whose fee distribution differs from Ethereum mainnet.
+pub fn init_tracer_with_buffer_and_semantics(
+    chain_id: u64,
+    shanghai_time: Option<u64>,
+    cancun_time: Option<u64>,
+    prague_time: Option<u64>,
+    semantics: ChainSemantics,
+) -> firehose_tracer::InMemoryBuffer {
+    set_chain_semantics(semantics);
     // Mirror `init_tracer`: ensure the shared stdout lock exists so any code path that later
     // reaches for it (e.g. an additional flashblock tracer) does not panic.
     let _ = init_stdout_lock();
@@ -168,4 +258,22 @@ pub fn tracer() -> MutexGuard<'static, firehose_tracer::Tracer> {
         .expect("firehose tracer not initialized — call init_tracer first")
         .lock()
         .expect("firehose tracer mutex poisoned")
+}
+
+#[cfg(test)]
+mod chain_semantics_tests {
+    use super::{burned_base_fee, ChainSemantics};
+
+    #[test]
+    fn default_is_mainnet_burn() {
+        assert_eq!(ChainSemantics::default(), ChainSemantics::MAINNET);
+        assert!(ChainSemantics::default().base_fee_burned);
+    }
+
+    #[test]
+    fn burned_base_fee_follows_semantics() {
+        assert_eq!(burned_base_fee(7, ChainSemantics::MAINNET), 7);
+        assert_eq!(burned_base_fee(7, ChainSemantics::BASE_FEE_TO_BENEFICIARY), 0);
+        assert_eq!(burned_base_fee(0, ChainSemantics::MAINNET), 0);
+    }
 }

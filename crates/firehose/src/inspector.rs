@@ -1609,6 +1609,19 @@ where
         );
     }
 
+    /// A log was appended to the journal outside of a LOG opcode.
+    ///
+    /// Hosts whose EVM journals logs directly (e.g. Arc's synthetic EIP-7708 `Transfer` logs
+    /// emitted around value-carrying frames, or precompile log replays) notify the inspector
+    /// through `Inspector::log`. Those logs never pass through [`Self::log_full`], and a later
+    /// opcode `LOG` in the same call would advance `trx_logs_count` past them, so they must be
+    /// emitted now. `gather_precompile_logs` emits every journaled log above the watermark and is
+    /// a no-op when the host notifies before the log reaches the journal (the log is then picked
+    /// up at `call_end`).
+    fn log(&mut self, context: &mut CTX, _log: AlloyLog) {
+        self.gather_precompile_logs(context);
+    }
+
     /// LOG operation is executed
     fn log_full(
         &mut self,
@@ -2490,7 +2503,6 @@ mod tests {
                 value: CallValue::Transfer(U256::ZERO),
                 scheme: CallScheme::Call,
                 is_static: false,
-                charged_new_account_state_gas: false,
             };
 
             // Enter the precompile frame through the production hook.
@@ -2517,7 +2529,6 @@ mod tests {
                 memory_offset: 0..0,
                 was_precompile_called: true,
                 precompile_call_logs: Vec::new(),
-                charged_new_account_state_gas: false,
             };
             insp.call_end(&mut ctx, &inputs, &mut outcome);
 
@@ -2606,7 +2617,6 @@ mod tests {
                 value: CallValue::Transfer(value),
                 scheme: CallScheme::Call,
                 is_static: false,
-                charged_new_account_state_gas: false,
             };
 
             // Enter the precompile frame through the production hook (records the pending
@@ -2629,7 +2639,6 @@ mod tests {
                 memory_offset: 0..0,
                 was_precompile_called: true,
                 precompile_call_logs: Vec::new(),
-                charged_new_account_state_gas: false,
             };
             insp.call_end(&mut ctx, &inputs, &mut outcome);
 
@@ -2728,7 +2737,6 @@ mod tests {
                 value: CallValue::Transfer(U256::ZERO),
                 scheme: CallScheme::Call,
                 is_static: false,
-                charged_new_account_state_gas: false,
             };
 
             // Enter the precompile frame through the production hook.
@@ -2769,7 +2777,6 @@ mod tests {
                 memory_offset: 0..0,
                 was_precompile_called: true,
                 precompile_call_logs: Vec::new(),
-                charged_new_account_state_gas: false,
             };
             insp.call_end(&mut ctx, &inputs, &mut outcome);
 
