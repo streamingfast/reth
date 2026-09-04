@@ -7,6 +7,16 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## arc-v2.2.0-fh3.1-1
+
+### Fixed
+
+- Sweep the journal for logs and storage changes at `create_end`, as `call_end` already does.
+  Init code cannot emit logs without a `LOG` opcode on Ethereum, but Arc's SELFDESTRUCT journals
+  an EIP-7708 `Transfer` log directly, so a contract whose init code self-destructs (Arc mainnet
+  block 2,426,896) produced a receipt with one more log than the call trace and the tracer aborted
+  with "mismatch between call logs and receipt logs".
+
 ## arc-v2.2.0-fh3.1
 
 Arc-specific release line (`release/arc-2.x`) for [arc-node](https://github.com/circlefin/arc-node),

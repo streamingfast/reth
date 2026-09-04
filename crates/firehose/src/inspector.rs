@@ -1572,6 +1572,14 @@ where
         // to the CREATE call.
         self.process_journal_changes(context);
 
+        // Same sweep as `call_end`: init code can journal state changes and logs without an
+        // opcode firing (`step_end` / `log_full` never ran for them). On Ethereum that only
+        // happens for precompile calls, which have their own frame, but Arc's SELFDESTRUCT
+        // journals an EIP-7708 Transfer log directly — an init frame that self-destructs would
+        // otherwise leave the receipt with one more log than the call trace.
+        self.gather_precompile_storage_changes(context);
+        self.gather_precompile_logs(context);
+
         // Clear pending flag: if the CREATE failed before executing any opcode (e.g.
         // OutOfFunds, CallTooDeep, CreateCollision), step never ran to clear it.
         self.pending_value_transfer_check = false;
@@ -2380,6 +2388,111 @@ mod tests {
     /// those writes must attach both to the precompile's call frame: the log so the call-log
     /// count matches the receipt (otherwise the tracer panics), and the storage change so it
     /// is not silently dropped.
+    /// A log journaled directly inside an init frame (Arc's SELFDESTRUCT emits an EIP-7708
+    /// Transfer log with no LOG opcode) must be attached to the CREATE call at `create_end`,
+    /// exactly like `call_end` does for precompile logs. Regression for Arc mainnet block
+    /// 2,426,896: a contract whose init code self-destructs produced a receipt with one more
+    /// log than the trace ("3 call logs but 4 receipt logs").
+    #[test]
+    fn journal_log_inside_create_frame_is_captured_at_create_end() {
+        let block = decode_fire_block(&drive_create_with_journal_log());
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        let call = trx.calls.first().expect("one call");
+        assert_eq!(call.call_type, pb::sf::ethereum::r#type::v2::CallType::Create as i32);
+        assert_eq!(call.logs.len(), 1, "journal-only log must be attached to the CREATE call");
+        assert_eq!(call.logs[0].address, SYSTEM_ADDRESS.to_vec());
+        assert_eq!(call.logs[0].block_index, 0);
+    }
+
+    /// Drives one CREATE through the production `create` / `create_end` hooks while the init
+    /// code journals a log without any opcode.
+    fn drive_create_with_journal_log() -> Vec<u8> {
+        use reth_revm::revm::{
+            context::Context,
+            context_interface::CreateScheme,
+            database::{CacheDB, EmptyDB},
+            interpreter::{CreateInputs, CreateOutcome, Gas, InstructionResult, InterpreterResult},
+            state::AccountInfo,
+            MainContext,
+        };
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            SENDER,
+            AccountInfo { balance: U256::from(1_000_000u64), ..Default::default() },
+        );
+        let mut ctx = Context::mainnet().with_db(db);
+
+        let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+            firehose_tracer::config::Config::default(),
+            firehose_tracer::config::ChainConfig {
+                chain_id: 5042,
+                shanghai_time: Some(0),
+                cancun_time: Some(0),
+                prague_time: Some(0),
+                verkle_time: None,
+            },
+            "reth-firehose-test",
+            "0",
+        );
+
+        {
+            let mut insp = FirehoseInspector::new(&mut tracer);
+            insp.tracer_mut().on_block_start(firehose_tracer::types::BlockEvent {
+                block: firehose_tracer::types::BlockData { number: 2, ..Default::default() },
+                finalized: None,
+                flash_block: None,
+            });
+            insp.tracer_mut().on_tx_start(legacy_tx_event(), None);
+
+            let mut inputs = CreateInputs::new(
+                SENDER,
+                CreateScheme::Create,
+                U256::ZERO,
+                Bytes::from_static(&[0x00]),
+                100_000,
+                0,
+            );
+            ctx.journal_mut().load_account(SENDER).expect("load sender");
+            let _ = insp.create(&mut ctx, &mut inputs);
+
+            // Init code runs Arc's SELFDESTRUCT: the transfer log lands on the journal directly.
+            ctx.journal_mut().log(AlloyLog {
+                address: SYSTEM_ADDRESS,
+                data: alloy_primitives::LogData::new_unchecked(
+                    vec![B256::repeat_byte(0xdd)],
+                    Bytes::from_static(&[0x01]),
+                ),
+            });
+
+            let mut outcome = CreateOutcome::new(
+                InterpreterResult {
+                    result: InstructionResult::Return,
+                    output: Bytes::new(),
+                    gas: Gas::new(100_000),
+                },
+                Some(CREATED),
+            );
+            insp.create_end(&mut ctx, &inputs, &mut outcome);
+
+            let mut receipt = firehose_tracer::types::ReceiptData::new(0, 21_000, 1, 21_000);
+            receipt.add_log(firehose_tracer::types::LogData::new(
+                SYSTEM_ADDRESS,
+                vec![B256::repeat_byte(0xdd)],
+                Bytes::from_static(&[0x01]),
+                0,
+            ));
+            // Panics ("mismatch between call logs and receipt logs") if the log was not gathered.
+            insp.tracer_mut().on_tx_end(Some(&receipt), None);
+        }
+
+        tracer.on_block_end(None);
+        drop(tracer);
+
+        buffer.get_bytes()
+    }
+
     #[test]
     fn precompile_journal_storage_and_logs_are_captured() {
         let block = decode_fire_block(&drive_precompile_call());
@@ -2437,6 +2550,10 @@ mod tests {
     const PRECOMPILE: Address =
         Address::new([0x84, 0x53, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
     const SENDER: Address = Address::repeat_byte(0xaa);
+    /// Address assigned to the contract created in `drive_create_with_journal_log`.
+    const CREATED: Address = Address::repeat_byte(0xc1);
+    /// Arc's emitter of synthetic EIP-7708 Transfer logs.
+    const SYSTEM_ADDRESS: Address = Address::repeat_byte(0xff);
 
     /// Drives one transaction whose only call targets a native precompile, going through the
     /// inspector's real `call` / `call_end` hooks (which run the precompile gathers). The
