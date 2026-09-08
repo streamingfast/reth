@@ -8891,6 +8891,7 @@ dependencies = [
  "reth-ethereum-forks",
  "reth-ethereum-primitives",
  "reth-evm",
+ "reth-evm-ethereum",
  "reth-execution-types",
  "reth-exex",
  "reth-node-api",

@@ -907,9 +907,10 @@ mod tests {
 /// A thin wrapper around any [`ConfigureEvm`] that overrides [`ConfigureEvm::batch_executor`]
 /// to return a [`FirehoseBlockExecutor`] instead of the default `BasicBlockExecutor`.
 ///
-/// All other methods delegate directly to the inner config. The live engine path (payload
-/// validator) constructs its wrapped executor explicitly, since `create_executor` cannot tighten
-/// its inspector bound via a trait override.
+/// All other methods delegate directly to the inner config, including the provided
+/// `builder_for_next_block`, so chain-specific overrides on the inner config survive the wrapper.
+/// The live engine path (payload validator) constructs its wrapped executor explicitly, since
+/// `create_executor` cannot tighten its inspector bound via a trait override.
 ///
 /// This wrapper always installs [`NoPostTxExtras`] / [`NoPreTxAdjust`] — suitable for mainnet
 /// Ethereum out of the box. Chains that need chain-specific tracer hooks (OP Stack fee vaults,
@@ -989,6 +990,27 @@ where
         self.inner.context_for_next_block(parent, attributes)
     }
 
+    /// Delegates instead of taking the trait default so that an inner config which overrides this
+    /// method keeps its behaviour behind the wrapper. Arc derives the block gas limit from its
+    /// on-chain `ProtocolConfig` here; with the default, the payload builder used reth's generic
+    /// gas-limit target and then rejected its own block during pre-execution validation.
+    fn builder_for_next_block<'a, DB: reth_evm::Database + 'a>(
+        &'a self,
+        db: &'a mut State<DB>,
+        parent: &'a reth_primitives_traits::SealedHeader<
+            reth_primitives_traits::HeaderTy<Self::Primitives>,
+        >,
+        attributes: Self::NextBlockEnvCtx,
+    ) -> Result<
+        impl reth_evm::execute::BlockBuilder<
+            Primitives = Self::Primitives,
+            Executor = reth_evm::BlockExecutorForEvm<'a, Self, DB>,
+        >,
+        Self::Error,
+    > {
+        self.inner.builder_for_next_block(db, parent, attributes)
+    }
+
     fn batch_executor<DB: reth_evm::Database>(
         &self,
         db: DB,
@@ -1026,5 +1048,117 @@ where
         payload: &ExecutionData,
     ) -> Result<impl reth_evm::ExecutableTxIterator<Self>, Self::Error> {
         self.inner.tx_iterator_for_payload(payload)
+    }
+}
+
+#[cfg(test)]
+mod evm_config_tests {
+    use super::*;
+    use alloy_consensus::Header;
+    use alloy_primitives::B256;
+    use reth_chainspec::{EthChainSpec, MAINNET};
+    use reth_ethereum_primitives::Block;
+    use reth_evm::{
+        execute::BlockBuilder, BlockExecutorForEvm, EvmEnvFor, ExecutionCtxFor,
+        NextBlockEnvAttributes,
+    };
+    use reth_evm_ethereum::EthEvmConfig;
+    use reth_primitives_traits::{SealedBlock, SealedHeader};
+    use revm::database::{CacheDB, EmptyDB};
+
+    const PINNED_GAS_LIMIT: u64 = 12_345_678;
+
+    /// A config that overrides the provided `builder_for_next_block`, as Arc does to derive the
+    /// block gas limit from on-chain state instead of the payload attributes.
+    #[derive(Clone, Debug)]
+    struct PinnedGasLimit(EthEvmConfig);
+
+    impl ConfigureEvm for PinnedGasLimit {
+        type Primitives = <EthEvmConfig as ConfigureEvm>::Primitives;
+        type Error = <EthEvmConfig as ConfigureEvm>::Error;
+        type NextBlockEnvCtx = <EthEvmConfig as ConfigureEvm>::NextBlockEnvCtx;
+        type BlockExecutorFactory = <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory;
+        type BlockAssembler = <EthEvmConfig as ConfigureEvm>::BlockAssembler;
+
+        fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
+            self.0.block_executor_factory()
+        }
+
+        fn block_assembler(&self) -> &Self::BlockAssembler {
+            self.0.block_assembler()
+        }
+
+        fn evm_env(&self, header: &Header) -> Result<EvmEnvFor<Self>, Self::Error> {
+            self.0.evm_env(header)
+        }
+
+        fn next_evm_env(
+            &self,
+            parent: &Header,
+            attributes: &Self::NextBlockEnvCtx,
+        ) -> Result<EvmEnvFor<Self>, Self::Error> {
+            self.0.next_evm_env(parent, attributes)
+        }
+
+        fn context_for_block<'a>(
+            &self,
+            block: &'a SealedBlock<Block>,
+        ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
+            self.0.context_for_block(block)
+        }
+
+        fn context_for_next_block(
+            &self,
+            parent: &SealedHeader,
+            attributes: Self::NextBlockEnvCtx,
+        ) -> Result<ExecutionCtxFor<'_, Self>, Self::Error> {
+            self.0.context_for_next_block(parent, attributes)
+        }
+
+        fn builder_for_next_block<'a, DB: reth_evm::Database + 'a>(
+            &'a self,
+            db: &'a mut State<DB>,
+            parent: &'a SealedHeader,
+            mut attributes: Self::NextBlockEnvCtx,
+        ) -> Result<
+            impl BlockBuilder<Primitives = Self::Primitives, Executor = BlockExecutorForEvm<'a, Self, DB>>,
+            Self::Error,
+        > {
+            attributes.gas_limit = PINNED_GAS_LIMIT;
+            let evm_env = self.next_evm_env(parent, &attributes)?;
+            let evm = self.evm_with_env(db, evm_env);
+            let ctx = self.context_for_next_block(parent, attributes)?;
+            Ok(self.create_block_builder(evm, parent, ctx))
+        }
+    }
+
+    /// The wrapper must reach the inner config's `builder_for_next_block` override rather than the
+    /// trait default, which would silently rebuild the block environment from the raw attributes.
+    #[test]
+    fn wrapper_delegates_builder_for_next_block() {
+        let parent = SealedHeader::seal_slow(MAINNET.genesis_header().clone());
+        let attributes = NextBlockEnvAttributes {
+            timestamp: parent.timestamp + 1,
+            suggested_fee_recipient: Address::ZERO,
+            prev_randao: B256::ZERO,
+            gas_limit: 36_000_000,
+            parent_beacon_block_root: None,
+            withdrawals: None,
+            extra_data: Default::default(),
+            slot_number: None,
+        };
+        let mut db = State::builder()
+            .with_database(CacheDB::new(EmptyDB::default()))
+            .with_bundle_update()
+            .build();
+
+        let wrapped = FirehoseEvmConfig::new(PinnedGasLimit(EthEvmConfig::mainnet()));
+        let gas_limit = wrapped
+            .builder_for_next_block(&mut db, &parent, attributes)
+            .expect("builder_for_next_block")
+            .evm_mut()
+            .block()
+            .gas_limit();
+        assert_eq!(gas_limit, PINNED_GAS_LIMIT, "inner override bypassed by FirehoseEvmConfig");
     }
 }

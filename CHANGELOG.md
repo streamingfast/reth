@@ -7,6 +7,17 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## arc-v2.2.0-fh3.1-2
+
+### Fixed
+
+- `FirehoseEvmConfig` now delegates `builder_for_next_block` to the wrapped config instead of
+  inheriting the trait default. Arc overrides that method to take the block gas limit from its
+  on-chain `ProtocolConfig`; behind the wrapper the default ran instead, the payload builder used
+  reth's generic gas-limit target (36M, clamped to `parent + parent/1024 - 1`) and then rejected
+  its own block with "block gas limit 30029295 does not match expected 30000000". Every node
+  running the wrapper failed to build blocks, independent of whether the tracer was enabled.
+
 ## arc-v2.2.0-fh3.1-1
 
 ### Fixed
