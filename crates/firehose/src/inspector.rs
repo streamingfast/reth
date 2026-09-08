@@ -80,6 +80,14 @@ pub struct FirehoseInspector<'a> {
     /// even when the root call reverted and `balance_tracker` is stale.
     tx_journal_snapshot: Vec<JournalEntry>,
 
+    /// Live balance, at root call/create exit, of every account the committed journal touched
+    /// through a direct `BalanceChange` entry. revm records only the *old* balance on that entry
+    /// (native precompiles mutate balances in place — Arc's `NativeCoinAuthority` mint/burn, for
+    /// instance), so the journal replay in `resolve_post_tx_balance` cannot follow such a change.
+    /// The live value already includes every committed change and replaces the replay for these
+    /// accounts. Captured together with `tx_journal_snapshot`, cleared with it.
+    tx_post_exec_direct_balances: HashMap<Address, U256>,
+
     /// Sender's account balance at the start of root execution (i.e. after all pre-execution
     /// deductions: gas buy on mainnet, gas buy + L1 cost + operator fee on OP Stack).
     /// Captured at depth 0 from `account.info.balance` and consumed by
@@ -131,6 +139,7 @@ impl<'a> Debug for FirehoseInspector<'a> {
             .field("pending_value_transfer", &self.pending_value_transfer)
             .field("selfdestruct_addresses", &self.selfdestruct_addresses)
             .field("tx_journal_snapshot_len", &self.tx_journal_snapshot.len())
+            .field("tx_post_exec_direct_balances", &self.tx_post_exec_direct_balances)
             .finish()
     }
 }
@@ -156,6 +165,7 @@ impl<'a> FirehoseInspector<'a> {
             selfdestruct_addresses: HashSet::new(),
             pending_selfdestruct_cleanups: Vec::new(),
             tx_journal_snapshot: Vec::new(),
+            tx_post_exec_direct_balances: HashMap::new(),
             tx_post_pre_exec_sender_balance: None,
             root_balance_reason_override: None,
             log_block_index: 0,
@@ -577,6 +587,7 @@ impl<'a> FirehoseInspector<'a> {
         // back to the pre-tx DB balance instead of reading a STALE previous-tx snapshot.
         // Do NOT remove during refactors. See `resolve_post_tx_balance_*` tests.
         self.tx_journal_snapshot.clear();
+        self.tx_post_exec_direct_balances.clear();
 
         let Some(account) = context.journal().evm_state().get(&caller) else { return };
 
@@ -1018,6 +1029,74 @@ impl<'a> FirehoseInspector<'a> {
         balance.unwrap_or_else(|| get_pre_tx_balance(address))
     }
 
+    /// Records the live balance of every account with a direct `BalanceChange` entry in the
+    /// committed journal snapshot. See `tx_post_exec_direct_balances`.
+    fn capture_post_exec_direct_balances<CTX>(&mut self, context: &mut CTX)
+    where
+        CTX: ContextTr,
+        CTX::Journal: JournalExt,
+    {
+        self.tx_post_exec_direct_balances.clear();
+        let evm_state = context.journal().evm_state();
+        for entry in &self.tx_journal_snapshot {
+            if let JournalEntry::BalanceChange { address, .. } = entry {
+                if let Some(account) = evm_state.get(address) {
+                    self.tx_post_exec_direct_balances.insert(*address, account.info.balance);
+                }
+            }
+        }
+    }
+
+    /// Whether `tx_journal` holds a direct `BalanceChange` for `address` whose delta the journal
+    /// replay cannot recover. On the sender path (`initial_balance` seeded or a non-zero
+    /// `gas_buy_cost`) the first such entry is the gas buy, which the replay does understand;
+    /// every further one is an in-place mutation such as a native precompile's mint or burn. On
+    /// any other path every such entry is one.
+    fn has_direct_balance_mutation(
+        address: Address,
+        initial_balance: Option<U256>,
+        gas_buy_cost: U256,
+        tx_journal: &[JournalEntry],
+    ) -> bool {
+        let sender_path = initial_balance.is_some() || !gas_buy_cost.is_zero();
+        let direct_changes = tx_journal
+            .iter()
+            .filter(|entry| {
+                matches!(entry, JournalEntry::BalanceChange { address: a, .. } if *a == address)
+            })
+            .count();
+        direct_changes > usize::from(sender_path)
+    }
+
+    /// [`Self::resolve_post_tx_balance`], except that an account mutated in place by a direct
+    /// `BalanceChange` (see [`Self::has_direct_balance_mutation`]) resolves to the live balance
+    /// captured at root exit, which is the exact post-execution value the replay cannot reach.
+    fn resolve_post_tx_balance_or_live(
+        address: Address,
+        initial_balance: Option<U256>,
+        gas_buy_cost: U256,
+        tx_journal: &[JournalEntry],
+        live_balances: &HashMap<Address, U256>,
+        get_pre_tx_balance: &mut impl FnMut(Address) -> U256,
+    ) -> U256 {
+        if Self::has_direct_balance_mutation(address, initial_balance, gas_buy_cost, tx_journal) {
+            if let Some(live) = live_balances.get(&address) {
+                return *live;
+            }
+            firehose_tracer::firehose_debug!(
+                "direct balance mutation without a live balance for address: {:?}",
+                address
+            );
+        }
+        Self::resolve_post_tx_balance(
+            address,
+            initial_balance,
+            gas_buy_cost,
+            tx_journal,
+            get_pre_tx_balance,
+        )
+    }
+
     /// Resolves the post-execution balance of `address` from this transaction's journal
     /// snapshot, falling back to `get_pre_tx_balance` when the account had no
     /// balance-affecting journal entry this tx.
@@ -1035,11 +1114,12 @@ impl<'a> FirehoseInspector<'a> {
         address: Address,
         get_pre_tx_balance: &mut impl FnMut(Address) -> U256,
     ) -> U256 {
-        Self::resolve_post_tx_balance(
+        Self::resolve_post_tx_balance_or_live(
             address,
             None,
             U256::ZERO,
             &self.tx_journal_snapshot,
+            &self.tx_post_exec_direct_balances,
             get_pre_tx_balance,
         )
     }
@@ -1086,11 +1166,12 @@ impl<'a> FirehoseInspector<'a> {
         // didn't capture (e.g. tracer activated mid-tx, or sender account missing from the
         // EVM state map); in that case `resolve_post_tx_balance` falls back to the
         // journal-walk derivation, which is correct for chains without the OP-style fold.
-        let sender_balance = Self::resolve_post_tx_balance(
+        let sender_balance = Self::resolve_post_tx_balance_or_live(
             sender,
             self.tx_post_pre_exec_sender_balance.take(),
             gas_buy_cost,
             &self.tx_journal_snapshot,
+            &self.tx_post_exec_direct_balances,
             &mut get_pre_tx_balance,
         );
 
@@ -1116,11 +1197,12 @@ impl<'a> FirehoseInspector<'a> {
             let coinbase_balance = if sender == coinbase {
                 sender_balance + refund_amount
             } else {
-                Self::resolve_post_tx_balance(
+                Self::resolve_post_tx_balance_or_live(
                     coinbase,
                     None,
                     U256::ZERO,
                     &self.tx_journal_snapshot,
+                    &self.tx_post_exec_direct_balances,
                     &mut get_pre_tx_balance,
                 )
             };
@@ -1498,6 +1580,7 @@ where
         // sender/coinbase balances to use as old_balance for gas refund and miner reward.
         if depth == 0 {
             self.tx_journal_snapshot = context.journal().journal().to_vec();
+            self.capture_post_exec_direct_balances(context);
         }
 
         // The `reverted` parameter in on_call_exit means "did the call fail"
@@ -1606,6 +1689,7 @@ where
         // process_post_tx_balance_changes can derive correct post-execution balances.
         if depth == 0 {
             self.tx_journal_snapshot = context.journal().journal().to_vec();
+            self.capture_post_exec_direct_balances(context);
         }
 
         self.tracer.on_call_exit(
@@ -2090,6 +2174,85 @@ mod tests {
             &mut get_pre,
         );
         assert_eq!(resolved, pre_tx_coinbase);
+    }
+
+    /// A native precompile that debits the sender in place (Arc's `NativeCoinAuthority` burn)
+    /// leaves a second `BalanceChange { old }` for the sender whose new balance the journal does
+    /// not record. The replay must not be trusted for that account; the live balance captured at
+    /// root exit is the post-execution value. Without this, the gas-refund `old_balance`
+    /// contradicted the burn's `new_balance` emitted moments earlier.
+    #[test]
+    fn resolve_post_tx_balance_direct_mutation_uses_live_balance() {
+        let sender = addr(0xAA);
+        let post_pre_exec = U256::from(1_000_u64);
+        let burnt = U256::from(250_u64);
+        let journal = vec![
+            balance_change(sender, U256::from(1_100_u64)), // gas buy: new = post_pre_exec
+            balance_change(sender, post_pre_exec),         // precompile burn: new unknown here
+        ];
+        let live = HashMap::from([(sender, post_pre_exec - burnt)]);
+        let mut get_pre = |_: Address| U256::ZERO;
+
+        assert!(FirehoseInspector::has_direct_balance_mutation(
+            sender,
+            Some(post_pre_exec),
+            U256::from(100_u64),
+            &journal
+        ));
+        let resolved = FirehoseInspector::resolve_post_tx_balance_or_live(
+            sender,
+            Some(post_pre_exec),
+            U256::from(100_u64),
+            &journal,
+            &live,
+            &mut get_pre,
+        );
+        assert_eq!(resolved, post_pre_exec - burnt, "live post-exec balance wins");
+
+        // Without a captured live balance the replay result is kept (stale, but unchanged
+        // behaviour), and the gas buy alone is not a direct mutation.
+        let stale = FirehoseInspector::resolve_post_tx_balance_or_live(
+            sender,
+            Some(post_pre_exec),
+            U256::from(100_u64),
+            &journal,
+            &HashMap::new(),
+            &mut get_pre,
+        );
+        assert_eq!(stale, post_pre_exec);
+        assert!(!FirehoseInspector::has_direct_balance_mutation(
+            sender,
+            Some(post_pre_exec),
+            U256::from(100_u64),
+            &journal[..1]
+        ));
+    }
+
+    /// Coinbase / fee-vault path: any direct `BalanceChange` is an in-place mutation (there is
+    /// no gas buy on this path), so the live balance replaces the replay, which would otherwise
+    /// take the entry's `old_balance` as the resolved value.
+    #[test]
+    fn resolve_post_tx_balance_direct_mutation_on_non_sender() {
+        let account = addr(0xCC);
+        let journal = vec![balance_change(account, U256::from(40_u64))];
+        let live = HashMap::from([(account, U256::from(65_u64))]);
+        let mut get_pre = |_: Address| U256::from(40_u64);
+
+        assert!(FirehoseInspector::has_direct_balance_mutation(
+            account,
+            None,
+            U256::ZERO,
+            &journal
+        ));
+        let resolved = FirehoseInspector::resolve_post_tx_balance_or_live(
+            account,
+            None,
+            U256::ZERO,
+            &journal,
+            &live,
+            &mut get_pre,
+        );
+        assert_eq!(resolved, U256::from(65_u64));
     }
 
     /// Fee-vault credit path (`post_tx_balance`): the OP Stack post-tx extras hook resolves

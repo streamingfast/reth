@@ -7,6 +7,17 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## arc-v2.2.0-fh3.1-3
+
+### Fixed
+
+- Post-transaction balance resolution (gas refund, coinbase reward, post-tx extras) for accounts a
+  native precompile mutated in place. revm records only the old balance on a direct
+  `BalanceChange` journal entry, so the journal replay skipped it and the gas-refund `old_balance`
+  contradicted the debit emitted moments earlier (Arc `NativeCoinAuthority` burn: "balance
+  snapshots ... are not contiguous"). The inspector now captures the live post-execution balance
+  of such accounts at root exit and uses it instead of the replay.
+
 ## arc-v2.2.0-fh3.1-2
 
 ### Fixed
