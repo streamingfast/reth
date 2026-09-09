@@ -711,10 +711,10 @@ where
         // If any early return is taken between here and `mark_verified()`, the guard's Drop
         // emits `on_block_end(Some(err))` so invalid blocks are never flushed downstream.
         //
-        // `finalized` advertises the last finalized head known to the node. On the live engine
-        // path this is set by forkchoiceUpdated (via `set_finalized` on the in-memory state), so
-        // it may lag the block being validated by a few slots — that's the correct Firehose
-        // semantics: each block carries the finalized head as of its execution.
+        // `finalized` advertises the last finalized head known to the node, set by
+        // forkchoiceUpdated (via `set_finalized` on the in-memory state), clamped to an ancestor
+        // of the block being validated. It may lag that block by a few slots — that is the
+        // correct Firehose semantics: each block carries the finalized head as of its execution.
         //
         // When the converted block is not yet available (get() not ready or error), fall through
         // to the non-Firehose path.
@@ -724,9 +724,7 @@ where
                 // returns a reference to the Result<SealedBlock, _>.
                 match validated_block.get().as_ref() {
                     Ok(sealed) => {
-                        let finalized = reth_firehose::mapper::finalized_ref_from_num_hash(
-                            ctx.canonical_in_memory_state().get_finalized_num_hash(),
-                        );
+                        let finalized = self.firehose_finalized_ref(sealed, &ctx);
                         Some(reth_firehose::FirehoseBlockTracer::start::<N>(sealed, finalized))
                     }
                     Err(_) => None,
@@ -1014,6 +1012,40 @@ where
 
             Ok(block)
         })
+    }
+
+    /// Firehose: the finalized block to advertise for `block`, which is always one of its own
+    /// ancestors.
+    ///
+    /// The node's finalized head belongs to the canonical chain. A block on a side branch that
+    /// left the canonical chain below that head must not carry it: the Firehose protocol
+    /// transmits finality as a block number, so the consumer would mark its own block at that
+    /// height — a different one — irreversible, and then see it replaced. See
+    /// [`reth_firehose::finalized_ref_for_block`].
+    fn firehose_finalized_ref(
+        &self,
+        block: &SealedBlock<N::Block>,
+        ctx: &TreeCtx<'_, N>,
+    ) -> Option<reth_firehose::FinalizedBlockRef> {
+        let state = ctx.state();
+        let canonical = ctx.canonical_in_memory_state();
+
+        reth_firehose::finalized_ref_for_block(
+            block.header().number(),
+            block.header().parent_hash(),
+            canonical.get_finalized_num_hash(),
+            |hash| {
+                state
+                    .tree_state
+                    .sealed_header_by_hash(&hash)
+                    .map(|header| (header.number(), header.parent_hash()))
+            },
+            |number| {
+                canonical
+                    .hash_by_number(number)
+                    .or_else(|| self.provider.block_hash(number).ok().flatten())
+            },
+        )
     }
 
     /// Return sealed block header from database or in-memory state by hash.
