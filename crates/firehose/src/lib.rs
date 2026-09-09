@@ -6,6 +6,8 @@
 pub mod block_tracer;
 /// Executor module with Firehose-aware block executors and EVM configs.
 pub mod executor;
+/// Resolves which finalized block a Firehose block event may advertise.
+pub mod finality;
 /// Inspector module for analyzing blockchain data.
 pub mod inspector;
 /// Mapper module for transforming blockchain data.
@@ -21,6 +23,8 @@ pub use executor::{
     FirehoseWrappedExecutor, NoChainHooks, NoPostTxExtras, NoPreTxAdjust, PostTxExtras,
     PreTxAdjust,
 };
+pub use finality::finalized_ref_for_block;
+pub use firehose_tracer::types::FinalizedBlockRef;
 pub use runner::{emit_genesis_block_if_empty, emit_genesis_block_on_empty_chain, run_exex};
 
 use std::{
