@@ -7,6 +7,15 @@ This changelog covers Firehose-specific changes only. For upstream changes, see 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## bnb-v0.1.2-fh3.1
+
+Rebased onto bnb-chain/reth `v0.1.2` (`f66079c2`). That upstream range is RPC-only —
+`eth_getLogs` topic-position selection, rejection of log filters naming the pending block,
+`totalDifficulty` on header responses, tracer null-config handling,
+`getTransactionDataAndReceipt` null result, the new `--rpc.batchrequestlimit` flag, and an h2
+bump — plus CI changes. It touches no Firehose file, so the instrumentation is carried across
+unchanged.
+
 ## bnb-v0.1.1-fh3.2
 
 ### Fixed
