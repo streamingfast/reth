@@ -21,6 +21,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   BSC mainnet at block 120653740, where a four-block side branch was published with LIB
   120653741 — one of those blocks naming a height above its own number.
 
+### Build
+
+- `install_llvm_ubuntu.sh` configures the apt.llvm.org repository directly instead of
+  running that site's `llvm.sh` installer. The installer is fetched unpinned at build time
+  and gates on a distro allow-list of its own, so it rejected Debian 13 — the base of the
+  `cargo-chef:latest-rust-1.95-trixie` image — even though
+  `apt.llvm.org/trixie/llvm-toolchain-trixie-22` carries every package the build needs.
+
 ## reth-v2.5.0-fh3.1
 
 Rebase of the Firehose fork onto upstream reth v2.5.0. Covers everything since
