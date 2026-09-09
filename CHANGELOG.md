@@ -7,6 +7,20 @@ This changelog covers Firehose-specific changes only. For upstream changes, see 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## bnb-v0.1.1-fh3.2
+
+### Fixed
+
+- Stop advertising a finalized block that is not an ancestor of the block being emitted. Every
+  `FIRE BLOCK` line carried the node's finalized head as of the moment the block executed, so a
+  block from a side branch was published with a LIB number naming the canonical chain's block at
+  that height; the consumer marked its own block at that height irreversible and then saw the
+  reorg replace it. The advertised block is now the node's finalized head when that head is on
+  the emitted block's own chain, the fork point where its branch left the canonical chain
+  otherwise, and genesis when the branch cannot be tied to the canonical chain at all. Seen on
+  BSC mainnet at block 120653740, where a four-block side branch was published with LIB
+  120653741 — one of those blocks naming a height above its own number.
+
 ## Unreleased
 
 This fork is consumed as a library by
