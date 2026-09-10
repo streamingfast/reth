@@ -7,6 +7,19 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## arc-v2.2.0-fh3.1-4
+
+### Fixed
+
+- Firehose block events on a side branch no longer advertise the canonical chain's finalized head.
+  Finality travels as a bare block *number* on the `FIRE BLOCK` line, so the consumer resolved it
+  against the block it holds at that height: a reorged-away block was marked irreversible and then
+  replaced. The advertised finalized block is now clamped to an ancestor of the block being
+  emitted — the node's finalized head when it sits on that block's own chain, otherwise the fork
+  point where the branch left the canonical chain (itself below the finalized head, hence final),
+  falling back to genesis for a branch that cannot be tied to the canonical chain at all.
+  Back-ported from `streamingfast/reth` `release/reth-2.x` @ `a91920dda`.
+
 ## arc-v2.2.0-fh3.1-3
 
 ### Fixed
