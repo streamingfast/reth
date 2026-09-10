@@ -20,6 +20,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   falling back to genesis for a branch that cannot be tied to the canonical chain at all.
   Back-ported from `streamingfast/reth` `release/reth-2.x` @ `a91920dda`.
 
+### Upstream reth fixes back-ported onto 2.2.0
+
+Selected correctness fixes from reth 2.3.0–2.5.0 that apply to the 2.2.0 code base. Engine:
+finalized/safe state is applied once a syncing FCU head import completes (#23838); blocks the
+tree already holds are not re-inserted on the backfill hand-off (#23987); the execution cache is
+not mutated while a payload has it checked out (#24384); the hashed post-state is recomputed when
+the state-root task fails over to the serial path (#24506); an unchanged empty storage trie is no
+longer marked deleted (#26526); merkle-stage chunk off-by-one (#24267). Networking: the devp2p
+`Hello` identity must match the ECIES-authenticated peer (#26639); out-of-range subprotocol message
+IDs are rejected (#26654); RLPx mux outbound buffering is bounded fairly (#25031); eth/68 request
+packing overflow (#23848); senders with the canonical empty code hash are accepted per EIP-3607
+(#26644). Storage: RocksDB gets a write-buffer manager (#24001), is not cleared unnecessarily on
+start (#24903) and tolerates unknown column families (#26647); incomplete block receipts read as
+`None` (#25410); history prune checkpoints no longer rewind on static-file walks (#26505) and the
+static-file consistency check respects prune checkpoints (#26565); MDBX no longer uses
+`posix_fallocate`, fixing ENOSPC on ZFS (#24108).
+
 ## arc-v2.2.0-fh3.1-3
 
 ### Fixed
