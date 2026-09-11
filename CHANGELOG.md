@@ -7,6 +7,12 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## reth-v2.5.2-fh3.1
+
+### Changed
+
+- Merge upstream reth v2.5.2 (from v2.5.0). No Firehose code changed.
+
 ## reth-v2.5.0-fh3.2
 
 ### Fixed
