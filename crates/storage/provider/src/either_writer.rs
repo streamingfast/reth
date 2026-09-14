@@ -14,7 +14,7 @@ use crate::{
     },
     StaticFileProviderFactory,
 };
-use alloy_primitives::{map::HashMap, Address, BlockNumber, TxHash, TxNumber, B256};
+use alloy_primitives::{map::HashMap, Address, BlockNumber, TxHash, TxNumber};
 use rayon::slice::ParallelSliceMut;
 use reth_db::{
     cursor::{DbCursorRO, DbDupCursorRW},
@@ -33,32 +33,37 @@ use reth_errors::ProviderError;
 use reth_node_types::NodePrimitives;
 use reth_primitives_traits::{ReceiptTy, StorageEntry};
 use reth_static_file_types::StaticFileSegment;
-use reth_storage_api::{ChangeSetReader, DBProvider, NodePrimitivesProvider, StorageSettingsCache};
+use reth_storage_api::{
+    ChangeSetReader, DBProvider, DbTxProvider, NodePrimitivesProvider, StorageSettingsCache,
+};
 use reth_storage_errors::provider::ProviderResult;
 use strum::{Display, EnumIs};
 
 /// Type alias for [`EitherReader`] constructors.
-type EitherReaderTy<'a, P, T> =
-    EitherReader<'a, CursorTy<<P as DBProvider>::Tx, T>, <P as NodePrimitivesProvider>::Primitives>;
+type EitherReaderTy<'a, P, T> = EitherReader<
+    'a,
+    CursorTy<<P as DbTxProvider>::Tx, T>,
+    <P as NodePrimitivesProvider>::Primitives,
+>;
 
 /// Type alias for [`EitherReader`] constructors.
 type DupEitherReaderTy<'a, P, T> = EitherReader<
     'a,
-    DupCursorTy<<P as DBProvider>::Tx, T>,
+    DupCursorTy<<P as DbTxProvider>::Tx, T>,
     <P as NodePrimitivesProvider>::Primitives,
 >;
 
 /// Type alias for dup [`EitherWriter`] constructors.
 type DupEitherWriterTy<'a, P, T> = EitherWriter<
     'a,
-    DupCursorMutTy<<P as DBProvider>::Tx, T>,
+    DupCursorMutTy<<P as DbTxProvider>::Tx, T>,
     <P as NodePrimitivesProvider>::Primitives,
 >;
 
 /// Type alias for [`EitherWriter`] constructors.
 type EitherWriterTy<'a, P, T> = EitherWriter<
     'a,
-    CursorMutTy<<P as DBProvider>::Tx, T>,
+    CursorMutTy<<P as DbTxProvider>::Tx, T>,
     <P as NodePrimitivesProvider>::Primitives,
 >;
 
@@ -526,20 +531,6 @@ where
             Self::RocksDB(batch) => batch.put::<tables::StoragesHistory>(key, value),
         }
     }
-
-    /// Gets the last shard for an address and storage key (keyed with `u64::MAX`).
-    pub fn get_last_storage_history_shard(
-        &mut self,
-        address: Address,
-        storage_key: B256,
-    ) -> ProviderResult<Option<BlockNumberList>> {
-        let key = StorageShardedKey::last(address, storage_key);
-        match self {
-            Self::Database(cursor) => Ok(cursor.seek_exact(key)?.map(|(_, v)| v)),
-            Self::StaticFile(_) => Err(ProviderError::UnsupportedProvider),
-            Self::RocksDB(batch) => batch.get::<tables::StoragesHistory>(key),
-        }
-    }
 }
 
 impl<'a, CURSOR, N: NodePrimitives> EitherWriter<'a, CURSOR, N>
@@ -569,20 +560,6 @@ where
             Self::Database(cursor) => Ok(cursor.upsert(key, value)?),
             Self::StaticFile(_) => Err(ProviderError::UnsupportedProvider),
             Self::RocksDB(batch) => batch.put::<tables::AccountsHistory>(key, value),
-        }
-    }
-
-    /// Gets the last shard for an address (keyed with `u64::MAX`).
-    pub fn get_last_account_history_shard(
-        &mut self,
-        address: Address,
-    ) -> ProviderResult<Option<BlockNumberList>> {
-        match self {
-            Self::Database(cursor) => {
-                Ok(cursor.seek_exact(ShardedKey::last(address))?.map(|(_, v)| v))
-            }
-            Self::StaticFile(_) => Err(ProviderError::UnsupportedProvider),
-            Self::RocksDB(batch) => batch.get::<tables::AccountsHistory>(ShardedKey::last(address)),
         }
     }
 

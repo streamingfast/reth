@@ -2,18 +2,20 @@
 
 use alloy_primitives::{
     map::{DefaultHashBuilder, FbBuildHasher},
-    Bytes,
+    Address, Bytes,
 };
 use moka::policy::EvictionPolicy;
 use reth_evm::precompiles::{DynPrecompile, Precompile, PrecompileInput};
 use reth_primitives_traits::dashmap::DashMap;
 use revm::precompile::{PrecompileId, PrecompileOutput, PrecompileResult};
-use revm_primitives::Address;
 use std::{hash::Hash, sync::Arc};
 use tracing::error;
 
 /// Default max cache size for [`PrecompileCache`]
 const MAX_CACHE_SIZE: u32 = 1024 * 1024;
+
+/// Maximum calldata size to cache for a precompile.
+const MAX_PRECOMPILE_CACHE_INPUT_SIZE: usize = 2 * 1024;
 
 /// Stores caches for each precompile.
 #[derive(Debug, Clone, Default)]
@@ -180,7 +182,9 @@ where
     }
 
     fn call(&self, input: PrecompileInput<'_>) -> PrecompileResult {
-        if let Some(entry) = &self.cache.get(input.data, self.spec_id.clone()) &&
+        let cacheable_input = input.data.len() <= MAX_PRECOMPILE_CACHE_INPUT_SIZE;
+        if cacheable_input &&
+            let Some(entry) = &self.cache.get(input.data, self.spec_id.clone()) &&
             input.gas >= entry.gas_used()
         {
             self.increment_by_one_precompile_cache_hits();
@@ -194,7 +198,7 @@ where
         match &result {
             // Only successful outputs are cacheable. Non-success statuses and errors must execute
             // again instead of poisoning the cache for subsequent calls.
-            Ok(output) if output.is_success() => {
+            Ok(output) if cacheable_input && output.is_success() => {
                 // Sanity-check precompile output to ensure that it does not affect state gas in any
                 // way.
                 //
@@ -256,8 +260,8 @@ mod tests {
     use revm::{
         context::TxEnv,
         precompile::{PrecompileOutput, PrecompileStatus},
+        primitives::hardfork::SpecId,
     };
-    use revm_primitives::hardfork::SpecId;
 
     #[test]
     fn test_precompile_cache_basic() {
@@ -266,6 +270,7 @@ mod tests {
                 status: PrecompileStatus::Success,
                 gas_used: 0,
                 state_gas_used: 0,
+                state_gas_spilled: 0,
                 reservoir: 0,
                 gas_refunded: 0,
                 bytes: Bytes::default(),
@@ -280,6 +285,7 @@ mod tests {
             status: PrecompileStatus::Success,
             gas_used: 50,
             state_gas_used: 0,
+            state_gas_spilled: 0,
             reservoir: 0,
             gas_refunded: 0,
             bytes: alloy_primitives::Bytes::copy_from_slice(b"cached_result"),
@@ -314,6 +320,7 @@ mod tests {
                     status: PrecompileStatus::Success,
                     gas_used: 5000,
                     state_gas_used: 0,
+                    state_gas_spilled: 0,
                     reservoir: 0,
                     gas_refunded: 0,
                     bytes: alloy_primitives::Bytes::copy_from_slice(b"output_from_precompile_1"),
@@ -331,6 +338,7 @@ mod tests {
                     status: PrecompileStatus::Success,
                     gas_used: 7000,
                     state_gas_used: 0,
+                    state_gas_spilled: 0,
                     reservoir: 0,
                     gas_refunded: 0,
                     bytes: alloy_primitives::Bytes::copy_from_slice(b"output_from_precompile_2"),

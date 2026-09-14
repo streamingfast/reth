@@ -5,7 +5,7 @@ use crate::block::CachedTransaction;
 use alloy_consensus::{transaction::TxHashRef, BlockHeader};
 use alloy_eip7928::bal::DecodedBal;
 use alloy_eips::BlockHashOrNumber;
-use alloy_primitives::{Address, TxHash, B256};
+use alloy_primitives::{Address, Bytes, TxHash, B256};
 use futures::{stream::FuturesOrdered, Stream, StreamExt};
 use reth_chain_state::CanonStateNotification;
 use reth_errors::{ProviderError, ProviderResult};
@@ -157,6 +157,16 @@ impl<N: NodePrimitives> EthStateCache<N> {
         rx.await.map_err(|_| CacheServiceUnavailable)?
     }
 
+    /// Requests the block for the given block hash if it is cached.
+    pub async fn get_maybe_block(
+        &self,
+        block_hash: B256,
+    ) -> ProviderResult<Option<Arc<RecoveredBlock<N::Block>>>> {
+        let (response_tx, rx) = oneshot::channel();
+        let _ = self.to_service.send(CacheAction::GetCachedBlock { block_hash, response_tx });
+        rx.await.map_err(|_| CacheServiceUnavailable.into())
+    }
+
     /// Requests the receipts for the block hash
     ///
     /// Returns `None` if the block was not found.
@@ -280,7 +290,7 @@ impl<N: NodePrimitives> EthStateCache<N> {
     pub async fn get_bal(
         &self,
         block_hash: B256,
-    ) -> ProviderResult<Option<Arc<DecodedBal<RevmBal>>>> {
+    ) -> ProviderResult<Option<Arc<DecodedBal<Arc<RevmBal>>>>> {
         let (response_tx, rx) = oneshot::channel();
         let _ = self.to_service.send(CacheAction::GetBal { block_hash, response_tx });
         rx.await
@@ -427,9 +437,8 @@ where
     fn on_reorg_block(
         &mut self,
         block_hash: B256,
-        res: ProviderResult<Option<RecoveredBlock<Provider::Block>>>,
+        res: ProviderResult<Option<Arc<RecoveredBlock<Provider::Block>>>>,
     ) {
-        let res = res.map(|b| b.map(Arc::new));
         if let Some(queued) = self.full_block_cache.remove(&block_hash) {
             // send the response to queued senders
             for tx in queued {
@@ -616,10 +625,11 @@ where
                                     ActionSender::new(CacheKind::Bal, block_hash, action_tx);
                                 this.action_task_spawner.spawn_blocking_task(async move {
                                     let _permit = rate_limiter.acquire().await;
-                                    let res = provider
-                                        .bal_store()
-                                        .revm_bal_by_hash(block_hash)
-                                        .map(|maybe_bal| maybe_bal.map(CachedRevmBal::new));
+                                    let res = provider.get_bal_by_hash(block_hash).and_then(
+                                        |maybe_bal| {
+                                            maybe_bal.map(CachedRevmBal::try_from_raw).transpose()
+                                        },
+                                    );
                                     action_sender.send_bal(res);
                                 });
                             }
@@ -659,13 +669,13 @@ where
                             for block in chain_change.blocks {
                                 // Index transactions before caching the block
                                 this.index_block_transactions(&block);
-                                this.on_new_block(block.hash(), Ok(Some(Arc::new(block))));
+                                this.on_new_block(block.hash(), Ok(Some(block)));
                             }
 
                             for block_receipts in chain_change.receipts {
                                 this.on_new_receipts(
                                     block_receipts.block_hash,
-                                    Ok(Some(Arc::new(block_receipts.receipts))),
+                                    Ok(Some(block_receipts.receipts)),
                                 );
                             }
                         }
@@ -683,7 +693,7 @@ where
                             for block_receipts in chain_change.receipts {
                                 this.on_reorg_receipts(
                                     block_receipts.block_hash,
-                                    Ok(Some(Arc::new(block_receipts.receipts))),
+                                    Ok(Some(block_receipts.receipts)),
                                 );
                             }
                         }
@@ -790,12 +800,12 @@ enum CacheAction<B: Block, R> {
 
 struct BlockReceipts<R> {
     block_hash: B256,
-    receipts: Vec<R>,
+    receipts: Arc<Vec<R>>,
 }
 
 /// A change of the canonical chain
 struct ChainChange<B: Block, R> {
-    blocks: Vec<RecoveredBlock<B>>,
+    blocks: Vec<Arc<RecoveredBlock<B>>>,
     receipts: Vec<BlockReceipts<R>>,
 }
 
@@ -807,9 +817,11 @@ impl<B: Block, R: Clone> ChainChange<B, R> {
         let (blocks, receipts): (Vec<_>, Vec<_>) = chain
             .blocks_and_receipts()
             .map(|(block, receipts)| {
-                let block_receipts =
-                    BlockReceipts { block_hash: block.hash(), receipts: receipts.clone() };
-                (block.clone(), block_receipts)
+                let block_receipts = BlockReceipts {
+                    block_hash: block.hash(),
+                    receipts: Arc::new(receipts.clone()),
+                };
+                (Arc::clone(block), block_receipts)
             })
             .unzip();
         Self { blocks, receipts }
@@ -925,13 +937,25 @@ pub async fn cache_new_blocks_task<St, N: NodePrimitives>(
 
 /// Cached decoded revm BAL.
 #[derive(Clone, Debug)]
-pub(crate) struct CachedRevmBal(Arc<DecodedBal<RevmBal>>);
+pub(crate) struct CachedRevmBal(Arc<DecodedBal<Arc<RevmBal>>>);
 
 impl CachedRevmBal {
     /// Creates a cached revm BAL from an owned decoded BAL.
     #[inline]
-    fn new(bal: DecodedBal<RevmBal>) -> Self {
+    fn new(bal: DecodedBal<Arc<RevmBal>>) -> Self {
         Self(Arc::new(bal))
+    }
+
+    /// Decodes raw BAL bytes into the representation used by revm.
+    fn try_from_raw(raw: Bytes) -> ProviderResult<Self> {
+        DecodedBal::from_rlp_bytes(raw)
+            .map_err(Into::into)
+            .and_then(|decoded| {
+                decoded.try_map(|bal| {
+                    RevmBal::try_from(Vec::from(bal)).map(Arc::new).map_err(ProviderError::other)
+                })
+            })
+            .map(Self::new)
     }
 }
 
@@ -941,11 +965,13 @@ impl InMemorySize for CachedRevmBal {
     }
 }
 
-fn decoded_revm_bal_size(bal: &DecodedBal<RevmBal>) -> usize {
-    core::mem::size_of::<DecodedBal<RevmBal>>() + bal.as_raw().len() + revm_bal_size(bal.as_bal())
+fn decoded_revm_bal_size(bal: &DecodedBal<Arc<RevmBal>>) -> usize {
+    core::mem::size_of::<DecodedBal<Arc<RevmBal>>>() +
+        bal.as_raw().len() +
+        revm_bal_size(bal.as_bal())
 }
 
-fn revm_bal_size(bal: &RevmBal) -> usize {
+fn revm_bal_size(bal: &Arc<RevmBal>) -> usize {
     core::mem::size_of::<RevmBal>() +
         bal.accounts.capacity() * core::mem::size_of::<(Address, RevmAccountBal)>() +
         bal.accounts.values().map(revm_account_bal_heap_size).sum::<usize>()
@@ -1020,8 +1046,8 @@ mod tests {
         service
     }
 
-    fn test_decoded_revm_bal() -> DecodedBal<RevmBal> {
-        DecodedBal::new(RevmBal::default(), Bytes::from_static(&[0xc0]))
+    fn test_decoded_revm_bal() -> DecodedBal<Arc<RevmBal>> {
+        DecodedBal::new(Arc::new(RevmBal::default()), Bytes::from_static(&[0xc0]))
     }
 
     fn test_block() -> RecoveredBlock<Block> {
@@ -1137,10 +1163,10 @@ mod tests {
 
         let raw = Bytes::from_static(&[0xc0, 0x01, 0x02]);
         let previous_estimate = core::mem::size_of::<CachedRevmBal>() +
-            core::mem::size_of::<DecodedBal<RevmBal>>() +
+            core::mem::size_of::<DecodedBal<Arc<RevmBal>>>() +
             raw.len() +
             core::mem::size_of::<RevmBal>();
-        assert!(CachedRevmBal::new(DecodedBal::new(bal, raw)).size() > previous_estimate);
+        assert!(CachedRevmBal::new(DecodedBal::new(Arc::new(bal), raw)).size() > previous_estimate);
     }
 
     #[tokio::test]
@@ -1215,11 +1241,7 @@ mod tests {
     }
 
     impl BalStore for TestBalStore {
-        fn insert(
-            &self,
-            _num_hash: NumHash,
-            _bal: reth_storage_api::SealedBal,
-        ) -> ProviderResult<()> {
+        fn insert(&self, _num_hash: NumHash, _bal: reth_storage_api::RawBal) -> ProviderResult<()> {
             Ok(())
         }
 
@@ -1228,15 +1250,8 @@ mod tests {
         }
 
         fn get_by_hashes(&self, block_hashes: &[BlockHash]) -> ProviderResult<Vec<Option<Bytes>>> {
-            Ok(block_hashes.iter().map(|_| None).collect())
-        }
-
-        fn revm_bal_by_hash(
-            &self,
-            _block_hash: BlockHash,
-        ) -> ProviderResult<Option<DecodedBal<RevmBal>>> {
             self.fetches.fetch_add(1, Ordering::SeqCst);
-            Ok(Some(test_decoded_revm_bal()))
+            Ok(block_hashes.iter().map(|_| Some(Bytes::from_static(&[0xc0]))).collect())
         }
 
         fn bal_stream(&self) -> reth_storage_api::BalNotificationStream {

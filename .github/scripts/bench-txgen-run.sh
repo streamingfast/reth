@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 #
-# Runs a single txgen-backed Engine API benchmark cycle:
-# mount snapshot → start node → extract source blocks → warmup → send-blocks →
+# Runs a single txgen-backed benchmark cycle:
+# mount snapshot → start node → extract source blocks → warmup → replay →
 # convert txgen JSON report into legacy benchmark CSVs.
 #
 # Usage: bench-txgen-run.sh <label> <binary> <output-dir>
 #
 # Required env: SCHELK_MOUNT, BENCH_RPC_URL, BENCH_BLOCKS, BENCH_WARMUP_BLOCKS
-# Optional env: BENCH_BIG_BLOCKS, BENCH_BIG_BLOCKS_TARGET_GAS, BENCH_BAL,
-#               BENCH_WORK_DIR, BENCH_WAIT_TIME, BENCH_BASELINE_ARGS,
+# Optional env: BENCH_EXECUTION_MODE, BENCH_BIG_BLOCKS, BENCH_BIG_BLOCKS_TARGET_GAS,
+#               BENCH_REORG, BENCH_BAL,
+#               BENCH_WORK_DIR, BENCH_WAIT_TIME, BENCH_BLOCK_TIME, BENCH_BASELINE_ARGS,
 #               BENCH_FEATURE_ARGS, BENCH_OTLP_TRACES_ENDPOINT,
 #               BENCH_OTLP_LOGS_ENDPOINT, BENCH_OTLP_DISABLED,
 #               BENCH_TRACING_CHROME, BENCH_TRACY,
 #               BENCH_TRACY_FILTER, BENCH_TRACY_SAMPLING_HZ,
+#               BENCH_POST_WARMUP_SLEEP_SECONDS,
 #               TXGEN_PAYLOADS_DIR (pre-extracted payloads; skips extraction),
 #               BENCH_TARGET_METRICS_SCRAPE_INTERVAL_MS (optional txgen override)
 set -euxo pipefail
@@ -44,6 +46,7 @@ fi
 
 DATADIR_NAME="datadir"
 BIG_BLOCKS="${BENCH_BIG_BLOCKS:-false}"
+EXECUTION_MODE="${BENCH_EXECUTION_MODE:-engine}"
 if [ "$BIG_BLOCKS" = "true" ]; then
   DATADIR_NAME="datadir-big-blocks"
 fi
@@ -161,6 +164,21 @@ bal_enabled_for_label() {
 USE_BAL="$(bal_enabled_for_label)"
 echo "BAL replay for ${LABEL}: ${USE_BAL} (mode=${BENCH_BAL:-false})"
 
+call_reth_jit() {
+  local action="$1"
+  local response
+  if ! response=$(curl -sf http://127.0.0.1:8545 -X POST \
+    -H 'Content-Type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"method\":\"reth_jit\",\"params\":[\"${action}\"],\"id\":1}"); then
+    echo "::error::reth_jit ${action} request failed"
+    exit 1
+  fi
+  if jq -e '.error? != null' <<< "$response" > /dev/null 2>&1; then
+    echo "::error::reth_jit ${action} failed: ${response}"
+    exit 1
+  fi
+}
+
 cleanup() {
   kill "${TAIL_PID:-}" 2>/dev/null || true
   if [ -n "${TRACY_PID:-}" ] && kill -0 "$TRACY_PID" 2>/dev/null; then
@@ -233,6 +251,8 @@ RETH_ARGS=(
   --log.file.directory "$OUTPUT_DIR/reth-logs"
   --engine.accept-execution-requests-hash
   --http
+  # txgen reorg mode builds synthetic side-fork blocks via testing_buildBlockV1.
+  --http.api eth,net,web3,debug,reth,testing,txpool
   --http.port 8545
   --ws
   --ws.api all
@@ -240,6 +260,18 @@ RETH_ARGS=(
   --disable-discovery
   --no-persist-peers
 )
+
+if [ "$EXECUTION_MODE" = "rpc" ]; then
+  if [ "$BIG_BLOCKS" = "true" ] || [ -n "${BENCH_REORG:-}" ] || [ "$USE_BAL" = "true" ]; then
+    echo "::error::RPC mode does not support big blocks, reorg, or BAL"
+    exit 1
+  fi
+  RETH_ARGS+=(--chain mainnet --dev --dev.block-time "${BENCH_BLOCK_TIME:-1s}")
+fi
+
+if [ -n "${BENCH_REORG:-}" ]; then
+  RETH_ARGS+=(--testing.skip-invalid-transactions)
+fi
 
 SYNC_STATE_IDLE=false
 if "$BINARY" node --help 2>/dev/null | grep -qF -- '--debug.startup-sync-state-idle'; then
@@ -277,6 +309,22 @@ if [ "${BENCH_TRACY:-off}" != "off" ]; then
   elif [ "${BENCH_TRACY}" = "full" ]; then
     export TRACY_SAMPLING_HZ="${BENCH_TRACY_SAMPLING_HZ:-1}"
   fi
+fi
+
+JIT_ENABLED=false
+for arg in "${RETH_ARGS[@]}"; do
+  if [ "$arg" = "--jit" ]; then
+    JIT_ENABLED=true
+    break
+  fi
+done
+
+if [ -n "${BENCH_POST_WARMUP_SLEEP_SECONDS:-}" ]; then
+  POST_WARMUP_SLEEP_SECONDS="$BENCH_POST_WARMUP_SLEEP_SECONDS"
+elif [ "$JIT_ENABLED" = "true" ]; then
+  POST_WARMUP_SLEEP_SECONDS=120
+else
+  POST_WARMUP_SLEEP_SECONDS=0
 fi
 
 SUDO_ENV=()
@@ -363,8 +411,11 @@ fi
 TXGEN_BENCH="$(which bench)"
 BENCH_NICE="sudo nice -n -20 sudo -u $(id -un)"
 TXGEN_SEND_ARGS=()
-if [ -n "${BENCH_WAIT_TIME:-}" ]; then
+if [ "$EXECUTION_MODE" = "engine" ] && [ -n "${BENCH_WAIT_TIME:-}" ]; then
   TXGEN_SEND_ARGS+=(--wait-time "$BENCH_WAIT_TIME")
+fi
+if [ -n "${BENCH_REORG:-}" ]; then
+  TXGEN_SEND_ARGS+=(--reorg "$BENCH_REORG")
 fi
 
 WARMUP="${BENCH_WARMUP_BLOCKS:-0}"
@@ -384,6 +435,9 @@ if [ -n "${TXGEN_PAYLOADS_DIR:-}" ] && [ -d "$TXGEN_PAYLOADS_DIR" ]; then
   if [ "$BIG_BLOCKS" = "true" ]; then
     WARMUP_BLOCKS="$TXGEN_PAYLOADS_DIR/warmup-big-blocks.ndjson"
     BENCHMARK_BLOCKS="$TXGEN_PAYLOADS_DIR/measured-big-blocks.ndjson"
+  elif [ "$EXECUTION_MODE" = "rpc" ]; then
+    WARMUP_BLOCKS="$TXGEN_PAYLOADS_DIR/warmup-transactions.ndjson"
+    BENCHMARK_BLOCKS="$TXGEN_PAYLOADS_DIR/benchmark-transactions.ndjson"
   else
     WARMUP_BLOCKS="$TXGEN_PAYLOADS_DIR/warmup-blocks.ndjson"
     BENCHMARK_BLOCKS="$TXGEN_PAYLOADS_DIR/benchmark-blocks.ndjson"
@@ -412,7 +466,11 @@ else
   ALL_BLOCKS="$TXGEN_DIR/all-blocks.ndjson"
   WARMUP_BLOCKS="$TXGEN_DIR/warmup-blocks.ndjson"
   BENCHMARK_BLOCKS="$TXGEN_DIR/benchmark-blocks.ndjson"
-  if [ "$BIG_BLOCKS" = "true" ]; then
+  if [ "$EXECUTION_MODE" = "rpc" ]; then
+    ALL_BLOCKS="$TXGEN_DIR/all-transactions.ndjson"
+    WARMUP_BLOCKS="$TXGEN_DIR/warmup-transactions.ndjson"
+    BENCHMARK_BLOCKS="$TXGEN_DIR/benchmark-transactions.ndjson"
+  elif [ "$BIG_BLOCKS" = "true" ]; then
     ALL_BLOCKS="$TXGEN_DIR/all-big-blocks.ndjson"
     WARMUP_BLOCKS="$TXGEN_DIR/warmup-big-blocks.ndjson"
     BENCHMARK_BLOCKS="$TXGEN_DIR/measured-big-blocks.ndjson"
@@ -423,7 +481,26 @@ else
   if [ "$USE_BAL" = "true" ]; then
     TXGEN_EXTRACT_ARGS+=(--bal)
   fi
-  if [ "$BIG_BLOCKS" = "true" ]; then
+  if [ "$EXECUTION_MODE" = "rpc" ]; then
+    EXTRACT_TO=$(( HEAD_DEC + TOTAL ))
+    if [ "$WARMUP" -gt 0 ] 2>/dev/null; then
+      "$TXGEN_ETHEREUM" extract \
+        --rpc "$BENCH_RPC_URL" \
+        --from "$EXTRACT_FROM" \
+        --to "$(( HEAD_DEC + WARMUP ))" \
+        --format transactions \
+        -o "$WARMUP_BLOCKS"
+    else
+      : > "$WARMUP_BLOCKS"
+    fi
+    "$TXGEN_ETHEREUM" extract \
+      --rpc "$BENCH_RPC_URL" \
+      --from "$(( HEAD_DEC + WARMUP + 1 ))" \
+      --to "$EXTRACT_TO" \
+      --format transactions \
+      -o "$BENCHMARK_BLOCKS"
+    cat "$WARMUP_BLOCKS" "$BENCHMARK_BLOCKS" > "$ALL_BLOCKS"
+  elif [ "$BIG_BLOCKS" = "true" ]; then
     echo "Extracting ${TOTAL} big blocks from ${EXTRACT_FROM} for txgen benchmark (${WARMUP} warmup, ${BLOCKS} measured, bal=${USE_BAL})"
     "$TXGEN_ETHEREUM" extract-big-blocks \
       --rpc "$BENCH_RPC_URL" \
@@ -443,25 +520,40 @@ else
       -o "$ALL_BLOCKS"
   fi
 
-  if [ "$WARMUP" -gt 0 ] 2>/dev/null; then
-    head -n "$WARMUP" "$ALL_BLOCKS" > "$WARMUP_BLOCKS"
-  else
-    : > "$WARMUP_BLOCKS"
+  if [ "$EXECUTION_MODE" = "engine" ]; then
+    if [ "$WARMUP" -gt 0 ] 2>/dev/null; then
+      head -n "$WARMUP" "$ALL_BLOCKS" > "$WARMUP_BLOCKS"
+    else
+      : > "$WARMUP_BLOCKS"
+    fi
+    awk -v warmup="$WARMUP" 'NR > warmup { print }' "$ALL_BLOCKS" > "$BENCHMARK_BLOCKS"
   fi
-  awk -v warmup="$WARMUP" 'NR > warmup { print }' "$ALL_BLOCKS" > "$BENCHMARK_BLOCKS"
 fi
 
 if [ "$WARMUP" -gt 0 ] 2>/dev/null; then
-  echo "Running txgen warmup (${WARMUP} blocks)..."
-  $BENCH_NICE "$TXGEN_BENCH" send-blocks \
-    --engine http://127.0.0.1:8551 \
-    --jwt-secret "$DATADIR/jwt.hex" \
-    --input "$WARMUP_BLOCKS" \
-    "${TXGEN_SEND_ARGS[@]}" \
-    --wait-for-persistence never \
-    --report json:"$TXGEN_DIR/warmup-report.json" 2>&1 | sed -u "s/^/[bench] /"
+  echo "Running txgen warmup (${WARMUP} source blocks, mode=${EXECUTION_MODE})..."
+  if [ "$EXECUTION_MODE" = "rpc" ]; then
+    $BENCH_NICE "$TXGEN_BENCH" send \
+      --rpc-url http://127.0.0.1:8545 \
+      --input "$WARMUP_BLOCKS" \
+      --drain-timeout 300 \
+      --report json:"$TXGEN_DIR/warmup-report.json" 2>&1 | sed -u "s/^/[bench] /"
+  else
+    $BENCH_NICE "$TXGEN_BENCH" send-blocks \
+      --engine http://127.0.0.1:8551 \
+      --jwt-secret "$DATADIR/jwt.hex" \
+      --input "$WARMUP_BLOCKS" \
+      "${TXGEN_SEND_ARGS[@]}" \
+      --wait-for-persistence never \
+      --report json:"$TXGEN_DIR/warmup-report.json" 2>&1 | sed -u "s/^/[bench] /"
+  fi
 else
   echo "Skipping warmup (0 blocks)..."
+fi
+
+if [ "$WARMUP" -gt 0 ] 2>/dev/null && [ "$POST_WARMUP_SLEEP_SECONDS" -gt 0 ] 2>/dev/null; then
+  echo "Sleeping ${POST_WARMUP_SLEEP_SECONDS}s after warmup to let background JIT finish..."
+  sleep "$POST_WARMUP_SLEEP_SECONDS"
 fi
 
 if [ "${BENCH_TRACY:-off}" != "off" ]; then
@@ -520,14 +612,24 @@ if [ -n "${BENCH_VICTORIAMETRICS_URL:-}" ]; then
   fi
 fi
 
-echo "Running txgen measured benchmark (${BLOCKS} blocks)..."
-$BENCH_NICE "$TXGEN_BENCH" send-blocks \
-  --engine http://127.0.0.1:8551 \
-  --jwt-secret "$DATADIR/jwt.hex" \
+if [ "$JIT_ENABLED" = "true" ]; then
+  echo "Pausing JIT helper before measured benchmark..."
+  call_reth_jit pause
+fi
+
+echo "Running txgen measured benchmark (${BLOCKS} source blocks, mode=${EXECUTION_MODE})..."
+TXGEN_REPLAY_ARGS=()
+BENCH_SCENARIO="replay"
+if [ "$EXECUTION_MODE" = "rpc" ]; then
+  TXGEN_REPLAY_ARGS=(send --rpc-url http://127.0.0.1:8545 --drain-timeout 300)
+  BENCH_SCENARIO="rpc-replay"
+else
+  TXGEN_REPLAY_ARGS=(send-blocks --engine http://127.0.0.1:8551 --jwt-secret "$DATADIR/jwt.hex" --wait-for-persistence never)
+fi
+$BENCH_NICE "$TXGEN_BENCH" "${TXGEN_REPLAY_ARGS[@]}" \
   --input "$BENCHMARK_BLOCKS" \
   "${TXGEN_SEND_ARGS[@]}" \
   "${METRICS_ARGS[@]}" \
-  --wait-for-persistence never \
   --report json:"$OUTPUT_DIR/report.json" \
   "${CLICKHOUSE_REPORT[@]}" \
   "${PROMETHEUS_REPORT[@]}" \
@@ -535,7 +637,7 @@ $BENCH_NICE "$TXGEN_BENCH" send-blocks \
   -m "git-ref=$GIT_REF" \
   -m "job=github-reth-bench" \
   -m "platform=ethereum" \
-  -m "scenario=replay" \
+  -m "scenario=$BENCH_SCENARIO" \
   -m "bal-mode=${BENCH_BAL:-false}" \
   -m "bal-enabled=$USE_BAL" \
   "${PROMETHEUS_METADATA[@]}" 2>&1 | sed -u "s/^/[bench] /"

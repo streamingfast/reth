@@ -22,6 +22,10 @@ pub trait DebugApi<TxReq: RpcObject> {
     #[method(name = "getRawBlock")]
     async fn raw_block(&self, block_id: BlockId) -> RpcResult<Bytes>;
 
+    /// Returns the RLP-encoded EIP-7928 block access list.
+    #[method(name = "getRawBlockAccessList")]
+    async fn raw_block_access_list(&self, block_id: BlockId) -> RpcResult<Bytes>;
+
     /// Returns an EIP-2718 binary-encoded transaction.
     ///
     /// If this is a pooled EIP-4844 transaction, the blob sidecar is included.
@@ -39,6 +43,10 @@ pub trait DebugApi<TxReq: RpcObject> {
     /// Returns an array of recent bad blocks that the client has seen on the network.
     #[method(name = "getBadBlocks")]
     async fn bad_blocks(&self) -> RpcResult<Vec<serde_json::Value>>;
+
+    /// Clears all transactions from the transaction pool.
+    #[method(name = "clearTxpool")]
+    async fn debug_clear_txpool(&self) -> RpcResult<()>;
 
     /// Returns the structured logs created during the execution of EVM between two blocks
     /// (excluding start) as a JSON object.
@@ -139,12 +147,12 @@ pub trait DebugApi<TxReq: RpcObject> {
     /// to their preimages that were required during the execution of the block, including during
     /// state root recomputation.
     ///
-    /// The first argument is the block number or tag. The optional second argument selects the
+    /// The first argument is the block identifier. The optional second argument selects the
     /// witness generation mode and defaults to `legacy`.
     #[method(name = "executionWitness")]
     async fn debug_execution_witness(
         &self,
-        block: BlockNumberOrTag,
+        block: BlockId,
         mode: Option<ExecutionWitnessMode>,
     ) -> RpcResult<ExecutionWitness>;
 

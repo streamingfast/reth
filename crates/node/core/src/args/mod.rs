@@ -50,7 +50,7 @@ pub use txpool::{DefaultTxPoolValues, TxPoolArgs};
 
 /// DevArgs for configuring the dev testnet
 mod dev;
-pub use dev::DevArgs;
+pub use dev::{DefaultDevArgs, DevArgs};
 
 /// PruneArgs for configuring the pruning and full node
 mod pruning;
@@ -75,6 +75,10 @@ pub use static_files::{StaticFilesArgs, MINIMAL_BLOCKS_PER_FILE};
 /// `StorageArgs` for configuring storage settings.
 mod storage;
 pub use storage::{DefaultStorageValues, StorageArgs};
+
+/// `JitArgs` for configuring JIT compilation of EVM bytecode.
+mod jit;
+pub use jit::JitArgs;
 
 mod error;
 pub mod types;
