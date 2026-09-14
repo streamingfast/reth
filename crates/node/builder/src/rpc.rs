@@ -1454,6 +1454,7 @@ where
             Block = BlockTy<Node::Types>,
         > + Clone,
     TxTy<Node::Types>: reth_firehose::mapper::SignatureFields,
+    Node::Evm: reth_firehose::FirehoseLiveHooks,
 {
     type EngineValidator = BasicEngineValidator<Node::Provider, Node::Evm, EV::Validator>;
 
