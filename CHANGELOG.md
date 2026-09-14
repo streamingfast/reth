@@ -9,6 +9,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+### Added
+
+- `FirehoseLiveHooks`, implemented by the node's EVM configuration, selects the chain-specific
+  hooks (`PreTxAdjust`, `PostTxExtras`) installed on live engine-API traced execution. OP Stack
+  chains use it to emit fee-vault credits and deposit nonces for blocks received through
+  `engine_newPayload`; every EVM configuration used with the engine validator must implement it.
+
 ### Changed
 
 - Rebase on Base's reth fork at `base-v2.5.2.3` (reth v2.5.2 plus two backports), with
