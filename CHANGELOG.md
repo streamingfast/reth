@@ -7,6 +7,31 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Added
+
+- `FirehoseLiveHooks`, implemented by the node's EVM configuration, selects the chain-specific
+  hooks (`PreTxAdjust`, `PostTxExtras`) installed on live engine-API traced execution. OP Stack
+  chains use it to emit fee-vault credits and deposit nonces for blocks received through
+  `engine_newPayload`; every EVM configuration used with the engine validator must implement it.
+
+### Changed
+
+- Rebase on Base's reth fork at `base-v2.5.2.3` (reth v2.5.2 plus two backports), with
+  alloy-evm from `streamingfast/evm` tag `v0.38.0-sf`.
+
+### Fixed
+
+- Reject blocks whose `block_access_list_hash` does not match execution when the Firehose tracer
+  is active. The traced execution path did not build the block access list, so the check was
+  skipped and a post-Amsterdam block that every other node rejects was accepted and streamed.
+- Execute transactions in block order on the traced path. With a block access list present, the
+  parallel execution mode delivers transactions out of order, which the sequential traced
+  executor cannot handle; it is now disabled while the tracer is active.
+- Report the previous code hash and bytecode in code-change events instead of assuming the
+  account had no code.
+
 ## base-v2.3.0-fh3.2
 
 ### Fixed

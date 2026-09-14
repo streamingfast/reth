@@ -16,6 +16,7 @@ workspace = true
 reth-ethereum-cli.workspace = true
 reth-chainspec.workspace = true
 reth-ethereum-primitives.workspace = true
+reth-firehose.workspace = true
 reth-cli-util.workspace = true
 reth-node-core.workspace = true
 reth-node-ethereum.workspace = true
@@ -57,7 +58,6 @@ derive_more.workspace = true
 crossbeam-channel.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 revm.workspace = true
-revm-primitives.workspace = true
 alloy-hardforks.workspace = true
 metrics.workspace = true
 
@@ -104,7 +104,6 @@ asm-keccak = [
     "alloy-primitives/asm-keccak",
     "alloy-evm/asm-keccak",
     "revm/asm-keccak",
-    "revm-primitives/asm-keccak",
 ]
 
 keccak-cache-global = [
@@ -123,6 +122,8 @@ min-trace-logs = [
     "reth-ethereum-cli/min-trace-logs",
     "reth-node-core/min-trace-logs",
 ]
+
+partial-persistence = ["reth-node-core/partial-persistence"]
 
 [[bin]]
 name = "reth-bb"

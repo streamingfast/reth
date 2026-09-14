@@ -29,7 +29,9 @@
 use std::{collections::HashMap, fmt::Debug};
 
 use crate::{
-    block_tracer::FirehoseBlockTracer, inspector::FirehoseInspectorApi, mapper,
+    block_tracer::FirehoseBlockTracer,
+    inspector::{FirehoseInspector, FirehoseInspectorApi},
+    mapper,
     mapper::SignatureFields,
 };
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction, TxReceipt};
@@ -41,14 +43,15 @@ use alloy_evm::{
 use alloy_primitives::{Address, Log, Sealable, U256};
 use reth_evm::{
     execute::{BlockExecutionError, Executor},
-    ConfigureEvm, Evm as _, OnStateHook,
+    ConfigureEvm, Evm as _, EvmFor, OnStateHook,
 };
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_node_api::NodePrimitives;
 use reth_primitives_traits::{Block as BlockTrait, BlockBody, BlockTy, RecoveredBlock, TxTy};
+use reth_provider::StateProviderBox;
 use reth_revm::{
-    db::states::bundle_state::BundleRetention, revm::context::Block as RevmBlock, Database as _,
-    State,
+    database::StateProviderDatabase, db::states::bundle_state::BundleRetention,
+    revm::context::Block as RevmBlock, Database as _, State,
 };
 
 /// Chain-specific hook that emits additional post-tx balance changes after the generic
@@ -484,6 +487,53 @@ where
             NoPostTxExtras,
         )
     }
+}
+
+/// EVM type the live engine-API path executes Firehose-traced blocks with.
+pub type LiveTracedEvm<'db, 'tracer, Evm> = EvmFor<
+    Evm,
+    &'db mut State<StateProviderDatabase<StateProviderBox>>,
+    FirehoseInspector<'tracer>,
+>;
+
+/// Chain-specific hooks the live engine-API path installs on its traced block executor.
+///
+/// The engine tree's block validator wraps the traced executor in
+/// [`FirehoseWrappedExecutor::with_hooks`] with the hook types selected here by the node's EVM
+/// configuration. This is the live-path counterpart of [`ChainHooks`], which serves the pipeline.
+///
+/// Every EVM configuration used with the engine tree's block validator must implement this trait,
+/// so a chain cannot silently trace live blocks without its hooks.
+pub trait FirehoseLiveHooks: ConfigureEvm {
+    /// Hook that patches each transaction event before it reaches the tracer.
+    type PreTxAdjust: for<'db, 'tracer> PreTxAdjust<LiveTracedEvm<'db, 'tracer, Self>> + Default;
+    /// Hook that emits chain-specific balance changes after each transaction.
+    type PostTxExtras: for<'db, 'tracer> PostTxExtras<LiveTracedEvm<'db, 'tracer, Self>> + Default;
+}
+
+impl<F> FirehoseLiveHooks for FirehoseEvmConfig<F>
+where
+    Self: ConfigureEvm,
+{
+    type PreTxAdjust = NoPreTxAdjust;
+    type PostTxExtras = NoPostTxExtras;
+}
+
+impl<ChainSpec, EvmF> FirehoseLiveHooks for reth_evm_ethereum::EthEvmConfig<ChainSpec, EvmF>
+where
+    Self: ConfigureEvm,
+{
+    type PreTxAdjust = NoPreTxAdjust;
+    type PostTxExtras = NoPostTxExtras;
+}
+
+impl<Inner> FirehoseLiveHooks for reth_evm::noop::NoopEvmConfig<Inner>
+where
+    Inner: FirehoseLiveHooks,
+    Self: ConfigureEvm<BlockExecutorFactory = Inner::BlockExecutorFactory>,
+{
+    type PreTxAdjust = Inner::PreTxAdjust;
+    type PostTxExtras = Inner::PostTxExtras;
 }
 
 /// Pipeline [`Executor`] that runs each block through a per-block wrapping strategy

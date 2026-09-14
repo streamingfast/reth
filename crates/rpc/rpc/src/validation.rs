@@ -1,8 +1,9 @@
 use alloy_consensus::{
     BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Transaction, TxReceipt,
 };
-use alloy_eips::{eip7685::RequestsOrHash, eip7928::bal::DecodedBal};
-use alloy_primitives::map::AddressSet;
+use alloy_eip7928::{bal::DecodedBal, compute_block_access_list_hash};
+use alloy_eips::eip7685::RequestsOrHash;
+use alloy_primitives::{map::AddressSet, Address, B256, U256};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
     BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
@@ -30,15 +31,13 @@ use reth_metrics::{
 };
 use reth_node_api::{NewPayloadError, PayloadTypes};
 use reth_primitives_traits::{
-    constants::GAS_LIMIT_BOUND_DIVISOR, BlockBody, GotExpected, NodePrimitives, RecoveredBlock,
-    SealedBlock, SealedHeaderFor,
+    BlockBody, GotExpected, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeaderFor,
 };
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase};
 use reth_rpc_api::BlockSubmissionValidationApiServer;
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
-use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
+use reth_storage_api::{BlockReaderIdExt, HashedPostStateProvider, StateProviderFactory};
 use reth_tasks::Runtime;
-use revm_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -127,7 +126,7 @@ where
         block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
         message: BidTrace,
         registered_gas_limit: u64,
-        _decoded_bal: Option<DecodedBal>,
+        decoded_bal: Option<DecodedBal>,
     ) -> Result<(), ValidationApiError> {
         self.validate_message_against_header(block.sealed_header(), &message)?;
 
@@ -174,41 +173,70 @@ where
         };
 
         self.consensus.validate_header_against_parent(block.sealed_header(), &parent_header)?;
-        self.validate_gas_limit(registered_gas_limit, &parent_header, block.sealed_header())?;
+        parent_header.validate_gas_limit(registered_gas_limit, block.gas_limit()).map_err(
+            |err| {
+                ValidationApiError::GasLimitMismatch(GotExpected {
+                    got: err.got,
+                    expected: err.expected,
+                })
+            },
+        )?;
+
+        // Ensure the submitted block access list does not exceed the block gas limit (EIP-7928)
+        if let Some(decoded_bal) = decoded_bal {
+            decoded_bal
+                .as_bal()
+                .validate_gas_limit(block.gas_limit())
+                .map_err(ConsensusError::from)?;
+        }
+
         let parent_header_hash = parent_header.hash();
         let state_provider = self.provider.state_by_block_hash(parent_header_hash)?;
 
         let mut request_cache = self.cached_reads(parent_header_hash).await;
 
-        let cached_db = request_cache.as_db_mut(StateProviderDatabase::new(&state_provider));
-        let executor = self.evm_config.batch_executor(cached_db);
+        let (output, block_access_list_hash) = {
+            let cached_db = request_cache.as_db_mut(StateProviderDatabase::new(&state_provider));
+            let mut executor = self.evm_config.batch_executor(cached_db);
 
-        let mut accessed_blacklisted = None;
-        let output = executor.execute_with_state_closure(&block, |state| {
+            let result = executor.execute_one(&block)?;
+
+            // The executor rebuilds the block access list whenever the block header contains a
+            // BAL hash. Comparing the rebuilt hash against the header post execution also
+            // commits to the submitted access list, because the header's BAL hash is derived
+            // from the submitted bytes.
+            let block_access_list_hash =
+                executor.take_bal().map(|bal| compute_block_access_list_hash(&bal));
+
+            let mut state = executor.into_state();
             if !self.disallow.is_empty() {
-                // Check whether the submission interacted with any blacklisted account by scanning
-                // the `State`'s cache that records everything read from database during execution.
+                // Check whether the submission interacted with any blacklisted account by
+                // scanning the `State`'s cache that records everything read from database
+                // during execution.
                 for account in state.cache.accounts.keys() {
                     if self.disallow.contains(account) {
-                        accessed_blacklisted = Some(*account);
+                        return Err(ValidationApiError::Blacklist(*account))
                     }
                 }
             }
-        })?;
 
-        if let Some(account) = accessed_blacklisted {
-            return Err(ValidationApiError::Blacklist(account))
-        }
+            (BlockExecutionOutput { state: state.take_bundle(), result }, block_access_list_hash)
+        };
 
         // update the cached reads
         self.update_cached_reads(parent_header_hash, request_cache).await;
 
-        self.consensus.validate_block_post_execution(&block, &output, None, None)?;
+        self.consensus.validate_block_post_execution(
+            &block,
+            &output,
+            None,
+            block_access_list_hash,
+        )?;
 
         self.ensure_payment(&block, &output, &message)?;
 
-        let state_root =
-            state_provider.state_root(state_provider.hashed_post_state(&output.state))?;
+        let hashed_state = state_provider.hashed_post_state(&output.state)?;
+        let state_root = state_provider.state_root(hashed_state)?;
 
         if state_root != block.header().state_root() {
             return Err(ConsensusError::BodyStateRootDiff(
@@ -249,34 +277,6 @@ where
         } else {
             Ok(())
         }
-    }
-
-    /// Ensures that the chosen gas limit is the closest possible value for the validator's
-    /// registered gas limit.
-    ///
-    /// Ref: <https://github.com/flashbots/builder/blob/a742641e24df68bc2fc476199b012b0abce40ffe/core/blockchain.go#L2474-L2477>
-    fn validate_gas_limit(
-        &self,
-        registered_gas_limit: u64,
-        parent_header: &SealedHeaderFor<E::Primitives>,
-        header: &SealedHeaderFor<E::Primitives>,
-    ) -> Result<(), ValidationApiError> {
-        let max_gas_limit =
-            parent_header.gas_limit() + parent_header.gas_limit() / GAS_LIMIT_BOUND_DIVISOR - 1;
-        let min_gas_limit =
-            parent_header.gas_limit() - parent_header.gas_limit() / GAS_LIMIT_BOUND_DIVISOR + 1;
-
-        let best_gas_limit =
-            std::cmp::max(min_gas_limit, std::cmp::min(max_gas_limit, registered_gas_limit));
-
-        if best_gas_limit != header.gas_limit() {
-            return Err(ValidationApiError::GasLimitMismatch(GotExpected {
-                got: header.gas_limit(),
-                expected: best_gas_limit,
-            }))
-        }
-
-        Ok(())
     }
 
     /// Ensures that the proposer has received [`BidTrace::value`] for this block.
@@ -725,6 +725,10 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             ValidationApiError::InvalidBlockAccessList(_) |
             ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
 
+            ValidationApiError::Consensus(
+                error @ (ConsensusError::BlockAccessListCostMoreThanGasLimit(_) |
+                ConsensusError::BlockAccessListHashMismatch(_)),
+            ) => invalid_params_rpc_err(error.to_string()),
             ValidationApiError::MissingLatestBlock |
             ValidationApiError::MissingParentBlock |
             ValidationApiError::BlockTooOld |
@@ -755,7 +759,7 @@ pub(crate) struct ValidationMetrics {
 #[cfg(test)]
 mod tests {
     use super::{hash_disallow_list, AddressSet};
-    use revm_primitives::Address;
+    use alloy_primitives::Address;
 
     #[test]
     fn test_hash_disallow_list_deterministic() {
