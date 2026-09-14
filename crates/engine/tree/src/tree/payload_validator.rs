@@ -474,6 +474,7 @@ where
         V: PayloadValidator<T, Block = N::Block> + Clone,
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
         TxTy<N>: reth_firehose::mapper::SignatureFields,
+        Evm: reth_firehose::FirehoseLiveHooks,
     {
         let parent_hash = input.parent_hash();
         let _txpool_pause = self.txpool_prewarm.as_ref().map(txpool_prewarm::Handle::pause);
@@ -1180,8 +1181,9 @@ where
     ///   - the EVM is constructed via `evm_with_env_and_inspector` with a [`FirehoseInspector`]
     ///     borrowed from the supplied `tracer`;
     ///   - the resulting executor is wrapped in a
-    ///     [`reth_firehose::executor::FirehoseWrappedExecutor`] so system-call boundaries and
-    ///     withdrawals are funnelled into the tracer.
+    ///     [`reth_firehose::executor::FirehoseWrappedExecutor`] carrying the chain hooks selected
+    ///     by [`reth_firehose::FirehoseLiveHooks`], so system-call boundaries, withdrawals and
+    ///     chain-specific balance changes are funnelled into the tracer.
     ///
     /// JIT support is never enabled here: JIT-compiled code does not drive the inspector hooks the
     /// tracer depends on.
@@ -1192,9 +1194,9 @@ where
     /// against upstream minimal and localized: upstream's `execute_block` stays pristine, and the
     /// Firehose-specific wiring lives here.
     #[expect(clippy::type_complexity)]
-    fn execute_and_trace_block<S, Err, T>(
+    fn execute_and_trace_block<Err, T>(
         &mut self,
-        state_provider: S,
+        state_provider: StateProviderBox,
         env: ExecutionEnv<Evm>,
         input: &BlockOrPayload<T>,
         handle: &mut PayloadHandle<impl ExecutableTxFor<Evm>, Err, N::Receipt>,
@@ -1210,12 +1212,12 @@ where
         InsertBlockErrorKind,
     >
     where
-        S: StateProvider + Send,
         Err: core::error::Error + Send + Sync + 'static,
         V: PayloadValidator<T, Block = N::Block>,
         T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
         TxTy<N>: reth_firehose::mapper::SignatureFields,
+        Evm: reth_firehose::FirehoseLiveHooks,
     {
         debug!(target: "engine::tree::payload_validator", "Executing block (with Firehose tracing)");
 
@@ -1242,12 +1244,17 @@ where
             (spec_id, inner)
         };
 
-        // Firehose-specific: wrap the inner executor so EIP-4895 withdrawal balance changes and
-        // system-call boundaries are emitted as tracer events.
+        // Firehose-specific: wrap the inner executor so EIP-4895 withdrawal balance changes,
+        // system-call boundaries and the chain's own per-transaction hooks are emitted as tracer
+        // events.
         let withdrawals =
             input.withdrawals().map(|w| alloy_eips::eip4895::Withdrawals::new(w.to_vec()));
-        let mut executor =
-            reth_firehose::executor::FirehoseWrappedExecutor::new(inner_executor, withdrawals);
+        let mut executor = reth_firehose::executor::FirehoseWrappedExecutor::with_hooks(
+            inner_executor,
+            withdrawals,
+            <Evm as reth_firehose::FirehoseLiveHooks>::PreTxAdjust::default(),
+            <Evm as reth_firehose::FirehoseLiveHooks>::PostTxExtras::default(),
+        );
 
         if !self.config.precompile_cache_disabled() {
             let _span = debug_span!(target: "engine::tree", "setup_precompile_cache").entered();
@@ -2018,6 +2025,7 @@ where
     Evm: ConfigureEngineEvm<Types::ExecutionData, Primitives = N> + 'static,
     Types: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
     TxTy<N>: reth_firehose::mapper::SignatureFields,
+    Evm: reth_firehose::FirehoseLiveHooks,
 {
     fn validate_payload_attributes_against_header(
         &self,
