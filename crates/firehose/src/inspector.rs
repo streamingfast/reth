@@ -39,6 +39,42 @@ struct StepContext {
     keccak_preimage: Option<(B256, Vec<u8>)>,
 }
 
+/// Gas-fee parameters for the post-transaction `GasRefund` and `RewardTransactionFee` balance
+/// changes of one transaction.
+///
+/// [`PostTxGasAccounting::ethereum`] reproduces Ethereum: unused gas is refunded at the effective
+/// gas price and the beneficiary is credited the priority fee of every consumed gas unit, the base
+/// fee being burned. Chains that price gas differently (a base fee that is not burned, a data fee
+/// credited to the beneficiary, gas paid in something other than the native balance) return their
+/// own values from [`crate::PostTxExtras::gas_accounting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostTxGasAccounting {
+    /// Wei refunded to the sender per unit of unused gas.
+    pub refund_gas_price: u128,
+    /// Wei credited to the beneficiary per unit of consumed gas.
+    pub reward_gas_price: u128,
+    /// Wei credited to the beneficiary on top of `reward_gas_price * gas_used`, in the same
+    /// `RewardTransactionFee` change.
+    pub extra_reward: U256,
+}
+
+impl PostTxGasAccounting {
+    /// Ethereum accounting for a transaction paying `effective_gas_price` in a block whose base
+    /// fee is `base_fee` (0 before London).
+    pub const fn ethereum(effective_gas_price: u128, base_fee: u64) -> Self {
+        Self {
+            refund_gas_price: effective_gas_price,
+            reward_gas_price: effective_gas_price.saturating_sub(base_fee as u128),
+            extra_reward: U256::ZERO,
+        }
+    }
+
+    /// Accounting for a transaction that moves no native balance for gas.
+    pub const fn none() -> Self {
+        Self { refund_gas_price: 0, reward_gas_price: 0, extra_reward: U256::ZERO }
+    }
+}
+
 /// FirehoseInspector captures execution traces for the Firehose format
 /// It hooks into EVM execution via the Inspector trait to build a complete call tree
 pub struct FirehoseInspector<'a> {
@@ -1079,15 +1115,45 @@ impl<'a> FirehoseInspector<'a> {
         effective_gas_price: u128,
         base_fee: u64,
         committed_log_count: u32,
+        get_pre_tx_balance: F,
+    ) where
+        F: FnMut(Address) -> U256,
+    {
+        self.process_post_tx_gas_accounting(
+            sender,
+            coinbase,
+            gas_limit,
+            gas_used,
+            PostTxGasAccounting::ethereum(effective_gas_price, base_fee),
+            committed_log_count,
+            get_pre_tx_balance,
+        );
+    }
+
+    /// Same as [`Self::process_post_tx_balance_changes`] with chain-supplied gas-fee
+    /// parameters instead of Ethereum's.
+    ///
+    /// The refund is `(gas_limit - gas_used) * accounting.refund_gas_price` and the reward is
+    /// `gas_used * accounting.reward_gas_price + accounting.extra_reward`; each change is only
+    /// emitted when its amount is non-zero.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_post_tx_gas_accounting<F>(
+        &mut self,
+        sender: Address,
+        coinbase: Address,
+        gas_limit: u64,
+        gas_used: u64,
+        accounting: PostTxGasAccounting,
+        committed_log_count: u32,
         mut get_pre_tx_balance: F,
     ) where
         F: FnMut(Address) -> U256,
     {
         use pb::sf::ethereum::r#type::v2::balance_change::Reason;
 
-        let gas_buy_cost = U256::from(gas_limit) * U256::from(effective_gas_price);
+        let gas_buy_cost = U256::from(gas_limit) * U256::from(accounting.refund_gas_price);
         let remaining_gas = gas_limit.saturating_sub(gas_used);
-        let refund_amount = U256::from(remaining_gas) * U256::from(effective_gas_price);
+        let refund_amount = U256::from(remaining_gas) * U256::from(accounting.refund_gas_price);
 
         // Derive sender's balance after execution (before gas refund). Seed with the
         // post-pre-exec balance captured at root call entry — this is the only reliable
@@ -1106,7 +1172,7 @@ impl<'a> FirehoseInspector<'a> {
             &mut get_pre_tx_balance,
         );
 
-        // Gas refund to sender: reimburse unused gas at effective_gas_price.
+        // Gas refund to sender: reimburse unused gas at the refund gas price.
         // gas_used from ExecutionResult already accounts for the capped refund counter,
         // so remaining_gas = gas_limit - gas_used includes both unspent gas and EVM refunds.
         if remaining_gas > 0 {
@@ -1114,13 +1180,12 @@ impl<'a> FirehoseInspector<'a> {
             self.tracer.on_balance_change(sender, sender_balance, new_balance, Reason::GasRefund);
         }
 
-        // Coinbase reward: the priority fee portion of consumed gas.
-        // Post-EIP-1559 the base fee is burned, only the tip goes to the coinbase.
-        // Pre-EIP-1559 (base_fee == 0) the entire gas price goes to coinbase.
-        let priority_fee_per_gas = effective_gas_price.saturating_sub(base_fee as u128);
-        if gas_used > 0 && priority_fee_per_gas > 0 {
-            let reward_amount = U256::from(gas_used) * U256::from(priority_fee_per_gas);
-
+        // Coinbase reward. With Ethereum accounting this is the priority fee portion of consumed
+        // gas: post-EIP-1559 the base fee is burned, pre-EIP-1559 (base_fee == 0) the entire gas
+        // price goes to coinbase.
+        let reward_amount = (U256::from(gas_used) * U256::from(accounting.reward_gas_price))
+            .saturating_add(accounting.extra_reward);
+        if !reward_amount.is_zero() {
             // When sender == coinbase, the gas refund event was emitted first; use the
             // sender's updated balance as the coinbase's old_balance. Otherwise derive
             // independently from the journal snapshot (coinbase has no gas-buy BalanceChange,
@@ -1697,6 +1762,19 @@ pub trait FirehoseInspectorApi {
         get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
     );
 
+    /// Type-erased version of [`FirehoseInspector::process_post_tx_gas_accounting`].
+    #[allow(clippy::too_many_arguments)]
+    fn process_post_tx_gas_accounting_erased(
+        &mut self,
+        sender: Address,
+        coinbase: Address,
+        gas_limit: u64,
+        gas_used: u64,
+        accounting: PostTxGasAccounting,
+        committed_log_count: u32,
+        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
+    );
+
     /// Type-erased version of [`FirehoseInspector::post_tx_balance`].
     ///
     /// Chain-specific [`PostTxExtras`](crate::PostTxExtras) impls call this to obtain the
@@ -1742,6 +1820,27 @@ impl<'a> FirehoseInspectorApi for FirehoseInspector<'a> {
             base_fee,
             committed_log_count,
             |addr| get_pre_tx_balance(addr),
+        );
+    }
+
+    fn process_post_tx_gas_accounting_erased(
+        &mut self,
+        sender: Address,
+        coinbase: Address,
+        gas_limit: u64,
+        gas_used: u64,
+        accounting: PostTxGasAccounting,
+        committed_log_count: u32,
+        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
+    ) {
+        self.process_post_tx_gas_accounting(
+            sender,
+            coinbase,
+            gas_limit,
+            gas_used,
+            accounting,
+            committed_log_count,
+            get_pre_tx_balance,
         );
     }
 
@@ -2803,6 +2902,184 @@ mod tests {
         drop(tracer);
 
         buffer.get_bytes()
+    }
+
+    const COINBASE: Address = Address::repeat_byte(0xcb);
+
+    /// Drives one transaction whose root call targets an empty account, then applies the given
+    /// post-tx gas accounting through the production method and returns the decoded block.
+    /// The sender's live balance is captured by the depth-0 hook, as on a real transaction.
+    fn drive_gas_accounting(
+        gas_limit: u64,
+        gas_used: u64,
+        accounting: PostTxGasAccounting,
+    ) -> pb::sf::ethereum::r#type::v2::Block {
+        use reth_revm::{
+            bytecode::Bytecode,
+            revm::{
+                context::Context,
+                database::{CacheDB, EmptyDB},
+                interpreter::{
+                    interpreter_action::CallScheme, CallInput, CallValue, Gas, InstructionResult,
+                    InterpreterResult,
+                },
+                state::AccountInfo,
+                MainContext,
+            },
+        };
+
+        let sender_balance = U256::from(1_000_000u64);
+        let coinbase_balance = U256::from(50u64);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            SENDER,
+            AccountInfo { balance: sender_balance, ..Default::default() },
+        );
+        db.insert_account_info(
+            COINBASE,
+            AccountInfo { balance: coinbase_balance, ..Default::default() },
+        );
+        db.insert_account_info(PRECOMPILE, AccountInfo::default());
+        let mut ctx = Context::mainnet().with_db(db);
+        ctx.journal_mut().load_account(SENDER).expect("load sender");
+
+        let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+            firehose_tracer::config::Config::default(),
+            firehose_tracer::config::ChainConfig {
+                chain_id: 2818,
+                shanghai_time: Some(0),
+                cancun_time: Some(0),
+                prague_time: None,
+                verkle_time: None,
+            },
+            "reth-firehose-test",
+            "0",
+        );
+
+        {
+            let mut insp = FirehoseInspector::new(&mut tracer);
+            insp.tracer_mut().on_block_start(firehose_tracer::types::BlockEvent {
+                block: firehose_tracer::types::BlockData { number: 2, ..Default::default() },
+                finalized: None,
+                flash_block: None,
+            });
+            insp.tracer_mut().on_tx_start(legacy_tx_event(), None);
+
+            let mut inputs = CallInputs {
+                input: CallInput::Bytes(Bytes::new()),
+                return_memory_offset: 0..0,
+                gas_limit,
+                reservoir: 0,
+                bytecode_address: PRECOMPILE,
+                known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
+                target_address: PRECOMPILE,
+                caller: SENDER,
+                value: CallValue::Transfer(U256::ZERO),
+                scheme: CallScheme::Call,
+                is_static: false,
+                charged_new_account_state_gas: false,
+            };
+            let _ = insp.call(&mut ctx, &mut inputs);
+            let mut outcome = CallOutcome {
+                result: InterpreterResult {
+                    result: InstructionResult::Stop,
+                    output: Bytes::new(),
+                    gas: Gas::new(gas_limit),
+                },
+                memory_offset: 0..0,
+                was_precompile_called: false,
+                precompile_call_logs: Vec::new(),
+                charged_new_account_state_gas: false,
+            };
+            insp.call_end(&mut ctx, &inputs, &mut outcome);
+
+            insp.process_post_tx_gas_accounting(
+                SENDER,
+                COINBASE,
+                gas_limit,
+                gas_used,
+                accounting,
+                0,
+                |address| if address == COINBASE { coinbase_balance } else { sender_balance },
+            );
+
+            let receipt = firehose_tracer::types::ReceiptData::new(0, gas_used, 1, gas_used);
+            insp.tracer_mut().on_tx_end(Some(&receipt), None);
+        }
+
+        tracer.on_block_end(None);
+        drop(tracer);
+
+        decode_fire_block(&buffer.get_bytes())
+    }
+
+    fn fee_changes(
+        block: &pb::sf::ethereum::r#type::v2::Block,
+    ) -> Vec<(Address, pb::sf::ethereum::r#type::v2::balance_change::Reason, U256, U256)> {
+        use pb::sf::ethereum::r#type::v2::balance_change::Reason;
+
+        let big = |value: &Option<pb::sf::ethereum::r#type::v2::BigInt>| {
+            value.as_ref().map(|v| U256::from_be_slice(&v.bytes)).unwrap_or_default()
+        };
+        block.transaction_traces[0].calls[0]
+            .balance_changes
+            .iter()
+            .filter_map(|change| {
+                let reason = Reason::try_from(change.reason).ok()?;
+                matches!(reason, Reason::GasRefund | Reason::RewardTransactionFee).then(|| {
+                    (
+                        Address::from_slice(&change.address),
+                        reason,
+                        big(&change.old_value),
+                        big(&change.new_value),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// The Ethereum accounting refunds unused gas at the effective price and credits only the
+    /// priority fee, exactly as `process_post_tx_balance_changes` always did.
+    #[test]
+    fn gas_accounting_ethereum_matches_legacy_method() {
+        use pb::sf::ethereum::r#type::v2::balance_change::Reason;
+
+        let block = drive_gas_accounting(100, 60, PostTxGasAccounting::ethereum(10, 4));
+        assert_eq!(
+            fee_changes(&block),
+            vec![
+                (SENDER, Reason::GasRefund, U256::from(1_000_000u64), U256::from(1_000_400u64)),
+                (COINBASE, Reason::RewardTransactionFee, U256::from(50u64), U256::from(410u64)),
+            ]
+        );
+    }
+
+    /// A chain that does not burn the base fee and charges an extra data fee credits both in a
+    /// single `RewardTransactionFee` change.
+    #[test]
+    fn gas_accounting_extra_reward_is_one_change() {
+        use pb::sf::ethereum::r#type::v2::balance_change::Reason;
+
+        let accounting = PostTxGasAccounting {
+            refund_gas_price: 10,
+            reward_gas_price: 10,
+            extra_reward: U256::from(7u64),
+        };
+        let block = drive_gas_accounting(100, 60, accounting);
+        assert_eq!(
+            fee_changes(&block),
+            vec![
+                (SENDER, Reason::GasRefund, U256::from(1_000_000u64), U256::from(1_000_400u64)),
+                (COINBASE, Reason::RewardTransactionFee, U256::from(50u64), U256::from(657u64)),
+            ]
+        );
+    }
+
+    /// Gas not paid from the native balance produces neither a refund nor a reward.
+    #[test]
+    fn gas_accounting_none_emits_no_fee_changes() {
+        let block = drive_gas_accounting(100, 60, PostTxGasAccounting::none());
+        assert!(fee_changes(&block).is_empty());
     }
 
     fn legacy_tx_event() -> firehose_tracer::types::TxEvent {
