@@ -19,6 +19,16 @@ use std::{
     fmt::Debug,
 };
 
+/// The largest preimage, in bytes, recorded in `Call.keccak_preimages`. The map exists so a
+/// consumer can walk a storage slot back to the expression that produced it, and Solidity's slot
+/// derivations are all small: 32 bytes for a dynamic array or a long `bytes`/`string`, 64 bytes
+/// for a mapping with a value-type key (one level per nesting), and 32 bytes plus the key for a
+/// `mapping(string => V)` or `mapping(bytes => V)`. 256 bytes covers those with room for a
+/// 224-byte dynamic key. Anything larger is contract-level hashing, not slot derivation, and is
+/// dropped rather than truncated: a truncated preimage does not hash back to its key and would be
+/// worse than no entry at all.
+const MAX_KECCAK_PREIMAGE_SIZE: usize = 256;
+
 struct StepContext {
     start_journal_idx: usize,
     opcode: u8,
@@ -197,6 +207,10 @@ impl<'a> FirehoseInspector<'a> {
         };
 
         let len = size.saturating_to::<usize>();
+        if len > MAX_KECCAK_PREIMAGE_SIZE {
+            return None;
+        }
+
         if len == 0 {
             return Some((alloy_primitives::utils::KECCAK256_EMPTY, Vec::new()));
         }
@@ -213,12 +227,10 @@ impl<'a> FirehoseInspector<'a> {
             // Memory not yet resized (step fires before resize_memory!).
             // Zero-pad like Geth's Memory.GetPtr to produce a complete preimage.
             //
-            // `size` is an untrusted stack operand. Growing memory to cover it
-            // costs quadratic gas (3*w + w^2/512, w = words). Anything the
-            // remaining gas can't pay for OOG-reverts before the opcode runs, so
-            // step_end never emits this preimage. Cap the zero-pad allocation to
-            // that gas-affordable bound so a beefy machine doesn't allocate GBs
-            // for a keccak Ethereum would reject anyway (and never overflows).
+            // Growing memory to cover `size` costs quadratic gas (3*w + w^2/512,
+            // w = words). Anything the remaining gas can't pay for OOG-reverts
+            // before the opcode runs, so step_end never emits this preimage; skip
+            // it here as well rather than hashing a region that never existed.
             //
             // From 3*w + w^2/512 <= gas, a generous bound is w <= floor(sqrt(512*gas))
             // (dropping the +3*w term only makes the cap larger, never rejecting a
