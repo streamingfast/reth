@@ -30,7 +30,7 @@ use std::{collections::HashMap, fmt::Debug};
 
 use crate::{
     block_tracer::FirehoseBlockTracer,
-    inspector::{FirehoseInspector, FirehoseInspectorApi},
+    inspector::{FirehoseInspector, FirehoseInspectorApi, PostTxGasAccounting},
     mapper,
     mapper::SignatureFields,
 };
@@ -78,6 +78,16 @@ where
     /// Emit chain-specific post-tx balance changes. `gas_used` is the post-refund gas
     /// charged to the sender; `base_fee` is the block's EIP-1559 base fee (0 pre-London).
     fn emit_post_tx_extras(&self, evm: &mut E, gas_used: u64, base_fee: u64);
+
+    /// Gas-fee parameters for the generic `GasRefund` / `RewardTransactionFee` changes of the
+    /// current transaction, which is still available through `evm.ctx()`.
+    ///
+    /// `ethereum` holds the Ethereum parameters derived from the transaction envelope and the
+    /// block base fee; the default returns it unchanged. Runs before those changes are emitted
+    /// and before [`Self::emit_post_tx_extras`].
+    fn gas_accounting(&self, _evm: &mut E, ethereum: PostTxGasAccounting) -> PostTxGasAccounting {
+        ethereum
+    }
 }
 
 /// No-op [`PostTxExtras`] used on Ethereum mainnet (and any chain whose fee distribution is
@@ -383,8 +393,12 @@ where
         } else {
             gas_price_opt.unwrap_or(0)
         };
+        let accounting = self.extras.gas_accounting(
+            self.inner.evm_mut(),
+            PostTxGasAccounting::ethereum(effective_gas_price, base_fee),
+        );
 
-        // Post-tx balance changes (gas refund to sender, priority fee to coinbase). The DB at
+        // Post-tx balance changes (gas refund to sender, fee reward to coinbase). The DB at
         // this point reflects state up to but not including this transaction's commit, so
         // db.basic(addr) reads the pre-tx balance.
         {
@@ -392,13 +406,12 @@ where
             let mut get_pre = |addr: Address| -> U256 {
                 evm_db.basic(addr).ok().flatten().map(|i| i.balance).unwrap_or(U256::ZERO)
             };
-            inspector.process_post_tx_balance_changes_erased(
+            inspector.process_post_tx_gas_accounting_erased(
                 sender,
                 coinbase,
                 gas_limit,
                 gas_used,
-                effective_gas_price,
-                base_fee,
+                accounting,
                 committed_log_count,
                 &mut get_pre,
             );
