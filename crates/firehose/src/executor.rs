@@ -25,6 +25,11 @@
 //!
 //! If the executor is dropped before either, the stashed [`FirehoseBlockTracer`] is dropped,
 //! which emits `on_block_end(Some(err))` and discards the block.
+//!
+//! Only `execute_and_trace_one` traces. Every other [`Executor`] method, `execute` included, runs
+//! untraced: callers other than staged sync use them to re-execute blocks for other purposes
+//! (single-block ExEx backfill, for example), often blocks that were already emitted, and
+//! `execute` would flush a block before its caller validated it.
 
 use std::{collections::HashMap, fmt::Debug};
 
@@ -45,7 +50,7 @@ use reth_evm::{
     execute::{BlockExecutionError, Executor},
     ConfigureEvm, Evm as _, EvmFor, OnStateHook,
 };
-use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
+use reth_execution_types::BlockExecutionResult;
 use reth_node_api::NodePrimitives;
 use reth_primitives_traits::{Block as BlockTrait, BlockBody, BlockTy, RecoveredBlock, TxTy};
 use reth_provider::StateProviderBox;
@@ -679,9 +684,9 @@ where
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
         if !crate::is_tracer_initialized() {
-            return Err(BlockExecutionError::msg(
-                "FirehoseBlockExecutor requires the global tracer to be initialized for execute_and_trace_one",
-            ));
+            // Tracing disabled (e.g. FIREHOSE_DISABLED kill-switch): run the plain untraced
+            // executor so the node behaves exactly like the un-instrumented upstream.
+            return self.execute_one(block);
         }
 
         // The previous block has reached a point where the caller would have returned early on
@@ -714,26 +719,6 @@ where
                 Err(e)
             }
         }
-    }
-
-    /// Overrides the trait default so that `execute()` — the single-block convenience method used
-    /// by the pipeline and any other call site that doesn't know about Firehose — automatically
-    /// routes through [`Self::execute_and_trace_one`] when the global tracer is active.
-    ///
-    /// Without this override, the provided `execute()` calls `execute_one()` unconditionally,
-    /// which skips inspector attachment and produces no `FIRE BLOCK` output for historical blocks.
-    fn execute(
-        mut self,
-        block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
-    ) -> Result<BlockExecutionOutput<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
-    {
-        let result = if crate::is_tracer_initialized() {
-            self.execute_and_trace_one(block)?
-        } else {
-            self.execute_one(block)?
-        };
-        let mut state = self.into_state();
-        Ok(BlockExecutionOutput { state: state.take_bundle(), result })
     }
 
     fn execute_one_with_state_hook<S>(
