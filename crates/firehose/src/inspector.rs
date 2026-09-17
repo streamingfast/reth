@@ -31,6 +31,9 @@ const MAX_KECCAK_PREIMAGE_SIZE: usize = 256;
 
 struct StepContext {
     start_journal_idx: usize,
+    pc: u64,
+    gas: u64,
+    depth: i32,
     opcode: u8,
     /// For KECCAK256: preimage captured in `step` (where stack still holds offset/size),
     /// emitted from `step_end` only when the opcode did not halt. Mirrors Geth's firehose
@@ -1362,7 +1365,12 @@ where
 
         let start_journal_idx = journal.journal().len();
 
-        self.tracer.on_opcode(pc, op, gas, 0, &[], depth, None);
+        // SELFDESTRUCT is reported from `step_end`, once it is known whether the instruction
+        // table defines it: the tracer marks the call as self-destructed as soon as it is told
+        // the opcode runs, and a chain may replace SELFDESTRUCT with an undefined instruction.
+        if op != Opcode::SelfDestruct as u8 {
+            self.tracer.on_opcode(pc, op, gas, 0, &[], depth, None);
+        }
 
         // For KECCAK256, capture the (hash, preimage) now while the stack still holds
         // offset/size, but defer emission to `step_end` so that we only record preimages
@@ -1372,7 +1380,8 @@ where
         let keccak_preimage =
             (op == Opcode::Keccak256 as u8).then(|| Self::step_keccak256(interp)).flatten();
 
-        self.last_step = Some(StepContext { start_journal_idx, opcode: op, keccak_preimage });
+        self.last_step =
+            Some(StepContext { start_journal_idx, pc, gas, depth, opcode: op, keccak_preimage });
     }
 
     /// Called after each opcode executes; used to detect SSTORE and SELFDESTRUCT state changes.
@@ -1420,7 +1429,33 @@ where
                 self.storage_processed_up_to = context.journal().journal().len();
             }
         } else if step_ctx.opcode == Opcode::SelfDestruct as u8 {
-            self.process_selfdestruct_balance_changes(context, step_ctx.start_journal_idx);
+            use reth_revm::revm::interpreter::InstructionResult;
+
+            if interp.bytecode.instruction_result() == Some(InstructionResult::OpcodeNotFound) {
+                // The instruction table does not define 0xff: the frame halted on an undefined
+                // opcode and nothing self-destructed.
+                let err = StringError("opcode not found".to_string());
+                self.tracer.on_opcode(
+                    step_ctx.pc,
+                    step_ctx.opcode,
+                    step_ctx.gas,
+                    0,
+                    &[],
+                    step_ctx.depth,
+                    Some(&err),
+                );
+            } else {
+                self.tracer.on_opcode(
+                    step_ctx.pc,
+                    step_ctx.opcode,
+                    step_ctx.gas,
+                    0,
+                    &[],
+                    step_ctx.depth,
+                    None,
+                );
+                self.process_selfdestruct_balance_changes(context, step_ctx.start_journal_idx);
+            }
         }
     }
 
@@ -3080,6 +3115,143 @@ mod tests {
     fn gas_accounting_none_emits_no_fee_changes() {
         let block = drive_gas_accounting(100, 60, PostTxGasAccounting::none());
         assert!(fee_changes(&block).is_empty());
+    }
+
+    #[test]
+    fn executed_selfdestruct_marks_call_as_suicide() {
+        use reth_revm::revm::interpreter::InstructionResult;
+
+        let block = decode_fire_block(&drive_lone_selfdestruct(InstructionResult::SelfDestruct));
+        let call = block.transaction_traces[0].calls.first().expect("one call");
+
+        assert!(call.suicide, "an executed SELFDESTRUCT must mark the call as self-destructed");
+        assert!(!call.status_failed, "an executed SELFDESTRUCT succeeds");
+    }
+
+    /// A chain can replace SELFDESTRUCT with an undefined instruction. The frame then halts on
+    /// `OpcodeNotFound` without self-destructing, so the call must not be reported as a suicide.
+    #[test]
+    fn undefined_selfdestruct_does_not_mark_call_as_suicide() {
+        use reth_revm::revm::interpreter::InstructionResult;
+
+        let block = decode_fire_block(&drive_lone_selfdestruct(InstructionResult::OpcodeNotFound));
+        let call = block.transaction_traces[0].calls.first().expect("one call");
+
+        assert!(
+            !call.suicide,
+            "an undefined SELFDESTRUCT must not mark the call as self-destructed"
+        );
+        assert!(call.status_failed, "a frame halting on an undefined opcode fails");
+    }
+
+    /// Contract whose code is a lone `0xff` byte.
+    const SELFDESTRUCT_CONTRACT: Address = Address::repeat_byte(0xdd);
+
+    /// Drives one transaction calling [`SELFDESTRUCT_CONTRACT`] through the inspector's `call`,
+    /// `step`, `step_end` and `call_end` hooks, with the `0xff` instruction halting the frame on
+    /// `result`: `SelfDestruct` when the instruction table defines SELFDESTRUCT, `OpcodeNotFound`
+    /// when a chain replaced it with an undefined instruction. Returns the raw FIRE output buffer.
+    fn drive_lone_selfdestruct(result: reth_revm::revm::interpreter::InstructionResult) -> Vec<u8> {
+        use reth_revm::{
+            bytecode::Bytecode,
+            revm::{
+                context::Context,
+                database::{CacheDB, EmptyDB},
+                interpreter::{
+                    interpreter::ExtBytecode, interpreter_action::CallScheme, CallInput, CallValue,
+                    Gas, Interpreter, InterpreterResult,
+                },
+                state::AccountInfo,
+                MainContext,
+            },
+        };
+
+        let gas_limit = 100_000;
+        let code = Bytecode::new_raw(Bytes::from_static(&[0xff]));
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            SELFDESTRUCT_CONTRACT,
+            AccountInfo {
+                code_hash: code.hash_slow(),
+                code: Some(code.clone()),
+                ..Default::default()
+            },
+        );
+        let mut ctx = Context::mainnet().with_db(db);
+
+        let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+            firehose_tracer::config::Config::default(),
+            firehose_tracer::config::ChainConfig {
+                chain_id: 1,
+                shanghai_time: Some(0),
+                cancun_time: Some(0),
+                prague_time: None,
+                verkle_time: None,
+            },
+            "reth-firehose-test",
+            "0",
+        );
+
+        {
+            let mut insp = FirehoseInspector::new(&mut tracer);
+            insp.tracer_mut().on_block_start(firehose_tracer::types::BlockEvent {
+                block: firehose_tracer::types::BlockData { number: 1, ..Default::default() },
+                finalized: None,
+                flash_block: None,
+            });
+            insp.tracer_mut().on_tx_start(
+                firehose_tracer::types::TxEvent {
+                    to: Some(SELFDESTRUCT_CONTRACT),
+                    ..legacy_tx_event()
+                },
+                None,
+            );
+
+            let mut inputs = CallInputs {
+                input: CallInput::Bytes(Bytes::new()),
+                return_memory_offset: 0..0,
+                gas_limit,
+                reservoir: 0,
+                bytecode_address: SELFDESTRUCT_CONTRACT,
+                known_bytecode: (code.hash_slow(), code.clone()),
+                target_address: SELFDESTRUCT_CONTRACT,
+                caller: SENDER,
+                value: CallValue::Transfer(U256::ZERO),
+                scheme: CallScheme::Call,
+                is_static: false,
+                charged_new_account_state_gas: false,
+            };
+            let _ = insp.call(&mut ctx, &mut inputs);
+
+            // Stand-in for the interpreter loop running the lone instruction: `step`, the
+            // instruction halting the frame, then `step_end`.
+            let mut interp = Interpreter { bytecode: ExtBytecode::new(code), ..Default::default() };
+            insp.step(&mut interp, &mut ctx);
+            interp.halt(result);
+            insp.step_end(&mut interp, &mut ctx);
+
+            let mut outcome = CallOutcome {
+                result: InterpreterResult {
+                    result,
+                    output: Bytes::new(),
+                    gas: Gas::new(gas_limit),
+                },
+                memory_offset: 0..0,
+                was_precompile_called: false,
+                precompile_call_logs: Vec::new(),
+                charged_new_account_state_gas: false,
+            };
+            insp.call_end(&mut ctx, &inputs, &mut outcome);
+
+            let status = if result.is_ok() { 1 } else { 0 };
+            let receipt = firehose_tracer::types::ReceiptData::new(0, gas_limit, status, gas_limit);
+            insp.tracer_mut().on_tx_end(Some(&receipt), None);
+        }
+
+        tracer.on_block_end(None);
+        drop(tracer);
+
+        buffer.get_bytes()
     }
 
     fn legacy_tx_event() -> firehose_tracer::types::TxEvent {
