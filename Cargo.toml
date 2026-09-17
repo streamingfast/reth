@@ -708,7 +708,10 @@ vergen-git2 = "10.0.1"
 ipnet = "2.11"
 
 ## Firehose Additions
-firehose-tracer = "5"
+# Tip of `main`, which carries the Rust protobuf bindings regenerated against firehose-ethereum
+# `develop`. Pinned to a commit rather than the branch so builds stay reproducible. Temporary:
+# switch back to a crates.io version once those bindings ship in a release.
+firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", rev = "1a5547dee51e5930db490b4c97c54ebd01c13802" }
 reth-firehose = { path = "crates/firehose" }
 reth-firehose-tests = { path = "crates/firehose-tests" }
 

@@ -7,6 +7,14 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Changed
+
+- Track the development version of `evm-firehose-tracer-rs` instead of the published `5.x` crate,
+  picking up the regenerated protobuf bindings that follow `firehose-ethereum` `develop`. The
+  dependency is pinned to a commit rather than a branch so builds stay reproducible.
+
 ## reth-v2.5.2-fh3.1
 
 ### Changed
