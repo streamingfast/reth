@@ -7,6 +7,14 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## base-v2.5.2.6-fh3.1
+
+### Changed
+
+- Rebase on Base's reth fork at `base-v2.5.2.6`, the reth version pinned by Base `v1.4.0`. It adds
+  an extensible transaction-pool replacement policy and a pluggable snapshot archive output; no
+  Firehose code changed.
+
 ## base-v2.5.2.3-fh3.1
 
 ### Added
