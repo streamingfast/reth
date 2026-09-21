@@ -20,7 +20,7 @@
 
 # Bundled `fireeth` version = the `firehose-ethereum` runtime base image tag.
 # Declared before the first FROM so it is usable in the runtime stage's FROM.
-ARG FIREHOSE_ETHEREUM="latest"
+ARG FIREHOSE_ETHEREUM="675d85d"
 
 FROM lukemathwalker/cargo-chef:latest-rust-1.95-trixie AS chef
 WORKDIR /app
