@@ -425,24 +425,38 @@ impl<'a> FirehoseInspector<'a> {
         }
     }
 
-    /// Emit logs appended to the journal directly by native precompiles.
+    /// Emit logs appended to the journal without a LOG opcode.
     ///
-    /// Custom precompiles (B-20 tokens, the activation/policy registries, ...)
-    /// push event logs straight onto the journal via `EvmInternals::log`
-    /// instead of executing a LOG opcode, so revm never fires `log_full` for
-    /// them — see the `Inspector::log_full` rustdoc: "This will not happen only
-    /// if custom precompiles where logs will be gathered after precompile
-    /// call." Without gathering them here the call frame carries 0 logs while
-    /// the receipt carries the precompile's logs, and
-    /// `assign_ordinal_and_index_to_receipt_logs` panics with a call/receipt
-    /// log count mismatch.
+    /// Two producers bypass the `log_full` hook:
     ///
-    /// Called from `call_end` before the frame is popped, so the logs attach to
-    /// the precompile call that emitted them and land in execution order
-    /// (just before the call exit, mirroring where they were produced). A
-    /// reverted call has already had its journal logs truncated by revm, so the
-    /// gap is empty and nothing is emitted — matching the (empty) receipt logs.
-    fn gather_precompile_logs<CTX>(&mut self, context: &mut CTX)
+    /// * Custom precompiles (B-20 tokens, the activation/policy registries, ...) push event logs
+    ///   straight onto the journal via `EvmInternals::log` — see the `Inspector::log_full` rustdoc:
+    ///   "This will not happen only if custom precompiles where logs will be gathered after
+    ///   precompile call."
+    /// * [EIP-7708] native ETH transfer logs, which revm appends from `Journal::transfer_loaded`,
+    ///   `create_account_checkpoint` and `selfdestruct` once Amsterdam is active.
+    ///
+    /// Either way the call frame would carry fewer logs than the receipt and
+    /// `assign_ordinal_and_index_to_receipt_logs` panics on the count mismatch.
+    ///
+    /// Must be called at every point where the journal can grow without an
+    /// opcode firing, because `log_full` sets the watermark to the full journal
+    /// length: a single LOG opcode after an undrained journal log strands it
+    /// permanently. The drain points are a frame's first `step` (the EIP-7708
+    /// log for its own incoming value transfer) and `call_end`/`create_end` (a
+    /// precompile's logs, plus frames that never execute an opcode — EOA
+    /// targets and empty initcode).
+    ///
+    /// Draining at frame entry is also what makes the attribution right:
+    /// revm appends the transfer log *after* taking the callee's checkpoint, so
+    /// the log is scoped to the callee and reverts with it. Draining only at
+    /// `call_end` would park an outer frame's log on whichever inner frame
+    /// happened to exit first, and the tracer drops logs of reverted calls —
+    /// a surviving log attributed to a reverted callee reappears as a count
+    /// mismatch.
+    ///
+    /// [EIP-7708]: https://eips.ethereum.org/EIPS/eip-7708
+    fn drain_journal_logs<CTX>(&mut self, context: &mut CTX)
     where
         CTX: ContextTr,
         CTX::Journal: JournalExt,
@@ -452,7 +466,7 @@ impl<'a> FirehoseInspector<'a> {
         // revm truncates journal logs when a call reverts. If an earlier opcode LOG
         // advanced `trx_logs_count` (via `log_full`) and was then rolled back, the
         // watermark is now stale-high relative to the shrunken journal. Clamp it down
-        // so a subsequent precompile log that reuses the freed index is not skipped as
+        // so a subsequent journal log that reuses the freed index is not skipped as
         // "already emitted". Mirrors the clamp in `gather_precompile_storage_changes`.
         // Runs on every `call_end`, including the reverting frames, so the watermark is
         // corrected before the next call appends at the reused index.
@@ -1354,6 +1368,11 @@ where
             if let Some((address, value)) = self.pending_self_transfer.take() {
                 self.emit_self_transfer_balance_changes(context, address, value);
             }
+            // The EIP-7708 log for that same value transfer sits on the journal with no
+            // opcode behind it. Drain it here, after the balance changes, so it attaches
+            // to this frame in effects-then-event order and before any LOG opcode of this
+            // frame moves the watermark past it.
+            self.drain_journal_logs(context);
         }
 
         let journal = context.journal();
@@ -1547,11 +1566,13 @@ where
         // so changes are attributed to the call that caused them.
         self.process_journal_changes(context);
 
-        // Gather state changes a native precompile made straight on the journal (no
-        // opcode fired, so step_end/log_full were never called) and attach them to this
-        // call frame. Storage before logs to match the usual effects-then-event order.
+        // Gather state changes made straight on the journal (no opcode fired, so
+        // step_end/log_full were never called) and attach them to this call frame.
+        // Storage before logs to match the usual effects-then-event order. For a frame
+        // that executed at least one opcode the log drain already ran on its first
+        // `step`; this covers the step-less ones (precompiles, EOA targets).
         self.gather_precompile_storage_changes(context);
-        self.gather_precompile_logs(context);
+        self.drain_journal_logs(context);
 
         // Emit synthetic balance changes for a pending self-transfer if the call succeeded
         // (no-code target: step never fires but the transfer did happen). On failure
@@ -1685,6 +1706,11 @@ where
         // contract's 0→1 nonce bump) BEFORE popping the call, so changes are attributed
         // to the CREATE call.
         self.process_journal_changes(context);
+
+        // Zero-length initcode creates an account without executing a single opcode, so
+        // the first-`step` drain never runs and the EIP-7708 endowment log would be left
+        // for an outer frame to pick up. Drain it here while this CREATE is still active.
+        self.drain_journal_logs(context);
 
         // Clear pending flag: if the CREATE failed before executing any opcode (e.g.
         // OutOfFunds, CallTooDeep, CreateCollision), step never ran to clear it.
@@ -2811,12 +2837,12 @@ mod tests {
     /// revert-based quote emitted a `Swap` *opcode* log inside a sub-call that then reverted.
     /// `log_full` had advanced `trx_logs_count`; revm truncated the log on revert but left the
     /// watermark stale-high. A B-20 token's committed precompile log then reused the freed
-    /// journal index, so `gather_precompile_logs` skipped it as "already emitted" — the call
+    /// journal index, so `drain_journal_logs` skipped it as "already emitted" — the call
     /// carried one fewer log than the receipt and `assign_ordinal_and_index_to_receipt_logs`
     /// panicked ("6 call logs but 7 receipt logs").
     ///
     /// Drives the real hooks: emit an opcode log and revert it (with a manual
-    /// `gather_precompile_logs` standing in for the reverting child frame's `call_end`, which
+    /// `drain_journal_logs` standing in for the reverting child frame's `call_end`, which
     /// is where the watermark must be re-clamped to the live log count), then emit a native
     /// precompile log at the reused index — it must still be gathered.
     fn drive_precompile_log_after_reverted_opcode_log() -> Vec<u8> {
@@ -2895,7 +2921,7 @@ mod tests {
 
             // The reverting child frame's `call_end` runs the gather against the truncated
             // journal — this is where the watermark must be re-clamped down to the live count.
-            insp.gather_precompile_logs(&mut ctx);
+            insp.drain_journal_logs(&mut ctx);
 
             // The B-20 precompile body: a log straight on the journal (no LOG opcode), landing
             // at the index the reverted log just freed.
@@ -3252,6 +3278,336 @@ mod tests {
         drop(tracer);
 
         buffer.get_bytes()
+    }
+
+    // ---- EIP-7708 native ETH transfer logs ----------------------------------------------
+
+    /// `SYSTEM_ADDRESS`, the emitter revm stamps on every [EIP-7708] log.
+    ///
+    /// [EIP-7708]: https://eips.ethereum.org/EIPS/eip-7708
+    const NATIVE_LOG_ADDRESS: Address = Address::new([
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xfe,
+    ]);
+
+    const CONTRACT_A: Address = Address::repeat_byte(0xa1);
+    const CONTRACT_B: Address = Address::repeat_byte(0xb1);
+    const RECIPIENT: Address = Address::repeat_byte(0xcc);
+
+    /// `keccak256("Transfer(address,address,uint256)")`, pinned rather than imported: consumers
+    /// index native transfers off this exact topic, so a change upstream must break a test here.
+    fn native_transfer_topic() -> B256 {
+        B256::from(alloy_primitives::hex!(
+            "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+        ))
+    }
+
+    /// Asserts a captured log is the EIP-7708 transfer log for `from -> to` of `value`.
+    fn assert_native_transfer(
+        log: &pb::sf::ethereum::r#type::v2::Log,
+        from: Address,
+        to: Address,
+        value: u64,
+    ) {
+        assert_eq!(log.address, NATIVE_LOG_ADDRESS.to_vec(), "emitter must be SYSTEM_ADDRESS");
+        assert_eq!(
+            log.topics,
+            vec![
+                native_transfer_topic().to_vec(),
+                B256::left_padding_from(from.as_slice()).to_vec(),
+                B256::left_padding_from(to.as_slice()).to_vec(),
+            ]
+        );
+        assert_eq!(log.data, U256::from(value).to_be_bytes::<32>().to_vec());
+    }
+
+    /// `PUSHn <bytes>`. `PUSH0` is `0x5f`, so `PUSHn` is `0x5f + n`.
+    fn push(bytes: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x5f + bytes.len() as u8];
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    /// `CALL(gas = all remaining, target, value, in = none, out = none)` then `POP`.
+    fn op_call_with_value(target: Address, value: u64) -> Vec<u8> {
+        let mut code = Vec::new();
+        code.extend(push(&[0])); // retLength
+        code.extend(push(&[0])); // retOffset
+        code.extend(push(&[0])); // argsLength
+        code.extend(push(&[0])); // argsOffset
+        code.extend(push(&value.to_be_bytes())); // value
+        code.extend(push(target.as_slice())); // address
+        code.push(0x5a); // GAS
+        code.push(0xf1); // CALL
+        code.push(0x50); // POP
+        code
+    }
+
+    /// `LOG0` over an empty data range.
+    fn op_log0() -> Vec<u8> {
+        let mut code = Vec::new();
+        code.extend(push(&[0])); // size
+        code.extend(push(&[0])); // offset
+        code.push(0xa0); // LOG0
+        code
+    }
+
+    fn code_account(code: &[u8], balance: u64) -> revm::state::AccountInfo {
+        use reth_revm::bytecode::Bytecode;
+
+        let bytecode = Bytecode::new_raw(Bytes::copy_from_slice(code));
+        revm::state::AccountInfo {
+            balance: U256::from(balance),
+            nonce: 0,
+            code_hash: alloy_primitives::keccak256(bytecode.original_byte_slice()),
+            code: Some(bytecode),
+            account_id: None,
+        }
+    }
+
+    fn balance_account(balance: u64) -> revm::state::AccountInfo {
+        revm::state::AccountInfo { balance: U256::from(balance), ..Default::default() }
+    }
+
+    /// Runs one real transaction through revm at `SpecId::AMSTERDAM` with the production
+    /// inspector attached, then replays the resulting receipt through `on_tx_end`.
+    ///
+    /// Going through a genuine `inspect_tx` rather than hand-driven hooks is the point: EIP-7708
+    /// logs are appended by revm's journal at moments no inspector hook brackets, so a fixture
+    /// that fabricated them would only re-assert this file's own assumptions. `on_tx_end` runs
+    /// `assign_ordinal_and_index_to_receipt_logs`, which panics when the logs collected off the
+    /// call tree do not match the receipt one-for-one, in count and in `block_index` order.
+    fn drive_amsterdam_tx(
+        accounts: &[(Address, revm::state::AccountInfo)],
+        to: Address,
+        value: u64,
+    ) -> pb::sf::ethereum::r#type::v2::Block {
+        use reth_revm::revm::{
+            context::{Context, TxEnv},
+            database::{CacheDB, EmptyDB},
+            primitives::{hardfork::SpecId, TxKind},
+            InspectEvm, MainBuilder, MainContext,
+        };
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        for (address, info) in accounts {
+            db.insert_account_info(*address, info.clone());
+        }
+
+        let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+            firehose_tracer::config::Config::default(),
+            firehose_tracer::config::ChainConfig {
+                chain_id: 1,
+                shanghai_time: Some(0),
+                cancun_time: Some(0),
+                prague_time: Some(0),
+                verkle_time: None,
+            },
+            "reth-firehose-test",
+            "0",
+        );
+
+        let tx = TxEnv {
+            caller: SENDER,
+            gas_limit: 1_000_000,
+            gas_price: 0,
+            kind: TxKind::Call(to),
+            value: U256::from(value),
+            ..Default::default()
+        };
+
+        tracer.on_block_start(firehose_tracer::types::BlockEvent {
+            block: firehose_tracer::types::BlockData { number: 2, ..Default::default() },
+            finalized: None,
+            flash_block: None,
+        });
+        tracer.on_tx_start(
+            firehose_tracer::types::TxEvent {
+                to: Some(to),
+                value: U256::from(value),
+                gas: tx.gas_limit,
+                gas_price: U256::ZERO,
+                ..legacy_tx_event()
+            },
+            None,
+        );
+
+        // Scoped so the EVM (which owns the inspector, which borrows the tracer) is dropped
+        // before the tracer is used again for `on_tx_end`.
+        let result = {
+            let insp = FirehoseInspector::new(&mut tracer);
+            let mut evm = Context::mainnet()
+                .with_db(db)
+                .modify_cfg_chained(|cfg| cfg.spec = SpecId::AMSTERDAM)
+                .build_mainnet_with_inspector(insp);
+            evm.inspect_tx(tx).expect("transaction executes").result
+        };
+
+        let gas_used = result.tx_gas_used();
+        let mut receipt = firehose_tracer::types::ReceiptData::new(
+            0,
+            gas_used,
+            u64::from(result.is_success()),
+            gas_used,
+        );
+        for (index, log) in result.logs().iter().enumerate() {
+            receipt.add_log(firehose_tracer::types::LogData::new(
+                log.address,
+                log.topics().to_vec(),
+                log.data.data.clone(),
+                index as u32,
+            ));
+        }
+        tracer.on_tx_end(Some(&receipt), None);
+        tracer.on_block_end(None);
+        drop(tracer);
+
+        decode_fire_block(&buffer.get_bytes())
+    }
+
+    /// A plain value transfer between two EOAs produces one call, and the EIP-7708 log lands
+    /// on it. There is no other frame it could belong to.
+    #[test]
+    fn native_transfer_log_attaches_to_root_call() {
+        let block = drive_amsterdam_tx(
+            &[(SENDER, balance_account(1_000_000)), (RECIPIENT, balance_account(0))],
+            RECIPIENT,
+            1_000,
+        );
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        assert_eq!(trx.calls.len(), 1, "a value transfer to an EOA is a single call");
+
+        let call = &trx.calls[0];
+        assert_eq!(call.logs.len(), 1);
+        assert_native_transfer(&call.logs[0], SENDER, RECIPIENT, 1_000);
+    }
+
+    /// The log belongs to the callee, not the caller: revm appends it after taking the callee's
+    /// checkpoint, so that is the frame it reverts with. Here the root call moves no value and
+    /// must stay empty while the inner call carries the transfer.
+    #[test]
+    fn native_transfer_log_attaches_to_callee_not_caller() {
+        let a = code_account(&op_call_with_value(RECIPIENT, 1_000), 10_000);
+        let block = drive_amsterdam_tx(
+            &[
+                (SENDER, balance_account(1_000_000)),
+                (CONTRACT_A, a),
+                (RECIPIENT, balance_account(0)),
+            ],
+            CONTRACT_A,
+            0,
+        );
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        assert_eq!(trx.calls.len(), 2, "root call plus the inner value call");
+
+        assert!(trx.calls[0].logs.is_empty(), "the caller frame transfers nothing");
+        assert_eq!(trx.calls[1].logs.len(), 1);
+        assert_native_transfer(&trx.calls[1].logs[0], CONTRACT_A, RECIPIENT, 1_000);
+    }
+
+    /// Regression: `log_full` sets the watermark to the full journal length, so a `LOG` opcode
+    /// executed after an undrained journal log strands that log forever. Without the drain on
+    /// the frame's first `step`, the incoming EIP-7708 log is swallowed here and the call tree
+    /// ends up one log short of the receipt.
+    #[test]
+    fn native_transfer_log_survives_an_opcode_log_in_the_same_frame() {
+        let a = code_account(&op_log0(), 0);
+        let block = drive_amsterdam_tx(
+            &[(SENDER, balance_account(1_000_000)), (CONTRACT_A, a)],
+            CONTRACT_A,
+            1_000,
+        );
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        let call = trx.calls.first().expect("the root call");
+
+        assert_eq!(call.logs.len(), 2, "the native transfer log and the LOG0");
+        assert_native_transfer(&call.logs[0], SENDER, CONTRACT_A, 1_000);
+        assert_eq!(call.logs[0].block_index, 0, "the transfer log precedes EVM-emitted logs");
+        assert_eq!(call.logs[1].address, CONTRACT_A.to_vec());
+        assert_eq!(call.logs[1].block_index, 1);
+    }
+
+    /// Regression: draining only at `call_end` parks an outer frame's log on whichever inner
+    /// frame exits first. The tracer drops the logs of reverted calls, so a log that actually
+    /// survived would vanish from the call tree while staying in the receipt.
+    ///
+    /// Here the root call receives value (log survives) and then calls a reverting contract
+    /// with value (log reverts with it). The two must end up on different frames.
+    #[test]
+    fn native_transfer_log_is_not_parked_on_a_reverting_inner_call() {
+        // CONTRACT_A forwards value to CONTRACT_B, which reverts immediately.
+        let a = code_account(&op_call_with_value(CONTRACT_B, 500), 0);
+        let revert = {
+            let mut code = Vec::new();
+            code.extend(push(&[0])); // size
+            code.extend(push(&[0])); // offset
+            code.push(0xfd); // REVERT
+            code
+        };
+        let b = code_account(&revert, 0);
+
+        let block = drive_amsterdam_tx(
+            &[(SENDER, balance_account(1_000_000)), (CONTRACT_A, a), (CONTRACT_B, b)],
+            CONTRACT_A,
+            1_000,
+        );
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        assert_eq!(trx.calls.len(), 2, "root call plus the reverting inner call");
+
+        assert_eq!(trx.calls[0].logs.len(), 1, "the incoming transfer survives on the root call");
+        assert_native_transfer(&trx.calls[0].logs[0], SENDER, CONTRACT_A, 1_000);
+
+        assert!(trx.calls[1].state_reverted, "the inner call reverted");
+        assert_eq!(
+            trx.calls[1].logs.len(),
+            1,
+            "the reverted frame still records the log it produced; the tracer filters it out \
+             because the call is marked reverted"
+        );
+    }
+
+    /// `SELFDESTRUCT` is the one case where the log is emitter-side: the beneficiary has no
+    /// frame of its own, so it attaches to the destructing call.
+    #[test]
+    fn native_transfer_log_on_selfdestruct_attaches_to_the_destructing_call() {
+        let mut code = Vec::new();
+        code.extend(push(RECIPIENT.as_slice()));
+        code.push(0xff); // SELFDESTRUCT
+        let a = code_account(&code, 750);
+
+        let block = drive_amsterdam_tx(
+            &[
+                (SENDER, balance_account(1_000_000)),
+                (CONTRACT_A, a),
+                (RECIPIENT, balance_account(0)),
+            ],
+            CONTRACT_A,
+            0,
+        );
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        let call = trx.calls.first().expect("the root call");
+
+        assert_eq!(call.logs.len(), 1);
+        assert_native_transfer(&call.logs[0], CONTRACT_A, RECIPIENT, 750);
+    }
+
+    /// A zero-value call must not produce a log: revm short-circuits on a zero balance, and a
+    /// spurious entry here would desync every log index in the block.
+    #[test]
+    fn zero_value_transfer_emits_no_native_log() {
+        let block = drive_amsterdam_tx(
+            &[(SENDER, balance_account(1_000_000)), (RECIPIENT, balance_account(0))],
+            RECIPIENT,
+            0,
+        );
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        assert!(trx.calls.iter().all(|call| call.logs.is_empty()));
     }
 
     fn legacy_tx_event() -> firehose_tracer::types::TxEvent {
