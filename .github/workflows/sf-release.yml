@@ -117,7 +117,7 @@ jobs:
           cache-to: type=gha,mode=max
           build-args: |
             VERSION=${{ steps.extract-version.outputs.VERSION }}
-            FIREHOSE_ETHEREUM=${{ inputs.firehose_ethereum || 'latest' }}
+            FIREHOSE_ETHEREUM=${{ inputs.firehose_ethereum || '675d85d' }}
             # Full LTO `maxperf` is only worth its long link tail for shippable
             # builds (tags); branch pushes, PRs and manual dispatch use the
             # `release` profile (thin LTO) to validate faster.
