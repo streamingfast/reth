@@ -3294,6 +3294,12 @@ mod tests {
     const CONTRACT_B: Address = Address::repeat_byte(0xb1);
     const RECIPIENT: Address = Address::repeat_byte(0xcc);
 
+    /// The `identity` precompile, used as a stand-in for any real mainnet precompile — as
+    /// opposed to `PRECOMPILE` (a made-up address) used elsewhere in this file for hand-driven
+    /// hook tests.
+    const IDENTITY_PRECOMPILE: Address =
+        Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]);
+
     /// `keccak256("Transfer(address,address,uint256)")`, pinned rather than imported: consumers
     /// index native transfers off this exact topic, so a change upstream must break a test here.
     fn native_transfer_topic() -> B256 {
@@ -3352,6 +3358,45 @@ mod tests {
         code
     }
 
+    /// Writes `initcode` into memory via `PUSHn` + `MSTORE` and returns the bytecode plus the
+    /// `(offset, size)` pair a CREATE/CREATE2 should read it back from. `MSTORE` left-pads its
+    /// 32-byte word, so `initcode` lands at the tail of the word: offset `32 - len`.
+    ///
+    /// Empty `initcode` needs no memory write at all; `(0, 0)` alone reads as an empty range.
+    fn op_store_initcode(initcode: &[u8]) -> (Vec<u8>, u8, u8) {
+        if initcode.is_empty() {
+            return (Vec::new(), 0, 0);
+        }
+        let mut code = Vec::new();
+        code.extend(push(initcode));
+        code.extend(push(&[0])); // mstore offset
+        code.push(0x52); // MSTORE
+        (code, 32 - initcode.len() as u8, initcode.len() as u8)
+    }
+
+    /// `CREATE(value, offset, size)` then `POP` the created address.
+    fn op_create(value: u64, offset: u8, size: u8) -> Vec<u8> {
+        let mut code = Vec::new();
+        code.extend(push(&[size]));
+        code.extend(push(&[offset]));
+        code.extend(push(&value.to_be_bytes()));
+        code.push(0xf0); // CREATE
+        code.push(0x50); // POP
+        code
+    }
+
+    /// `CREATE2(value, offset, size, salt)` then `POP` the created address.
+    fn op_create2(value: u64, offset: u8, size: u8, salt: u8) -> Vec<u8> {
+        let mut code = Vec::new();
+        code.extend(push(&[salt]));
+        code.extend(push(&[size]));
+        code.extend(push(&[offset]));
+        code.extend(push(&value.to_be_bytes()));
+        code.push(0xf5); // CREATE2
+        code.push(0x50); // POP
+        code
+    }
+
     fn code_account(code: &[u8], balance: u64) -> revm::state::AccountInfo {
         use reth_revm::bytecode::Bytecode;
 
@@ -3369,24 +3414,30 @@ mod tests {
         revm::state::AccountInfo { balance: U256::from(balance), ..Default::default() }
     }
 
-    /// Runs one real transaction through revm at `SpecId::AMSTERDAM` with the production
-    /// inspector attached, then replays the resulting receipt through `on_tx_end`.
+    /// Runs `txs` (each a `(to, value)` pair) as separate transactions in one block through
+    /// revm at `SpecId::AMSTERDAM` with the production inspector attached, then replays each
+    /// resulting receipt through `on_tx_end`.
     ///
-    /// Going through a genuine `inspect_tx` rather than hand-driven hooks is the point: EIP-7708
-    /// logs are appended by revm's journal at moments no inspector hook brackets, so a fixture
-    /// that fabricated them would only re-assert this file's own assumptions. `on_tx_end` runs
-    /// `assign_ordinal_and_index_to_receipt_logs`, which panics when the logs collected off the
-    /// call tree do not match the receipt one-for-one, in count and in `block_index` order.
-    fn drive_amsterdam_tx(
+    /// Going through a genuine `inspect_tx_commit` rather than hand-driven hooks is the point:
+    /// EIP-7708 logs are appended by revm's journal outside any opcode, and where revm appends
+    /// them is the thing under test, so a fixture that fabricated them would only re-assert this
+    /// file's own assumptions. `on_tx_end`
+    /// runs `assign_ordinal_and_index_to_receipt_logs`, which panics when the logs collected off
+    /// the call tree do not match the receipt one-for-one, in count and in `block_index` order.
+    ///
+    /// A single inspector is built once and shared across every tx, exactly as the production
+    /// executor holds one inspector for the whole block: `process_post_tx_balance_changes` is
+    /// called after each tx to advance its block-wide log counter, so a second tx's logs
+    /// continue numbering after the first's rather than restarting at `block_index` 0.
+    fn drive_amsterdam_txs(
         accounts: &[(Address, revm::state::AccountInfo)],
-        to: Address,
-        value: u64,
+        txs: &[(Address, u64)],
     ) -> pb::sf::ethereum::r#type::v2::Block {
         use reth_revm::revm::{
             context::{Context, TxEnv},
             database::{CacheDB, EmptyDB},
             primitives::{hardfork::SpecId, TxKind},
-            InspectEvm, MainBuilder, MainContext,
+            InspectCommitEvm, MainBuilder, MainContext,
         };
 
         let mut db = CacheDB::new(EmptyDB::default());
@@ -3407,62 +3458,100 @@ mod tests {
             "0",
         );
 
-        let tx = TxEnv {
-            caller: SENDER,
-            gas_limit: 1_000_000,
-            gas_price: 0,
-            kind: TxKind::Call(to),
-            value: U256::from(value),
-            ..Default::default()
-        };
-
         tracer.on_block_start(firehose_tracer::types::BlockEvent {
             block: firehose_tracer::types::BlockData { number: 2, ..Default::default() },
             finalized: None,
             flash_block: None,
         });
-        tracer.on_tx_start(
-            firehose_tracer::types::TxEvent {
-                to: Some(to),
-                value: U256::from(value),
-                gas: tx.gas_limit,
-                gas_price: U256::ZERO,
-                ..legacy_tx_event()
-            },
-            None,
-        );
 
         // Scoped so the EVM (which owns the inspector, which borrows the tracer) is dropped
-        // before the tracer is used again for `on_tx_end`.
-        let result = {
+        // before the tracer is used again for `on_block_end`.
+        {
             let insp = FirehoseInspector::new(&mut tracer);
             let mut evm = Context::mainnet()
                 .with_db(db)
                 .modify_cfg_chained(|cfg| cfg.spec = SpecId::AMSTERDAM)
                 .build_mainnet_with_inspector(insp);
-            evm.inspect_tx(tx).expect("transaction executes").result
-        };
 
-        let gas_used = result.tx_gas_used();
-        let mut receipt = firehose_tracer::types::ReceiptData::new(
-            0,
-            gas_used,
-            u64::from(result.is_success()),
-            gas_used,
-        );
-        for (index, log) in result.logs().iter().enumerate() {
-            receipt.add_log(firehose_tracer::types::LogData::new(
-                log.address,
-                log.topics().to_vec(),
-                log.data.data.clone(),
-                index as u32,
-            ));
+            // Block-wide log count seen so far, mirroring `log_block_index`: a receipt log's
+            // `block_index` is the block-wide position the call tree reports, not the index
+            // within this tx's own `ExecutionResult::logs()`.
+            let mut block_log_offset = 0u32;
+
+            for (tx_index, &(to, value)) in txs.iter().enumerate() {
+                let gas_limit = 1_000_000;
+                let tx = TxEnv {
+                    caller: SENDER,
+                    gas_limit,
+                    gas_price: 0,
+                    kind: TxKind::Call(to),
+                    value: U256::from(value),
+                    nonce: tx_index as u64,
+                    ..Default::default()
+                };
+
+                evm.inspector.tracer_mut().on_tx_start(
+                    firehose_tracer::types::TxEvent {
+                        to: Some(to),
+                        value: U256::from(value),
+                        gas: gas_limit,
+                        gas_price: U256::ZERO,
+                        nonce: tx_index as u64,
+                        ..legacy_tx_event()
+                    },
+                    None,
+                );
+
+                let result = evm.inspect_tx_commit(tx).expect("transaction executes");
+
+                let gas_used = result.tx_gas_used();
+                let committed_log_count = result.logs().len() as u32;
+                let mut receipt = firehose_tracer::types::ReceiptData::new(
+                    tx_index as u32,
+                    gas_used,
+                    u64::from(result.is_success()),
+                    gas_used,
+                );
+                for (log_index, log) in result.logs().iter().enumerate() {
+                    receipt.add_log(firehose_tracer::types::LogData::new(
+                        log.address,
+                        log.topics().to_vec(),
+                        log.data.data.clone(),
+                        block_log_offset + log_index as u32,
+                    ));
+                }
+                evm.inspector.tracer_mut().on_tx_end(Some(&receipt), None);
+
+                // Mirrors the production executor's post-tx accounting call, whose sole
+                // effect relevant here is `self.log_block_index += committed_log_count`.
+                evm.inspector.process_post_tx_balance_changes(
+                    SENDER,
+                    Address::ZERO,
+                    gas_limit,
+                    gas_used,
+                    0,
+                    0,
+                    committed_log_count,
+                    |_| U256::ZERO,
+                );
+                block_log_offset += committed_log_count;
+            }
+
+            evm.inspector.tracer_mut().on_block_end(None);
         }
-        tracer.on_tx_end(Some(&receipt), None);
-        tracer.on_block_end(None);
-        drop(tracer);
 
         decode_fire_block(&buffer.get_bytes())
+    }
+
+    /// Runs one real transaction through revm at `SpecId::AMSTERDAM` with the production
+    /// inspector attached, then replays the resulting receipt through `on_tx_end`. See
+    /// [`drive_amsterdam_txs`] for what this exercises and why.
+    fn drive_amsterdam_tx(
+        accounts: &[(Address, revm::state::AccountInfo)],
+        to: Address,
+        value: u64,
+    ) -> pb::sf::ethereum::r#type::v2::Block {
+        drive_amsterdam_txs(accounts, &[(to, value)])
     }
 
     /// A plain value transfer between two EOAs produces one call, and the EIP-7708 log lands
@@ -3594,6 +3683,249 @@ mod tests {
 
         assert_eq!(call.logs.len(), 1);
         assert_native_transfer(&call.logs[0], CONTRACT_A, RECIPIENT, 750);
+    }
+
+    /// CREATE with value and non-empty initcode: the endowment log is appended to the journal
+    /// with no opcode behind it (same as any value transfer), but the frame that follows still
+    /// executes at least one opcode (the initcode's `STOP`), so this exercises the drain on the
+    /// CREATE frame's first `step` rather than the zero-opcode path `create_end` covers.
+    #[test]
+    fn native_transfer_log_on_create_attaches_to_the_create_call() {
+        let value = 1_000u64;
+        let (store, offset, size) = op_store_initcode(&[0x00]); // initcode: STOP
+        let mut code = store;
+        code.extend(op_create(value, offset, size));
+        let a = code_account(&code, 10_000);
+
+        let block = drive_amsterdam_tx(
+            &[(SENDER, balance_account(1_000_000)), (CONTRACT_A, a)],
+            CONTRACT_A,
+            0,
+        );
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        assert_eq!(trx.calls.len(), 2, "root call plus the CREATE");
+
+        assert!(trx.calls[0].logs.is_empty(), "the root call transfers no value itself");
+        let create_call = &trx.calls[1];
+        assert_eq!(create_call.logs.len(), 1);
+        let created = Address::from_slice(&create_call.address);
+        assert_native_transfer(&create_call.logs[0], CONTRACT_A, created, value);
+    }
+
+    /// Same as the CREATE case above, but for CREATE2 — its created address is derived
+    /// differently (salt + init code hash rather than caller nonce), so this pins that the log
+    /// still attaches to the CREATE2 frame regardless of how the address was computed.
+    #[test]
+    fn native_transfer_log_on_create2_attaches_to_the_create_call() {
+        let value = 1_000u64;
+        let (store, offset, size) = op_store_initcode(&[0x00]); // initcode: STOP
+        let mut code = store;
+        code.extend(op_create2(value, offset, size, 0x07));
+        let a = code_account(&code, 10_000);
+
+        let block = drive_amsterdam_tx(
+            &[(SENDER, balance_account(1_000_000)), (CONTRACT_A, a)],
+            CONTRACT_A,
+            0,
+        );
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        assert_eq!(trx.calls.len(), 2, "root call plus the CREATE2");
+
+        assert!(trx.calls[0].logs.is_empty(), "the root call transfers no value itself");
+        let create_call = &trx.calls[1];
+        assert_eq!(create_call.logs.len(), 1);
+        let created = Address::from_slice(&create_call.address);
+        assert_native_transfer(&create_call.logs[0], CONTRACT_A, created, value);
+    }
+
+    /// Drives a root CREATE by hand-invoking the inspector's `create`/`create_end` hooks
+    /// directly, with the EIP-7708 endowment log placed on the journal between them and no
+    /// opcode ever executed — unlike a genuine `CREATE` with empty initcode, where revm pads
+    /// the init code into a one-instruction `[STOP]` bytecode object that a real interpreter
+    /// run still single-steps (see `Bytecode::new_legacy`), draining the log via the frame's
+    /// first `step` and masking the very regression this is meant to pin. Mirrors
+    /// `drive_precompile_call`'s hand-driven pattern. Returns the raw FIRE output buffer.
+    fn drive_create_with_no_interpreter_step() -> (Vec<u8>, Address, Address) {
+        use reth_revm::revm::{
+            context::Context,
+            context_interface::CreateScheme,
+            database::{CacheDB, EmptyDB},
+            interpreter::{CreateInputs, CreateOutcome, Gas, InstructionResult, InterpreterResult},
+            state::AccountInfo,
+            MainContext,
+        };
+
+        let value = U256::from(1_000u64);
+        let created = CONTRACT_A.create(0);
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            CONTRACT_A,
+            AccountInfo { balance: U256::from(10_000u64), ..Default::default() },
+        );
+        let mut ctx = Context::mainnet().with_db(db);
+
+        let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+            firehose_tracer::config::Config::default(),
+            firehose_tracer::config::ChainConfig {
+                chain_id: 8453,
+                shanghai_time: Some(0),
+                cancun_time: Some(0),
+                prague_time: None,
+                verkle_time: None,
+            },
+            "reth-firehose-test",
+            "0",
+        );
+
+        {
+            let mut insp = FirehoseInspector::new(&mut tracer);
+            insp.tracer_mut().on_block_start(firehose_tracer::types::BlockEvent {
+                block: firehose_tracer::types::BlockData { number: 2, ..Default::default() },
+                finalized: None,
+                flash_block: None,
+            });
+            insp.tracer_mut().on_tx_start(
+                firehose_tracer::types::TxEvent {
+                    from: CONTRACT_A,
+                    to: None,
+                    value,
+                    ..legacy_tx_event()
+                },
+                None,
+            );
+
+            let mut inputs = CreateInputs::new(
+                CONTRACT_A,
+                CreateScheme::Create,
+                value,
+                Bytes::new(),
+                100_000,
+                0,
+            );
+
+            // Enter the CREATE frame through the production hook.
+            let _ = insp.create(&mut ctx, &mut inputs);
+
+            // The endowment log for the value transfer, straight on the journal with no
+            // opcode in between — exactly what revm's frame_init does for a real CREATE.
+            ctx.journal_mut().log(AlloyLog {
+                address: NATIVE_LOG_ADDRESS,
+                data: alloy_primitives::LogData::new_unchecked(
+                    vec![
+                        native_transfer_topic(),
+                        B256::left_padding_from(CONTRACT_A.as_slice()),
+                        B256::left_padding_from(created.as_slice()),
+                    ],
+                    Bytes::copy_from_slice(&value.to_be_bytes::<32>()),
+                ),
+            });
+
+            // Exit through the production hook — this is where `create_end`'s drain must run.
+            let mut outcome = CreateOutcome {
+                result: InterpreterResult {
+                    result: InstructionResult::Return,
+                    output: Bytes::new(),
+                    gas: Gas::new(100_000),
+                },
+                address: Some(created),
+                charged_create_state_gas: false,
+            };
+            insp.create_end(&mut ctx, &inputs, &mut outcome);
+
+            let mut receipt = firehose_tracer::types::ReceiptData::new(0, 21_000, 1, 21_000);
+            receipt.add_log(firehose_tracer::types::LogData::new(
+                NATIVE_LOG_ADDRESS,
+                vec![
+                    native_transfer_topic(),
+                    B256::left_padding_from(CONTRACT_A.as_slice()),
+                    B256::left_padding_from(created.as_slice()),
+                ],
+                Bytes::copy_from_slice(&value.to_be_bytes::<32>()),
+                0,
+            ));
+            // Panics ("mismatch between call logs and receipt logs") if the CREATE call
+            // carries fewer logs than the receipt — i.e. if create_end's drain regressed.
+            insp.tracer_mut().on_tx_end(Some(&receipt), None);
+        }
+
+        tracer.on_block_end(None);
+        drop(tracer);
+
+        (buffer.get_bytes(), CONTRACT_A, created)
+    }
+
+    /// Pins the drain in `create_end` for a CREATE frame that never reaches `step`. A genuine
+    /// empty-initcode CREATE does step (revm pads it to `[STOP]`), so this is hand-driven — see
+    /// `drive_create_with_no_interpreter_step`. Without that drain the endowment log is
+    /// stranded: this is the root call, so no outer frame picks it up.
+    #[test]
+    fn native_transfer_log_on_empty_initcode_create_attaches_to_the_create_call() {
+        let (raw, creator, created) = drive_create_with_no_interpreter_step();
+        let block = decode_fire_block(&raw);
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        let call = trx.calls.first().expect("the root CREATE call");
+
+        assert_eq!(call.logs.len(), 1);
+        assert_native_transfer(&call.logs[0], creator, created, 1_000);
+    }
+
+    /// A CALL with value to a real precompile (`identity`, address `0x…04`) is still a no-code
+    /// target from the EVM's perspective — no opcode ever runs in that frame — so this pins that
+    /// the precompile-call path (`was_precompile_called`) gets the same log attachment as any
+    /// other no-code callee, not the root that dispatched it.
+    #[test]
+    fn native_transfer_log_to_precompile_attaches_to_the_precompile_call() {
+        let a = code_account(&op_call_with_value(IDENTITY_PRECOMPILE, 1_000), 10_000);
+        let block = drive_amsterdam_tx(
+            &[
+                (SENDER, balance_account(1_000_000)),
+                (CONTRACT_A, a),
+                (IDENTITY_PRECOMPILE, balance_account(0)),
+            ],
+            CONTRACT_A,
+            0,
+        );
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        assert_eq!(trx.calls.len(), 2, "root call plus the precompile call");
+
+        assert!(trx.calls[0].logs.is_empty(), "the root call transfers no value itself");
+        assert_eq!(trx.calls[1].logs.len(), 1);
+        assert_native_transfer(&trx.calls[1].logs[0], CONTRACT_A, IDENTITY_PRECOMPILE, 1_000);
+    }
+
+    /// Two transactions in one block: the inspector is shared across both (as it is in
+    /// production), so the second tx's native log must carry a `block_index` continuing after
+    /// the first tx's, not restart at 0.
+    #[test]
+    fn native_transfer_log_second_tx_continues_block_index() {
+        let block = drive_amsterdam_txs(
+            &[
+                (SENDER, balance_account(1_000_000)),
+                (CONTRACT_A, balance_account(0)),
+                (CONTRACT_B, balance_account(0)),
+            ],
+            &[(CONTRACT_A, 1_000), (CONTRACT_B, 2_000)],
+        );
+
+        assert_eq!(block.transaction_traces.len(), 2, "two transactions in the block");
+
+        let first = block.transaction_traces[0].calls.first().expect("first tx's root call");
+        assert_eq!(first.logs.len(), 1);
+        assert_native_transfer(&first.logs[0], SENDER, CONTRACT_A, 1_000);
+        assert_eq!(first.logs[0].block_index, 0);
+
+        let second = block.transaction_traces[1].calls.first().expect("second tx's root call");
+        assert_eq!(second.logs.len(), 1);
+        assert_native_transfer(&second.logs[0], SENDER, CONTRACT_B, 2_000);
+        assert_eq!(
+            second.logs[0].block_index, 1,
+            "block index must continue after the first tx's logs, not restart at 0"
+        );
     }
 
     /// A zero-value call must not produce a log: revm short-circuits on a zero balance, and a
