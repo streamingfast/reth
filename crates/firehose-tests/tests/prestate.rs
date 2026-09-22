@@ -51,15 +51,18 @@ fn amsterdam_block_access_list() {
 }
 
 /// EIP-7928: a header declaring a `block_access_list_hash` that doesn't match what re-execution
-/// reconstructs must not surface a wrong `block_access_list_rlp` — the field stays unset.
+/// reconstructs must hard-fail the block rather than silently ship a wrong `block_access_list_rlp`.
 #[test]
 fn amsterdam_block_access_list_hash_mismatch() {
     let folder = case_dir("amsterdam_block_access_list_hash_mismatch");
-    let outcome = run_prestate(&folder)
-        .expect("running amsterdam_block_access_list_hash_mismatch prestate must succeed");
+    let err = run_prestate(&folder)
+        .expect_err("running amsterdam_block_access_list_hash_mismatch prestate must fail");
 
-    let golden = golden_dir(&folder, "block.2099.binpb");
-    assert_block_equals_golden(&outcome.block, &golden).expect("captured block must match golden");
+    let message = err.to_string();
+    assert!(
+        message.contains("reconstructed block access list hash mismatch"),
+        "unexpected error: {message}"
+    );
 }
 
 fn case_dir(name: &str) -> PathBuf {

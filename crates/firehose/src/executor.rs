@@ -896,20 +896,20 @@ where
 
     if has_bal && let Some(bal) = db.take_built_alloy_bal() {
         let computed_hash = alloy_eip7928::compute_block_access_list_hash(bal.as_slice());
-        if Some(computed_hash) == block.header().block_access_list_hash() {
-            if let Some(header) =
-                tracer_guard.tracer_mut().block_mut().and_then(|b| b.header.as_mut())
-            {
-                header.block_access_list_rlp = Some(alloy_rlp::encode(&bal));
-            }
-        } else {
-            reth_tracing::tracing::warn!(
-                target: "reth::firehose",
-                block = block.header().number(),
-                expected = %block.header().block_access_list_hash().unwrap_or_default(),
-                computed = %computed_hash,
-                "reconstructed block access list hash mismatch, leaving block_access_list_rlp unset"
-            );
+        // Hard error rather than warn-and-continue: this is the first re-execution-based BAL
+        // reconstruction shipped, and a mismatch means the reconstruction is wrong somewhere, not
+        // that the block is invalid. Revisit once this has proven itself on testnets — the live
+        // path (payload-sourced, not reconstructed) is unaffected either way.
+        if Some(computed_hash) != block.header().block_access_list_hash() {
+            return Err(BlockExecutionError::msg(format!(
+                "reconstructed block access list hash mismatch for block {}: expected {}, computed {computed_hash}",
+                block.header().number(),
+                block.header().block_access_list_hash().unwrap_or_default(),
+            )));
+        }
+        if let Some(header) = tracer_guard.tracer_mut().block_mut().and_then(|b| b.header.as_mut())
+        {
+            header.block_access_list_rlp = Some(alloy_rlp::encode(&bal));
         }
     }
 

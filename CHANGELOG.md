@@ -23,8 +23,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   commits to the hash), so it's sourced differently depending on path: on the live engine path
   it's read from the payload's decoded BAL sidecar; on the pipeline/backfill path, which has no
   sidecar, it's reconstructed via re-execution (the same BAL-index tracking
-  `BasicBlockExecutor::execute_one` uses) and only surfaced once the reconstructed hash matches
-  the header's declared one.
+  `BasicBlockExecutor::execute_one` uses); the block execution hard-fails if the reconstructed
+  hash doesn't match the header's declared one, since this is the first re-execution-based
+  reconstruction shipped and a mismatch means the reconstruction is wrong, not the block.
 
 ## reth-v2.5.2-fh3.1-1
 
