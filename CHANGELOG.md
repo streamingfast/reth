@@ -7,6 +7,18 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Changed
+
+- Track `evm-firehose-tracer-rs` `5.4.4` from crates.io instead of a pinned git commit, now that
+  the protobuf bindings it needs have shipped in a release.
+
+### Fixed
+
+- Populate `BlockHeader.slot_number` (EIP-7843, Amsterdam) from the block header instead of
+  always emitting `None`.
+
 ## reth-v2.5.2-fh3.1-1
 
 ### Added
