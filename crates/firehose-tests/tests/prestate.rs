@@ -37,6 +37,31 @@ fn amsterdam_slot_number() {
     assert_block_equals_golden(&outcome.block, &golden).expect("captured block must match golden");
 }
 
+/// EIP-7928: `run_wrapped_block` (this repo's pipeline/backfill path) has no payload sidecar to
+/// source the block access list from, so it must reconstruct it via re-execution and only surface
+/// it once the reconstructed hash matches the header's declared `block_access_list_hash`.
+#[test]
+fn amsterdam_block_access_list() {
+    let folder = case_dir("amsterdam_block_access_list");
+    let outcome =
+        run_prestate(&folder).expect("running amsterdam_block_access_list prestate must succeed");
+
+    let golden = golden_dir(&folder, "block.2099.binpb");
+    assert_block_equals_golden(&outcome.block, &golden).expect("captured block must match golden");
+}
+
+/// EIP-7928: a header declaring a `block_access_list_hash` that doesn't match what re-execution
+/// reconstructs must not surface a wrong `block_access_list_rlp` — the field stays unset.
+#[test]
+fn amsterdam_block_access_list_hash_mismatch() {
+    let folder = case_dir("amsterdam_block_access_list_hash_mismatch");
+    let outcome = run_prestate(&folder)
+        .expect("running amsterdam_block_access_list_hash_mismatch prestate must succeed");
+
+    let golden = golden_dir(&folder, "block.2099.binpb");
+    assert_block_equals_golden(&outcome.block, &golden).expect("captured block must match golden");
+}
+
 fn case_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("cases").join(name)
 }

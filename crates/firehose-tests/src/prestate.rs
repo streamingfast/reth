@@ -83,6 +83,11 @@ pub struct TraceContext {
     /// EIP-7843 slot number (Amsterdam+ only).
     #[serde(default, deserialize_with = "deser_opt_u64_str")]
     pub slot_number: Option<u64>,
+    /// EIP-7928 block access list hash (Amsterdam+ only). Declaring this triggers BAL
+    /// reconstruction via re-execution in `run_wrapped_block`, so it must be the real hash of the
+    /// access list the block's transactions produce, not an arbitrary placeholder.
+    #[serde(default)]
+    pub block_access_list_hash: Option<B256>,
 }
 
 /// Run the prestate-driven Firehose harness against `case_folder` and return the captured Block.
@@ -254,6 +259,7 @@ fn build_header(
         excess_blob_gas: Some(0),
         requests_hash: None,
         slot_number: ctx.slot_number,
+        block_access_list_hash: ctx.block_access_list_hash,
         ..Default::default()
     }
 }

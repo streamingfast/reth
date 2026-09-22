@@ -18,6 +18,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Populate `BlockHeader.slot_number` (EIP-7843, Amsterdam) from the block header instead of
   always emitting `None`.
+- Populate `BlockHeader.block_access_list_hash`/`block_access_list_rlp` (EIP-7928, Amsterdam).
+  The hash comes straight from the header. The RLP-encoded list isn't part of the header (it only
+  commits to the hash), so it's sourced differently depending on path: on the live engine path
+  it's read from the payload's decoded BAL sidecar; on the pipeline/backfill path, which has no
+  sidecar, it's reconstructed via re-execution (the same BAL-index tracking
+  `BasicBlockExecutor::execute_one` uses) and only surfaced once the reconstructed hash matches
+  the header's declared one.
 
 ## reth-v2.5.2-fh3.1-1
 
