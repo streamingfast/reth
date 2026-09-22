@@ -26,6 +26,17 @@ fn storage_sstore_oog() {
     assert_block_equals_golden(&outcome.block, &golden).expect("captured block must match golden");
 }
 
+/// EIP-7843: the mapper must read `slot_number` from the header rather than hardcoding `None`.
+#[test]
+fn amsterdam_slot_number() {
+    let folder = case_dir("amsterdam_slot_number");
+    let outcome =
+        run_prestate(&folder).expect("running amsterdam_slot_number prestate must succeed");
+
+    let golden = golden_dir(&folder, "block.2099.binpb");
+    assert_block_equals_golden(&outcome.block, &golden).expect("captured block must match golden");
+}
+
 fn case_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("cases").join(name)
 }

@@ -724,6 +724,10 @@ where
         match block_result {
             Ok(result) => {
                 self.db.merge_transitions(BundleRetention::Reverts);
+                // EIP-7928: `block_access_list_rlp` is left unset on this path (pipeline/backfill
+                // replay) — there is no payload sidecar to source it from here, unlike the live
+                // engine path (see `payload_validator.rs`), and this executor does not (yet)
+                // reconstruct it by tracking BAL during re-execution.
                 self.pending_tracer = Some(tracer);
                 Ok(result)
             }

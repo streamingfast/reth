@@ -83,8 +83,11 @@ where
         parent_beacon_root: header.parent_beacon_block_root(),
         requests_hash: header.requests_hash(),
         tx_dependency: None,
-        // EIP-7843: Amsterdam slot number — not yet exposed by reth Header trait
-        slot_number: None,
+        slot_number: header.slot_number(),
+        block_access_list_hash: header.block_access_list_hash(),
+        // Only known after this node has executed the block; patched in post-execution via
+        // `Tracer::block_mut` (see `executor.rs`).
+        block_access_list_rlp: None,
     }
 }
 

@@ -80,6 +80,9 @@ pub struct TraceContext {
     /// Block difficulty (absent on post-Merge blocks).
     #[serde(default, deserialize_with = "deser_opt_u256_str")]
     pub difficulty: Option<U256>,
+    /// EIP-7843 slot number (Amsterdam+ only).
+    #[serde(default, deserialize_with = "deser_opt_u64_str")]
+    pub slot_number: Option<u64>,
 }
 
 /// Run the prestate-driven Firehose harness against `case_folder` and return the captured Block.
@@ -250,6 +253,7 @@ fn build_header(
         blob_gas_used: Some(0),
         excess_blob_gas: Some(0),
         requests_hash: None,
+        slot_number: ctx.slot_number,
         ..Default::default()
     }
 }
@@ -356,6 +360,20 @@ mod private {
         }
     }
 
+    pub(super) fn de_opt_u64<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s: Option<String> = serde::Deserialize::deserialize(d)?;
+        match s {
+            None => Ok(None),
+            Some(s) => {
+                let v = parse_decimal_or_hex_u128(&s).map_err(D::Error::custom)?;
+                u64::try_from(v).map(Some).map_err(D::Error::custom)
+            }
+        }
+    }
+
     pub(super) fn de_opt_u256<'de, D>(d: D) -> Result<Option<U256>, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -398,4 +416,13 @@ where
     D: serde::Deserializer<'de>,
 {
     private::de_opt_u256(d)
+}
+
+/// Deserialise an optional decimal-or-hex string as `Option<u64>` (for `#[serde(deserialize_with =
+/// …)]`).
+pub fn deser_opt_u64_str<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    private::de_opt_u64(d)
 }
