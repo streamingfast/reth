@@ -40,6 +40,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   instruction. SELFDESTRUCT is now reported after the instruction runs, and reported as failed
   when it halted as an undefined opcode.
 
+### Build
+
+- The Docker image bundles `firehose-ethereum` v2.23.0.
+
 ## reth-v2.5.2-fh3.1
 
 ### Changed
