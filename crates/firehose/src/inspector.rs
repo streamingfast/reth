@@ -435,12 +435,12 @@ impl<'a> FirehoseInspector<'a> {
     ///   `create_account_checkpoint` and `selfdestruct` once Amsterdam is active.
     ///
     /// revm does report both: `inspect_frame_init` snapshots the journal log count around
-    /// `frame_init` and forwards anything new through `Inspector::log`, whose default body is
-    /// empty. We deliberately do not override `log` and drain here instead, because `log` fires
-    /// before the frame's first `step` — ahead of the balance changes that `step` emits from the
-    /// journal. Taking the log there would invert Geth's effects-then-event ordinal order for
-    /// exactly the transfer the log describes. Draining from `step` keeps the pair in order at
-    /// the cost of this watermark.
+    /// `frame_init` and forwards anything new through `Inspector::log`. We implement that hook
+    /// as an explicit no-op and drain here instead, because it fires before the frame's first
+    /// `step` — ahead of the balance changes that `step` emits from the journal. Taking the log
+    /// there would invert Geth's effects-then-event ordinal order for exactly the transfer the
+    /// log describes. Draining from `step` keeps the pair in order at the cost of this
+    /// watermark. [`Self::log`] carries the full rationale.
     ///
     /// Without a drain the call frame carries fewer logs than the receipt and
     /// `assign_ordinal_and_index_to_receipt_logs` panics on the count mismatch.
@@ -1766,7 +1766,38 @@ where
         );
     }
 
-    /// LOG operation is executed
+    /// A log was journaled outside an opcode — intentionally ignored, see below.
+    ///
+    /// revm calls this from `inspect_frame_init` for logs that appear between entering a frame
+    /// and its first instruction: the [EIP-7708] native transfer log for the frame's own
+    /// incoming value, and the logs of a precompile. Forwarding them here would be the obvious
+    /// implementation and it is deliberately not what we do — [`Self::drain_journal_logs`]
+    /// picks them up later instead.
+    ///
+    /// The reason is ordinal ordering. This hook fires before the frame's first `step`, which is
+    /// where `process_journal_changes` emits the balance changes for that same value transfer.
+    /// Emitting the log here would order the event ahead of the effect it describes, inverting
+    /// the effects-then-event order Geth produces, and a Firehose consumer replaying by ordinal
+    /// would see the transfer announced before it happened.
+    ///
+    /// Overriding this hook for real is a plausible simplification — it would retire the drain
+    /// calls in `step` and `create_end` — but it is not a change to make on reading alone. The
+    /// ordering above is pinned by `native_transfer_log_is_ordered_after_its_balance_changes`,
+    /// which is the only test that fails if this body starts draining; every other native-log
+    /// test still passes, so the regression is easy to miss. Beyond that the tracer diverges
+    /// from Geth in ways unit tests do not surface, so it needs battlefield coverage and a
+    /// spell of reth mainnet comparison first.
+    ///
+    /// [EIP-7708]: https://eips.ethereum.org/EIPS/eip-7708
+    fn log(&mut self, _context: &mut CTX, _log: AlloyLog) {}
+
+    /// LOG opcode executed.
+    ///
+    /// This is the opcode half of the split whose other half is [`Self::log`]: revm routes a log
+    /// appended during an instruction here, and one appended around frame init there. Note the
+    /// watermark assignment below is why a log that never reaches either hook is lost for good —
+    /// it jumps `trx_logs_count` to the full journal length, stranding anything undrained
+    /// beneath it. See [`Self::drain_journal_logs`].
     fn log_full(
         &mut self,
         _interp: &mut Interpreter<EthInterpreter>,
@@ -1777,7 +1808,6 @@ where
         // log is appended, so logs().len() - 1 is this log's index in the transaction.
         // On revert, the journal truncates logs back, so subsequent logs after
         // a revert get correct indices automatically.
-        //
         self.trx_logs_count = context.journal().logs().len() as u32;
         let block_index = self.trx_logs_count.saturating_sub(1) + self.log_block_index;
         self.tracer.on_log(log.address, log.topics(), &log.data.data, block_index);
@@ -2068,7 +2098,7 @@ pub(crate) fn deduct_caller_nonce_emission(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth_revm::revm::context::JournalEntry;
+    use reth_revm::revm::{context::JournalEntry, primitives::hardfork::SpecId};
 
     fn addr(b: u8) -> Address {
         Address::repeat_byte(b)
@@ -3432,8 +3462,12 @@ mod tests {
     }
 
     /// Runs `txs` (each a `(to, value)` pair) as separate transactions in one block through
-    /// revm at `SpecId::AMSTERDAM` with the production inspector attached, then replays each
-    /// resulting receipt through `on_tx_end`.
+    /// revm at `spec`, with the production inspector attached, then replays each resulting
+    /// receipt through `on_tx_end`.
+    ///
+    /// `spec` is a parameter rather than a constant so a test can pin behaviour on both sides of
+    /// a fork boundary — EIP-7708 only emits below `SpecId::AMSTERDAM`, and the absence of a log
+    /// before it is as much a property worth testing as its presence after.
     ///
     /// Going through a genuine `inspect_tx_commit` rather than hand-driven hooks is the point:
     /// EIP-7708 logs are appended by revm's journal outside any opcode, and where revm appends
@@ -3446,14 +3480,15 @@ mod tests {
     /// executor holds one inspector for the whole block: `process_post_tx_balance_changes` is
     /// called after each tx to advance its block-wide log counter, so a second tx's logs
     /// continue numbering after the first's rather than restarting at `block_index` 0.
-    fn drive_amsterdam_txs(
+    fn drive_txs(
+        spec: SpecId,
         accounts: &[(Address, revm::state::AccountInfo)],
         txs: &[(Address, u64)],
     ) -> pb::sf::ethereum::r#type::v2::Block {
         use reth_revm::revm::{
             context::{Context, TxEnv},
             database::{CacheDB, EmptyDB},
-            primitives::{hardfork::SpecId, TxKind},
+            primitives::TxKind,
             InspectCommitEvm, MainBuilder, MainContext,
         };
 
@@ -3487,7 +3522,7 @@ mod tests {
             let insp = FirehoseInspector::new(&mut tracer);
             let mut evm = Context::mainnet()
                 .with_db(db)
-                .modify_cfg_chained(|cfg| cfg.spec = SpecId::AMSTERDAM)
+                .modify_cfg_chained(|cfg| cfg.spec = spec)
                 .build_mainnet_with_inspector(insp);
 
             // Block-wide log count seen so far, mirroring `log_block_index`: a receipt log's
@@ -3560,22 +3595,24 @@ mod tests {
         decode_fire_block(&buffer.get_bytes())
     }
 
-    /// Runs one real transaction through revm at `SpecId::AMSTERDAM` with the production
-    /// inspector attached, then replays the resulting receipt through `on_tx_end`. See
-    /// [`drive_amsterdam_txs`] for what this exercises and why.
-    fn drive_amsterdam_tx(
+    /// Runs one real transaction through revm at `spec`, with the production inspector
+    /// attached, then replays the resulting receipt through `on_tx_end`. See [`drive_txs`] for
+    /// what this exercises and why.
+    fn drive_tx(
+        spec: SpecId,
         accounts: &[(Address, revm::state::AccountInfo)],
         to: Address,
         value: u64,
     ) -> pb::sf::ethereum::r#type::v2::Block {
-        drive_amsterdam_txs(accounts, &[(to, value)])
+        drive_txs(spec, accounts, &[(to, value)])
     }
 
     /// A plain value transfer between two EOAs produces one call, and the EIP-7708 log lands
     /// on it. There is no other frame it could belong to.
     #[test]
     fn native_transfer_log_attaches_to_root_call() {
-        let block = drive_amsterdam_tx(
+        let block = drive_tx(
+            SpecId::AMSTERDAM,
             &[(SENDER, balance_account(1_000_000)), (RECIPIENT, balance_account(0))],
             RECIPIENT,
             1_000,
@@ -3595,7 +3632,8 @@ mod tests {
     #[test]
     fn native_transfer_log_attaches_to_callee_not_caller() {
         let a = code_account(&op_call_with_value(RECIPIENT, 1_000), 10_000);
-        let block = drive_amsterdam_tx(
+        let block = drive_tx(
+            SpecId::AMSTERDAM,
             &[
                 (SENDER, balance_account(1_000_000)),
                 (CONTRACT_A, a),
@@ -3620,7 +3658,8 @@ mod tests {
     #[test]
     fn native_transfer_log_survives_an_opcode_log_in_the_same_frame() {
         let a = code_account(&op_log0(), 0);
-        let block = drive_amsterdam_tx(
+        let block = drive_tx(
+            SpecId::AMSTERDAM,
             &[(SENDER, balance_account(1_000_000)), (CONTRACT_A, a)],
             CONTRACT_A,
             1_000,
@@ -3634,6 +3673,50 @@ mod tests {
         assert_eq!(call.logs[0].block_index, 0, "the transfer log precedes EVM-emitted logs");
         assert_eq!(call.logs[1].address, CONTRACT_A.to_vec());
         assert_eq!(call.logs[1].block_index, 1);
+    }
+
+    /// The native transfer log must take an ordinal AFTER the balance changes for the very
+    /// transfer it describes. This is the property that keeps [`FirehoseInspector::log`]
+    /// deliberately empty: revm calls that hook before the frame's first `step`, which is where
+    /// the balance changes are emitted, so forwarding the log there would announce the transfer
+    /// ahead of the money moving. A consumer replaying the call by ordinal would see the event
+    /// before its effect.
+    #[test]
+    fn native_transfer_log_is_ordered_after_its_balance_changes() {
+        use pb::sf::ethereum::r#type::v2::balance_change::Reason;
+
+        // A contract target, so the frame executes opcodes and the transfer balance changes are
+        // emitted from the first `step` rather than from `call_end`.
+        let a = code_account(&op_log0(), 0);
+        let block = drive_tx(
+            SpecId::AMSTERDAM,
+            &[(SENDER, balance_account(1_000_000)), (CONTRACT_A, a)],
+            CONTRACT_A,
+            1_000,
+        );
+
+        let trx = block.transaction_traces.first().expect("one transaction");
+        let call = trx.calls.first().expect("the root call");
+
+        let transfer_ordinals: Vec<u64> = call
+            .balance_changes
+            .iter()
+            .filter(|change| change.reason == Reason::Transfer as i32)
+            .map(|change| change.ordinal)
+            .collect();
+        assert_eq!(transfer_ordinals.len(), 2, "sender debit and recipient credit");
+
+        let native_log = &call.logs[0];
+        assert_native_transfer(native_log, SENDER, CONTRACT_A, 1_000);
+
+        for ordinal in transfer_ordinals {
+            assert!(
+                ordinal < native_log.ordinal,
+                "balance change at ordinal {ordinal} must precede the native transfer log at \
+                 ordinal {}",
+                native_log.ordinal,
+            );
+        }
     }
 
     /// Regression: draining only at `call_end` parks an outer frame's log on whichever inner
@@ -3655,7 +3738,8 @@ mod tests {
         };
         let b = code_account(&revert, 0);
 
-        let block = drive_amsterdam_tx(
+        let block = drive_tx(
+            SpecId::AMSTERDAM,
             &[(SENDER, balance_account(1_000_000)), (CONTRACT_A, a), (CONTRACT_B, b)],
             CONTRACT_A,
             1_000,
@@ -3685,7 +3769,8 @@ mod tests {
         code.push(0xff); // SELFDESTRUCT
         let a = code_account(&code, 750);
 
-        let block = drive_amsterdam_tx(
+        let block = drive_tx(
+            SpecId::AMSTERDAM,
             &[
                 (SENDER, balance_account(1_000_000)),
                 (CONTRACT_A, a),
@@ -3714,7 +3799,8 @@ mod tests {
         code.extend(op_create(value, offset, size));
         let a = code_account(&code, 10_000);
 
-        let block = drive_amsterdam_tx(
+        let block = drive_tx(
+            SpecId::AMSTERDAM,
             &[(SENDER, balance_account(1_000_000)), (CONTRACT_A, a)],
             CONTRACT_A,
             0,
@@ -3741,7 +3827,8 @@ mod tests {
         code.extend(op_create2(value, offset, size, 0x07));
         let a = code_account(&code, 10_000);
 
-        let block = drive_amsterdam_tx(
+        let block = drive_tx(
+            SpecId::AMSTERDAM,
             &[(SENDER, balance_account(1_000_000)), (CONTRACT_A, a)],
             CONTRACT_A,
             0,
@@ -3897,7 +3984,8 @@ mod tests {
     #[test]
     fn native_transfer_log_to_precompile_attaches_to_the_precompile_call() {
         let a = code_account(&op_call_with_value(IDENTITY_PRECOMPILE, 1_000), 10_000);
-        let block = drive_amsterdam_tx(
+        let block = drive_tx(
+            SpecId::AMSTERDAM,
             &[
                 (SENDER, balance_account(1_000_000)),
                 (CONTRACT_A, a),
@@ -3920,7 +4008,8 @@ mod tests {
     /// the first tx's, not restart at 0.
     #[test]
     fn native_transfer_log_second_tx_continues_block_index() {
-        let block = drive_amsterdam_txs(
+        let block = drive_txs(
+            SpecId::AMSTERDAM,
             &[
                 (SENDER, balance_account(1_000_000)),
                 (CONTRACT_A, balance_account(0)),
@@ -3949,7 +4038,8 @@ mod tests {
     /// spurious entry here would desync every log index in the block.
     #[test]
     fn zero_value_transfer_emits_no_native_log() {
-        let block = drive_amsterdam_tx(
+        let block = drive_tx(
+            SpecId::AMSTERDAM,
             &[(SENDER, balance_account(1_000_000)), (RECIPIENT, balance_account(0))],
             RECIPIENT,
             0,
@@ -3957,6 +4047,29 @@ mod tests {
 
         let trx = block.transaction_traces.first().expect("one transaction");
         assert!(trx.calls.iter().all(|call| call.logs.is_empty()));
+    }
+
+    /// The fork gate: the exact transfer that produces a native log at Amsterdam must produce
+    /// none at Prague. Pins that the drain reports what revm journals rather than synthesising
+    /// logs of its own, so pre-Amsterdam chains keep byte-identical Firehose output.
+    #[test]
+    fn value_transfer_emits_no_native_log_before_amsterdam() {
+        let accounts = [(SENDER, balance_account(1_000_000)), (RECIPIENT, balance_account(0))];
+
+        let prague = drive_tx(SpecId::PRAGUE, &accounts, RECIPIENT, 1_000);
+        let trx = prague.transaction_traces.first().expect("one transaction");
+        assert!(
+            trx.calls.iter().all(|call| call.logs.is_empty()),
+            "EIP-7708 is not active before Amsterdam"
+        );
+
+        // Same transfer one fork later, to show the assertion above is about the fork and not
+        // about the transfer being unremarkable.
+        let amsterdam = drive_tx(SpecId::AMSTERDAM, &accounts, RECIPIENT, 1_000);
+        let trx = amsterdam.transaction_traces.first().expect("one transaction");
+        let logs: Vec<_> = trx.calls.iter().flat_map(|call| call.logs.iter()).collect();
+        assert_eq!(logs.len(), 1);
+        assert_native_transfer(logs[0], SENDER, RECIPIENT, 1_000);
     }
 
     fn legacy_tx_event() -> firehose_tracer::types::TxEvent {
