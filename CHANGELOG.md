@@ -7,13 +7,38 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## Unreleased
+## reth-v2.5.2-fh3.1-1
+
+### Added
+
+- `FirehoseLiveHooks`, implemented by the node's EVM configuration, selects the chain-specific
+  hooks (`PreTxAdjust`, `PostTxExtras`) installed on live engine-API traced execution. Before,
+  blocks received through `engine_newPayload` were traced without them, so only staged sync
+  applied a chain's fee handling. Every EVM configuration used with the engine validator must
+  implement it.
+- `PostTxExtras::gas_accounting` lets a chain choose the gas price used for the post-transaction
+  `GasRefund` and `RewardTransactionFee` balance changes, add an extra reward to the fee, or
+  suppress both. The default keeps Ethereum fee rules, so existing chains produce the same output.
 
 ### Changed
 
+- Drop KECCAK256 preimages larger than 256 bytes instead of recording them in
+  `Call.keccak_preimages`, matching the geth Firehose tracer. Solidity storage-slot derivations
+  fit well under that size; values could otherwise reach 65536 bytes each. Oversized preimages
+  are dropped, not truncated, so every recorded value still hashes back to its key.
 - Track the development version of `evm-firehose-tracer-rs` instead of the published `5.x` crate,
   picking up the regenerated protobuf bindings that follow `firehose-ethereum` `develop`. The
   dependency is pinned to a commit rather than a branch so builds stay reproducible.
+
+### Fixed
+
+- `Executor::execute` on `FirehoseBlockExecutor` no longer traces. Callers that re-execute blocks
+  for other purposes, such as the ExEx backfill job, emitted those blocks a second time and out of
+  order. `execute_and_trace_one` now falls back to untraced execution when the tracer is not
+  initialized instead of returning an error.
+- Stop reporting a call as self-destructed when a chain replaces SELFDESTRUCT with an undefined
+  instruction. SELFDESTRUCT is now reported after the instruction runs, and reported as failed
+  when it halted as an undefined opcode.
 
 ## reth-v2.5.2-fh3.1
 
