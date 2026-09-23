@@ -11,14 +11,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
-- Report EIP-7708 native ETH transfer logs. revm emits them from the journal with no opcode
-  behind them, at a point no inspector hook brackets, so they were dropped from the call tree
-  while still appearing in the receipt — the tracer then aborted block processing with
-  `mismatch between call logs and receipt logs`. The logs are now drained at a frame's first
-  opcode as well as at its exit, which also settles their attribution: a native transfer log
-  belongs to the frame whose checkpoint scopes it, meaning the callee for `CALL`, the created
-  account for `CREATE`/`CREATE2`, the root call for a transaction's own value transfer, and the
-  destructing call for `SELFDESTRUCT`. Only affects chains with Amsterdam activated.
+- Report EIP-7708 native ETH transfer logs. revm reports them through `Inspector::log`, which the
+  Firehose inspector did not implement, so they were dropped from the call tree while still
+  appearing in the receipt — the tracer then aborted block processing with
+  `mismatch between call logs and receipt logs`. The logs are now drained from the journal at a
+  frame's first opcode as well as at its exit, which also settles their attribution: a native
+  transfer log belongs to the frame whose checkpoint scopes it, meaning the callee for `CALL`,
+  the created account for `CREATE`/`CREATE2`, the root call for a transaction's own value
+  transfer, and the destructing call for `SELFDESTRUCT`. Only affects chains with Amsterdam
+  activated.
 
 ### Changed
 

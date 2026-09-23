@@ -427,16 +427,22 @@ impl<'a> FirehoseInspector<'a> {
 
     /// Emit logs appended to the journal without a LOG opcode.
     ///
-    /// Two producers bypass the `log_full` hook:
+    /// Two producers append to the journal outside the `log_full` hook:
     ///
     /// * Custom precompiles (B-20 tokens, the activation/policy registries, ...) push event logs
-    ///   straight onto the journal via `EvmInternals::log` — see the `Inspector::log_full` rustdoc:
-    ///   "This will not happen only if custom precompiles where logs will be gathered after
-    ///   precompile call."
+    ///   straight onto the journal via `EvmInternals::log`.
     /// * [EIP-7708] native ETH transfer logs, which revm appends from `Journal::transfer_loaded`,
     ///   `create_account_checkpoint` and `selfdestruct` once Amsterdam is active.
     ///
-    /// Either way the call frame would carry fewer logs than the receipt and
+    /// revm does report both: `inspect_frame_init` snapshots the journal log count around
+    /// `frame_init` and forwards anything new through `Inspector::log`, whose default body is
+    /// empty. We deliberately do not override `log` and drain here instead, because `log` fires
+    /// before the frame's first `step` — ahead of the balance changes that `step` emits from the
+    /// journal. Taking the log there would invert Geth's effects-then-event ordinal order for
+    /// exactly the transfer the log describes. Draining from `step` keeps the pair in order at
+    /// the cost of this watermark.
+    ///
+    /// Without a drain the call frame carries fewer logs than the receipt and
     /// `assign_ordinal_and_index_to_receipt_logs` panics on the count mismatch.
     ///
     /// Must be called at every point where the journal can grow without an
@@ -444,8 +450,8 @@ impl<'a> FirehoseInspector<'a> {
     /// length: a single LOG opcode after an undrained journal log strands it
     /// permanently. The drain points are a frame's first `step` (the EIP-7708
     /// log for its own incoming value transfer) and `call_end`/`create_end` (a
-    /// precompile's logs, plus frames that never execute an opcode — EOA
-    /// targets and empty initcode).
+    /// precompile's logs, plus frames that never execute an opcode — an EOA
+    /// target, or a precompile).
     ///
     /// Draining at frame entry is also what makes the attribution right:
     /// revm appends the transfer log *after* taking the callee's checkpoint, so
@@ -1372,6 +1378,13 @@ where
             // opcode behind it. Drain it here, after the balance changes, so it attaches
             // to this frame in effects-then-event order and before any LOG opcode of this
             // frame moves the watermark past it.
+            //
+            // This rides on `pending_value_transfer_check` being set for EVERY frame, not
+            // only the value-bearing ones: `call` and `create` set it unconditionally and
+            // nothing clears it before the first `step`. Gating that flag on a non-zero
+            // value would silently disable the drain, and the next LOG opcode in the frame
+            // would strand the native log — a panic in the receipt-log validator, not a
+            // test failure here. If the flag ever needs narrowing, give the drain its own.
             self.drain_journal_logs(context);
         }
 
@@ -1707,9 +1720,13 @@ where
         // to the CREATE call.
         self.process_journal_changes(context);
 
-        // Zero-length initcode creates an account without executing a single opcode, so
-        // the first-`step` drain never runs and the EIP-7708 endowment log would be left
-        // for an outer frame to pick up. Drain it here while this CREATE is still active.
+        // Backstop for a CREATE frame that never reaches `step`. No such path is reachable
+        // today: zero-length initcode is NOT one, because `Bytecode::new_legacy` turns an
+        // empty input into a single STOP, which steps like any other opcode. The frame-init
+        // failures that do skip `step` (CreateCollision, OutOfFunds, CallTooDeep) all revert
+        // the checkpoint the endowment log lives under, so there is nothing to drain. Kept
+        // because the drain is idempotent through the watermark and the alternative failure
+        // mode — an endowment log picked up by an outer frame — is a validator panic mid-block.
         self.drain_journal_logs(context);
 
         // Clear pending flag: if the CREATE failed before executing any opcode (e.g.
