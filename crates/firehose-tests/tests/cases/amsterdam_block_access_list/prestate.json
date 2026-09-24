@@ -1,7 +1,7 @@
 {
   "context": {
     "baseFeePerGas": "7",
-    "blockAccessListHash": "0x5fbc1b526ee7c320f803ed7e046ee65b7d10e7d11c304de6a2b778cb58bbdb81",
+    "blockAccessListHash": "0x45b0a8a7976a41549ff7ef4a07ade2d6e91c9ace6780185a8ebd98c6b3de6089",
     "difficulty": "0",
     "gasLimit": "30000000",
     "miner": "0xf97e180c050e5ab072211ad2c213eb5aee4df134",
@@ -36,10 +36,10 @@
       "mergeNetsplitBlock": 0,
       "shanghaiTime": 0,
       "cancunTime": 0,
-      "pragueTime": 1742999832,
-      "osakaTime": 1761677592,
-      "bpo1Time": 1762365720,
-      "bpo2Time": 1762955544,
+      "pragueTime": 0,
+      "osakaTime": 0,
+      "bpo1Time": 0,
+      "bpo2Time": 0,
       "amsterdamTime": 0,
       "terminalTotalDifficulty": 0,
       "depositContractAddress": "0x00000000219ab540356cbb839cbe05303d7705fa",
