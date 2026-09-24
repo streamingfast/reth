@@ -40,6 +40,11 @@ fn amsterdam_slot_number() {
 /// EIP-7928: `run_wrapped_block` (this repo's pipeline/backfill path) has no payload sidecar to
 /// source the block access list from, so it must reconstruct it via re-execution and only surface
 /// it once the reconstructed hash matches the header's declared `block_access_list_hash`.
+///
+/// Because of that check the fixture's `context.blockAccessListHash` is not free-standing: it has
+/// to be regenerated from the reconstructed value whenever anything about the block changes,
+/// including its fork configuration, since the accesses a newly-active system call makes belong in
+/// the list too. A stale value here fails as a hash mismatch, not as a golden diff.
 #[test]
 fn amsterdam_block_access_list() {
     let folder = case_dir("amsterdam_block_access_list");
