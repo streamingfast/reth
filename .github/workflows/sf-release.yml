@@ -21,7 +21,16 @@ on:
       - "release/*"
     tags:
       - "*-fh*"
+  # Deliberately only filtered on pull requests. A `push` path filter is also
+  # evaluated for tag pushes, so a release commit that only bumps CHANGELOG.md
+  # would silently skip building and publishing its own image.
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "book/**"
+      - "LICENSE-*"
+      - ".github/ISSUE_TEMPLATE/**"
   workflow_dispatch:
     inputs:
       firehose_ethereum:
@@ -29,13 +38,29 @@ on:
         required: false
         default: "latest"
 
+# A `synchronize` event on an open PR supersedes the run already in flight for
+# the same ref; a ~25 minute image build is far too expensive to keep burning on
+# a commit nobody is looking at anymore. Pushes to `release/*` and tags are never
+# cancelled: their images are published artifacts, not throwaway validation.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    # 16-core org runner: the `reth` workspace build is the whole cost of this
+    # job and parallelises well, so cores buy wall clock almost linearly until
+    # the serial link tail dominates. The 64 GB of RAM also keeps that link off
+    # a 16 GB standard runner's swap.
+    #
+    # Guarded on the repository so forks — which cannot see the organization's
+    # runner and would otherwise queue forever with no error — fall back to a
+    # standard runner.
+    runs-on: ${{ github.repository == 'streamingfast/reth' && 'sf-ubuntu-24.04-16core' || 'ubuntu-24.04' }}
 
     permissions:
       contents: read
@@ -111,10 +136,23 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
           # Cache the cargo-chef dependency layer across runs (ephemeral runners
-          # otherwise cold-rebuild all deps every time). Keyed per profile by
-          # buildx, so branch/PR (release) and tag (maxperf) caches stay separate.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # otherwise cold-rebuild all deps every time).
+          #
+          # Scoped per build profile: `release` and `maxperf` produce entirely
+          # different layers, so sharing one scope only makes them evict each
+          # other out of the repository's 10 GB Actions cache budget.
+          #
+          # Reads fall back to the default branch scope, which is where the
+          # useful entries live.
+          cache-from: |
+            type=gha,scope=${{ startsWith(github.ref, 'refs/tags/') && 'maxperf' || 'release' }}
+          # Pull requests read the cache but never write it. A PR's cache entries
+          # are scoped to `refs/pull/N/merge`, so no other run can ever read them
+          # — writing them is ~2 GB of pure waste per run that LRU-evicts the
+          # default-branch entries every PR build actually depends on, and costs
+          # ~3.5 minutes of export time on top.
+          cache-to: |
+            ${{ github.event_name != 'pull_request' && format('type=gha,mode=max,scope={0}', startsWith(github.ref, 'refs/tags/') && 'maxperf' || 'release') || '' }}
           build-args: |
             VERSION=${{ steps.extract-version.outputs.VERSION }}
             FIREHOSE_ETHEREUM=${{ inputs.firehose_ethereum || 'latest' }}
