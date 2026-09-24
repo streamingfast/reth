@@ -46,6 +46,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   hash doesn't match the header's declared one, since this is the first re-execution-based
   reconstruction shipped and a mismatch means the reconstruction is wrong, not the block.
 
+- Report the EIP-8037 state gas in `Call.gas_consumed`. A frame's regular gas and its state gas
+  are tracked separately, and only the regular half was reported: a call was charged less than it
+  consumed when the state gas came out of the transaction's reservoir, and more when a revert
+  handed that gas back. Only affects chains with Amsterdam activated.
+
 ## reth-v2.5.2-fh3.1-1
 
 ### Added

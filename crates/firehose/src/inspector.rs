@@ -10,7 +10,7 @@ use reth_revm::revm::{
     interpreter::{
         interpreter::EthInterpreter,
         interpreter_types::{Jumps, LoopControl},
-        CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter,
+        CallInputs, CallOutcome, CreateInputs, CreateOutcome, Gas, Interpreter,
     },
     primitives::KECCAK_EMPTY,
 };
@@ -1330,6 +1330,46 @@ impl<'a> FirehoseInspector<'a> {
         }
     }
 
+    /// Gas charged to a frame, as its caller will see it once revm settles the frame.
+    ///
+    /// [`Gas::total_gas_spent`] is `limit - remaining`, and under [EIP-8037] a frame's
+    /// `remaining` covers regular gas only. State gas paid out of the transaction's reservoir
+    /// therefore never shows up there, while the part that spilled into regular gas once the
+    /// reservoir ran dry does — a split the caller's own accounting does not make, so both have
+    /// to be folded back in here. Before Amsterdam every state-gas term is zero and this is
+    /// `total_gas_spent` unchanged.
+    ///
+    /// The hooks that call this run before revm reconciles the frame into its parent
+    /// (`handle_reservoir_remaining_gas`), so the counters still hold the charges it is about to
+    /// settle. That settlement is what each branch mirrors:
+    ///
+    /// - a halt consumes the frame's whole regular limit and hands the reservoir back untouched;
+    /// - a revert returns the state gas in full, spilled part included, leaving the regular gas
+    ///   minus that spill;
+    /// - a success keeps everything, so the reservoir-paid part — total charged less the spill —
+    ///   joins the regular figure.
+    ///
+    /// `state_gas_spent` is signed because a frame that restores more `0 -> x -> 0` slots than it
+    /// created hands the surplus back to a parent that charged the original `0 -> x`; that debt is
+    /// the parent's to report, hence the clamp.
+    ///
+    /// [EIP-8037]: https://eips.ethereum.org/EIPS/eip-8037
+    fn frame_gas_consumed(gas: &Gas, failed: bool, is_revert: bool) -> u64 {
+        // A halting error consumes all gas allocated to the frame. revm's spent counters only
+        // track opcodes that actually ran, so the limit is the only faithful figure.
+        if failed && !is_revert {
+            return gas.limit();
+        }
+
+        let spilled = gas.state_gas_spilled();
+        if is_revert {
+            return gas.total_gas_spent().saturating_sub(spilled);
+        }
+
+        let from_reservoir = gas.state_gas_spent().saturating_sub_unsigned(spilled).max(0) as u64;
+        gas.total_gas_spent().saturating_add(from_reservoir)
+    }
+
     /// Format EVM execution failure reason to match Geth's error strings.
     ///
     /// `is_create` distinguishes CREATE context (where OOG produces
@@ -1685,15 +1725,7 @@ where
         let err: Option<StringError> =
             if failed { Some(Self::failure_reason(outcome.result.result, false)) } else { None };
 
-        // EVM semantics: a halting error (not a revert) consumes all gas
-        // allocated to the call. revm's gas.spent() only tracks opcodes that
-        // actually executed, so we use gas.limit for non-revert failures.
-        // Reverts only consume gas actually spent (remaining gas is returned).
-        let gas_used = if failed && !is_revert {
-            outcome.result.gas.limit()
-        } else {
-            outcome.result.gas.total_gas_spent()
-        };
+        let gas_used = Self::frame_gas_consumed(&outcome.result.gas, failed, is_revert);
 
         // At root call exit, capture nonce/code state for self-destructed contracts.
         // The actual emission happens later in process_post_tx_balance_changes (after
@@ -1801,11 +1833,7 @@ where
         let err: Option<StringError> =
             if failed { Some(Self::failure_reason(outcome.result.result, true)) } else { None };
 
-        let gas_used = if failed && !is_revert {
-            outcome.result.gas.limit()
-        } else {
-            outcome.result.gas.total_gas_spent()
-        };
+        let gas_used = Self::frame_gas_consumed(&outcome.result.gas, failed, is_revert);
 
         // At root create exit, capture nonce/code state for self-destructed contracts
         // (same rationale as in call_end — emission deferred to process_post_tx_balance_changes).
@@ -3630,7 +3658,11 @@ mod tests {
             let insp = FirehoseInspector::new(&mut tracer);
             let mut evm = Context::mainnet()
                 .with_db(db)
-                .modify_cfg_chained(|cfg| cfg.spec = spec)
+                // Matches how the node builds its config (`EthEvmConfig::evm_env`): assigning
+                // `spec` alone leaves the Amsterdam gas params and the EIP-8037/EIP-2780
+                // switches off, so the EVM under test would not be the one that runs in
+                // production.
+                .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(spec))
                 .build_mainnet_with_inspector(insp);
 
             // Block-wide log count seen so far, mirroring `log_block_index`: a receipt log's
@@ -5290,6 +5322,83 @@ mod tests {
                 "no finalization cleanup at {spec:?}: {state:?}"
             );
         }
+    }
+
+    /// EIP-8037: a call's `gas_consumed` must not depend on where the state gas it charged
+    /// happened to come from.
+    ///
+    /// State gas is drawn from the transaction's reservoir first and only spills into regular
+    /// gas once the reservoir is empty. The reservoir exists only when the gas limit exceeds
+    /// `TX_GAS_LIMIT_CAP`, so the same `SSTORE` charges the same 64 state bytes either way —
+    /// paid out of regular gas under the cap, out of the reservoir above it. Reporting the
+    /// regular component alone would make the identical call look cheaper purely because it was
+    /// sent with a larger limit.
+    #[test]
+    fn call_gas_consumed_is_independent_of_the_eip8037_reservoir() {
+        use reth_revm::revm::primitives::eip7825::TX_GAS_LIMIT_CAP;
+
+        // PUSH1 0x01, PUSH1 0x00, SSTORE, STOP: one 0->non-zero store, 64 state bytes.
+        const SSTORE_ONE: &[u8] = &[0x60, 0x01, 0x60, 0x00, 0x55, 0x00];
+
+        let accounts =
+            [(SENDER, balance_account(u64::MAX)), (RECIPIENT, code_account(SSTORE_ONE, 0))];
+
+        let root_call_gas = |gas_limit: u64| {
+            let block =
+                drive_txs_with_gas(SpecId::AMSTERDAM, &accounts, &[(RECIPIENT, 0, gas_limit)]);
+            let trx = block.transaction_traces.first().expect("one transaction").clone();
+            let root = trx.calls.first().expect("a root call");
+            (root.gas_consumed, trx.gas_used)
+        };
+
+        let (under_cap, under_cap_tx) = root_call_gas(TX_GAS_LIMIT_CAP);
+        let (over_cap, over_cap_tx) = root_call_gas(TX_GAS_LIMIT_CAP + 200_000);
+
+        // Control: the work done is identical, so the receipt agrees across both limits. If this
+        // ever fails the fixture changed, not the reporting.
+        assert_eq!(under_cap_tx, over_cap_tx, "the same store costs the same either way");
+
+        assert_eq!(
+            over_cap, under_cap,
+            "reservoir-paid state gas is missing from the call's gas_consumed"
+        );
+    }
+
+    /// EIP-8037: a revert returns the state gas the frame charged, so `gas_consumed` must not
+    /// keep it.
+    ///
+    /// Pre-Amsterdam a reverted `SSTORE` was still paid for in full. Under EIP-8037 the state
+    /// component is handed back to the reservoir instead, and unlike the reservoir itself this
+    /// applies at any gas limit — an ordinary transaction whose call reverts after storing hits
+    /// it. Checked against the receipt rather than a constant: the root call plus the intrinsic
+    /// gas is what the transaction is charged, and the intrinsic part is read off a transaction
+    /// that does nothing but revert.
+    #[test]
+    fn call_gas_consumed_excludes_state_gas_returned_on_revert() {
+        // PUSH1 0x00, PUSH1 0x00, REVERT.
+        const REVERT: &[u8] = &[0x60, 0x00, 0x60, 0x00, 0xfd];
+        // PUSH1 0x01, PUSH1 0x00, SSTORE, then the same revert: 64 state bytes, all returned.
+        const SSTORE_THEN_REVERT: &[u8] =
+            &[0x60, 0x01, 0x60, 0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xfd];
+
+        let charged = |code: &[u8]| {
+            let accounts =
+                [(SENDER, balance_account(u64::MAX)), (RECIPIENT, code_account(code, 0))];
+            let block = drive_tx(SpecId::AMSTERDAM, &accounts, RECIPIENT, 0);
+            let trx = block.transaction_traces.first().expect("one transaction").clone();
+            let root = trx.calls.first().expect("a root call");
+            (root.gas_consumed, trx.gas_used)
+        };
+
+        let (bare_root, bare_tx) = charged(REVERT);
+        let intrinsic = bare_tx - bare_root;
+
+        let (root, tx) = charged(SSTORE_THEN_REVERT);
+        assert_eq!(
+            root + intrinsic,
+            tx,
+            "the reverted store's state gas is reported as consumed but the receipt gave it back"
+        );
     }
 
     fn legacy_tx_event() -> firehose_tracer::types::TxEvent {
