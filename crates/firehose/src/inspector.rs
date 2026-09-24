@@ -116,6 +116,10 @@ pub struct FirehoseInspector<'a> {
 
     /// Addresses that executed SELFDESTRUCT and were truly destroyed (AccountDestroyed
     /// journal entry) during the current transaction.
+    ///
+    /// Entries are added when the opcode runs and are NOT removed when the frame around it
+    /// reverts, so this is a set of candidates: `capture_selfdestruct_cleanup` keeps only the
+    /// ones whose journal entry survived in the committed journal.
     selfdestruct_addresses: HashSet<Address>,
 
     /// Captured nonce/code state for self-destructed accounts, to be emitted after post-tx
@@ -977,17 +981,43 @@ impl<'a> FirehoseInspector<'a> {
     /// for these cleanup operations. We capture the pre-destruction state here (at root
     /// call exit, while EVM context is still available) and emit later in
     /// `process_post_tx_balance_changes` to match Geth's ordinal ordering.
+    ///
+    /// Reverted destructions are filtered out here rather than at the opcode, because whether
+    /// the surrounding frame commits is not known until it exits.
     fn capture_selfdestruct_cleanup<CTX>(&mut self, context: &mut CTX)
     where
         CTX: ContextTr,
         CTX::Journal: JournalExt,
     {
+        use reth_revm::revm::context::JournalEntry;
+
+        // Only the destructions still present in the committed journal actually happened.
+        // `selfdestruct_addresses` is filled when the opcode runs; when the frame around it
+        // reverts, revm truncates the `AccountDestroyed` entry and never tells the inspector,
+        // so the set keeps addresses whose account survived with its nonce and code intact.
+        // Emitting the cleanup for those reported `nonce → 0` and an empty code for a live
+        // account. Geth's journal reverts its self-destruct set, so it emits nothing there.
+        let destroyed: HashSet<Address> = context
+            .journal()
+            .journal()
+            .iter()
+            .filter_map(|entry| match entry {
+                JournalEntry::AccountDestroyed { address, .. } => Some(*address),
+                _ => None,
+            })
+            .collect();
+
         // Iterate in ascending address order so downstream nonce/code-change events are
         // emitted deterministically, matching Geth's `statedb.Finalise()` which sorts
         // self-destructed addresses before invoking hooks. Without this, creating and
         // selfdestructing N contracts in one tx would emit cleanup hooks in HashSet
         // iteration order and diverge from Geth firehose traces.
-        let mut sorted: Vec<Address> = self.selfdestruct_addresses.iter().copied().collect();
+        let mut sorted: Vec<Address> = self
+            .selfdestruct_addresses
+            .iter()
+            .copied()
+            .filter(|address| destroyed.contains(address))
+            .collect();
         sorted.sort_unstable();
 
         for address in sorted {
@@ -1074,9 +1104,25 @@ impl<'a> FirehoseInspector<'a> {
                     let b = balance.get_or_insert_with(|| get_pre_tx_balance(address));
                     *b = b.saturating_add(*had_balance);
                 }
-                // SELFDESTRUCT: contract's balance was zeroed. Also covers the
-                // self-beneficiary case (`target == address`), where the balance is burned.
-                JournalEntry::AccountDestroyed { address: a, .. } if *a == address => {
+                // SELFDESTRUCT: the contract's balance left the account, either to `target` or
+                // (self-beneficiary, pre-Amsterdam) to the burn.
+                //
+                // `had_balance` is what actually left. [EIP-8246] makes a self-beneficiary
+                // SELFDESTRUCT record zero there and keep the balance on the account, which is
+                // then stripped of code, storage and nonce at finalization. Zeroing the running
+                // balance on that entry would make the GasRefund / RewardTransactionFee event
+                // that follows report `old_balance = 0` for an account that still holds its
+                // ether — reachable when a tx CREATE2s the coinbase address and self-destructs
+                // it, or on an OP Stack fee vault resolved through `post_tx_balance`.
+                //
+                // Pre-Amsterdam a zero `had_balance` on the self-beneficiary path means the
+                // account held nothing to burn, so leaving the running balance untouched is
+                // correct on both sides of the fork.
+                //
+                // [EIP-8246]: https://eips.ethereum.org/EIPS/eip-8246
+                JournalEntry::AccountDestroyed { address: a, target, had_balance, .. }
+                    if *a == address && (target != a || !had_balance.is_zero()) =>
+                {
                     balance = Some(U256::ZERO);
                 }
                 _ => {}
@@ -1463,20 +1509,22 @@ where
         } else if step_ctx.opcode == Opcode::SelfDestruct as u8 {
             use reth_revm::revm::interpreter::InstructionResult;
 
-            if interp.bytecode.instruction_result() == Some(InstructionResult::OpcodeNotFound) {
-                // The instruction table does not define 0xff: the frame halted on an undefined
-                // opcode and nothing self-destructed.
-                let err = StringError("opcode not found".to_string());
-                self.tracer.on_opcode(
-                    step_ctx.pc,
-                    step_ctx.opcode,
-                    step_ctx.gas,
-                    0,
-                    &[],
-                    step_ctx.depth,
-                    Some(&err),
-                );
-            } else {
+            // `SelfDestruct` is the only result that means the account was destroyed. The
+            // tracer marks the active call as self-destructed the moment it is told 0xff ran
+            // without an error, so every other outcome has to be reported as a failure:
+            //
+            // * `OpcodeNotFound` — a chain replaced SELFDESTRUCT with an undefined instruction.
+            // * `OutOfGas` — revm mutates the journal inside `Journal::selfdestruct` and charges
+            //   the dynamic cost afterwards, so the instruction can still halt on gas with the
+            //   `AccountDestroyed` entry already written. Geth charges before running the opcode
+            //   body, so its tracer never sees a suicide here.
+            // * a static-call violation, or any future halt.
+            //
+            // Reverting the frame rolls the journal entry back, so the emission below would be
+            // dropped as reverted state anyway — but the `suicide` marker sits on the call
+            // itself and outlives that.
+            let result = interp.bytecode.instruction_result();
+            if result == Some(InstructionResult::SelfDestruct) {
                 self.tracer.on_opcode(
                     step_ctx.pc,
                     step_ctx.opcode,
@@ -1487,6 +1535,20 @@ where
                     None,
                 );
                 self.process_selfdestruct_balance_changes(context, step_ctx.start_journal_idx);
+            } else {
+                let err = result.map_or_else(
+                    || StringError("selfdestruct did not run".to_string()),
+                    |result| Self::failure_reason(result, false),
+                );
+                self.tracer.on_opcode(
+                    step_ctx.pc,
+                    step_ctx.opcode,
+                    step_ctx.gas,
+                    0,
+                    &[],
+                    step_ctx.depth,
+                    Some(&err),
+                );
             }
         }
     }
@@ -2392,8 +2454,8 @@ mod tests {
         );
     }
 
-    /// Self-beneficiary SELFDESTRUCT (`target == address`): the balance is burned, not
-    /// credited. The beneficiary arm must not fire and re-add it.
+    /// Self-beneficiary SELFDESTRUCT (`target == address`) before Amsterdam: the balance is
+    /// burned, not credited. The beneficiary arm must not fire and re-add it.
     #[test]
     fn resolve_post_tx_balance_selfdestruct_to_self_burns() {
         use reth_revm::revm::context_interface::journaled_state::entry::SelfdestructionRevertStatus;
@@ -2418,6 +2480,39 @@ mod tests {
                 &mut get_pre,
             ),
             U256::ZERO,
+        );
+    }
+
+    /// Self-beneficiary SELFDESTRUCT at Amsterdam: [EIP-8246] keeps the balance on the account
+    /// and revm records `had_balance = 0` to say so. The resolver must leave the running balance
+    /// alone — an account that is also the coinbase would otherwise report
+    /// `RewardTransactionFee old_balance = 0` while still holding its ether.
+    ///
+    /// [EIP-8246]: https://eips.ethereum.org/EIPS/eip-8246
+    #[test]
+    fn resolve_post_tx_balance_selfdestruct_to_self_keeps_balance_at_amsterdam() {
+        use reth_revm::revm::context_interface::journaled_state::entry::SelfdestructionRevertStatus;
+
+        let account = addr(0x87);
+        let pre_tx = U256::from(0x1000_u64);
+
+        let journal = vec![JournalEntry::AccountDestroyed {
+            had_balance: U256::ZERO,
+            address: account,
+            target: account,
+            destroyed_status: SelfdestructionRevertStatus::GloballySelfdestroyed,
+        }];
+        let mut get_pre = |_: Address| pre_tx;
+
+        assert_eq!(
+            FirehoseInspector::resolve_post_tx_balance(
+                account,
+                None,
+                U256::ZERO,
+                &journal,
+                &mut get_pre,
+            ),
+            pre_tx,
         );
     }
 
@@ -3485,6 +3580,19 @@ mod tests {
         accounts: &[(Address, revm::state::AccountInfo)],
         txs: &[(Address, u64)],
     ) -> pb::sf::ethereum::r#type::v2::Block {
+        const AMPLE_GAS: u64 = 1_000_000;
+
+        let txs: Vec<_> = txs.iter().map(|&(to, value)| (to, value, AMPLE_GAS)).collect();
+        drive_txs_with_gas(spec, accounts, &txs)
+    }
+
+    /// [`drive_txs`] with a per-transaction gas limit, so a scenario can starve a frame instead
+    /// of always running to completion.
+    fn drive_txs_with_gas(
+        spec: SpecId,
+        accounts: &[(Address, revm::state::AccountInfo)],
+        txs: &[(Address, u64, u64)],
+    ) -> pb::sf::ethereum::r#type::v2::Block {
         use reth_revm::revm::{
             context::{Context, TxEnv},
             database::{CacheDB, EmptyDB},
@@ -3530,8 +3638,7 @@ mod tests {
             // within this tx's own `ExecutionResult::logs()`.
             let mut block_log_offset = 0u32;
 
-            for (tx_index, &(to, value)) in txs.iter().enumerate() {
-                let gas_limit = 1_000_000;
+            for (tx_index, &(to, value, gas_limit)) in txs.iter().enumerate() {
                 let tx = TxEnv {
                     caller: SENDER,
                     gas_limit,
@@ -3572,10 +3679,11 @@ mod tests {
                         block_log_offset + log_index as u32,
                     ));
                 }
-                evm.inspector.tracer_mut().on_tx_end(Some(&receipt), None);
-
-                // Mirrors the production executor's post-tx accounting call, whose sole
-                // effect relevant here is `self.log_block_index += committed_log_count`.
+                // Mirrors the production executor, which runs post-tx accounting before
+                // closing the transaction: the gas-refund and coinbase-reward events, and the
+                // nonce/code cleanup of self-destructed accounts, all belong to the
+                // transaction the tracer is still inside. It also advances the block-wide log
+                // counter (`self.log_block_index += committed_log_count`).
                 evm.inspector.process_post_tx_balance_changes(
                     SENDER,
                     Address::ZERO,
@@ -3586,6 +3694,8 @@ mod tests {
                     committed_log_count,
                     |_| U256::ZERO,
                 );
+
+                evm.inspector.tracer_mut().on_tx_end(Some(&receipt), None);
                 block_log_offset += committed_log_count;
             }
 
@@ -4070,6 +4180,1116 @@ mod tests {
         let logs: Vec<_> = trx.calls.iter().flat_map(|call| call.logs.iter()).collect();
         assert_eq!(logs.len(), 1);
         assert_native_transfer(logs[0], SENDER, RECIPIENT, 1_000);
+    }
+
+    // ---- EIP-8246 SELFDESTRUCT burn removal ----------------------------------------------
+    //
+    // [EIP-8246] stops `SELFDESTRUCT` from burning ETH: a self-beneficiary `SELFDESTRUCT`
+    // leaves the balance on the account, and at transaction finalization a self-destructed
+    // account that still holds a balance keeps it, losing only its nonce, code and storage.
+    //
+    // revm implements the rule (`JournalInner::selfdestruct` and
+    // `eip8246_clear_selfdestructed_accounts`); what the tests below pin is the Firehose side:
+    // which balance changes the inspector reports on each side of the fork. Every case from the
+    // EIP's own test-case list is driven at `PRAGUE` and at `AMSTERDAM` from the same scenario,
+    // so a difference in the reported events is attributable to the fork and nothing else.
+    //
+    // No new event kind is introduced. In particular the storage that revm wipes at
+    // finalization is not reported: nothing reported it before the fork and the Firehose
+    // protocol has no account-clearing event to hang it on.
+    //
+    // [EIP-8246]: https://eips.ethereum.org/EIPS/eip-8246
+
+    /// Beneficiary of every `selfdestruct-to-other` below, distinct from [`RECIPIENT`] so a
+    /// suicide refund cannot be confused with a plain transfer.
+    const BENEFICIARY: Address = Address::repeat_byte(0xbe);
+
+    /// Contract the transaction calls: it CREATE2s the account under test and then drives it.
+    const FACTORY: Address = Address::repeat_byte(0xf1);
+
+    /// Contract that calls the account under test and then reverts, so the `SELFDESTRUCT` it
+    /// triggered is rolled back with the frame.
+    const REVERTER: Address = Address::repeat_byte(0x5e);
+
+    /// Salt [`FACTORY`] CREATE2s the account under test with.
+    const SUBJECT_SALT: u8 = 1;
+
+    /// `CALLDATASIZE` selectors of the account under test, see [`subject_runtime`].
+    const SD_SELF: u8 = 0;
+    const SD_OTHER: u8 = 1;
+    const RECEIVE: u8 = 2;
+    const SSTORE_SLOT: u8 = 3;
+    const BUMP_NONCE: u8 = 4;
+
+    /// One SELFDESTRUCT scenario: [`FACTORY`] CREATE2s `initcode` with `endowment` wei and then
+    /// runs `ops`, and the transaction calls [`FACTORY`] with no value of its own.
+    ///
+    /// Scenarios are declared once and run at two spec ids, which is what makes a "before and
+    /// after the fork" assertion a comparison of the same execution rather than of two
+    /// hand-written fixtures.
+    struct Scenario {
+        initcode: Vec<u8>,
+        endowment: u64,
+        ops: Vec<Vec<u8>>,
+        extra_accounts: Vec<(Address, revm::state::AccountInfo)>,
+        gas_limit: u64,
+        transactions: usize,
+    }
+
+    impl Default for Scenario {
+        fn default() -> Self {
+            Self {
+                initcode: subject_initcode(),
+                endowment: 1_000,
+                ops: Vec::new(),
+                extra_accounts: Vec::new(),
+                gas_limit: 1_000_000,
+                transactions: 1,
+            }
+        }
+    }
+
+    impl Scenario {
+        /// Address [`FACTORY`]'s CREATE2 lands this scenario's account on. Precomputed so a
+        /// scenario can bake calls to the account into code deployed before it exists.
+        fn subject(&self) -> Address {
+            create2_address(&self.initcode)
+        }
+
+        fn run(&self, spec: SpecId) -> pb::sf::ethereum::r#type::v2::Block {
+            let mut accounts = vec![
+                (SENDER, balance_account(1_000_000)),
+                (
+                    FACTORY,
+                    code_account(
+                        &factory_code(&self.initcode, self.endowment, &self.ops),
+                        1_000_000,
+                    ),
+                ),
+                (BENEFICIARY, balance_account(0)),
+            ];
+            accounts.extend(self.extra_accounts.iter().cloned());
+
+            let txs: Vec<_> =
+                (0..self.transactions).map(|_| (FACTORY, 0, self.gas_limit)).collect();
+            drive_txs_with_gas(spec, &accounts, &txs)
+        }
+
+        /// Address labels for [`balance_change_log`] and [`state_change_log`].
+        fn labels(&self) -> Vec<(Address, &'static str)> {
+            vec![
+                (SENDER, "sender"),
+                (FACTORY, "factory"),
+                (self.subject(), "subject"),
+                (BENEFICIARY, "beneficiary"),
+                (REVERTER, "reverter"),
+            ]
+        }
+
+        /// The balance changes of the scenario's first transaction at `spec`.
+        fn balance_log(&self, spec: SpecId) -> Vec<String> {
+            balance_change_log(&self.run(spec), &self.labels())
+        }
+
+        /// Asserts the scenario's balance changes on both sides of the fork: `before` at
+        /// `PRAGUE`, `after` at `AMSTERDAM`.
+        fn assert_balance_logs(&self, before: &[&str], after: &[&str]) {
+            assert_eq!(self.balance_log(SpecId::PRAGUE), before, "before Amsterdam");
+            assert_eq!(self.balance_log(SpecId::AMSTERDAM), after, "at Amsterdam");
+        }
+    }
+
+    /// Address of the account under test in every scenario that keeps the default initcode.
+    /// Precomputed rather than derived from a running scenario: the factory's own code has to
+    /// contain calls to it.
+    fn subject() -> Address {
+        create2_address(&subject_initcode())
+    }
+
+    /// Runtime code of the account under test, dispatching on the number of calldata bytes:
+    ///
+    /// * [`SD_SELF`] — `SELFDESTRUCT` with itself as beneficiary
+    /// * [`SD_OTHER`] — `SELFDESTRUCT` to [`BENEFICIARY`]
+    /// * [`RECEIVE`] — `STOP`, so a caller can fund the account without destroying it again
+    /// * [`SSTORE_SLOT`] — write storage slot 1, then `STOP`
+    /// * [`BUMP_NONCE`] — `CREATE` two empty accounts to raise its own nonce, then `STOP`
+    ///
+    /// One contract covers every case because `SELFDESTRUCT` halts its frame: "selfdestruct,
+    /// then receive value, then selfdestruct again" can only be expressed as separate calls
+    /// into the same account, and the account has to behave differently in each.
+    fn subject_runtime() -> Vec<u8> {
+        let bump = [op_create(0, 0, 0), op_create(0, 0, 0), vec![0x00]].concat();
+
+        op_dispatch(&[
+            op_selfdestruct_self(),
+            op_selfdestruct_to(BENEFICIARY),
+            vec![0x00], // STOP
+            [op_sstore(1, 1), vec![0x00]].concat(),
+            bump,
+        ])
+    }
+
+    fn subject_initcode() -> Vec<u8> {
+        op_deploy(&subject_runtime())
+    }
+
+    fn create2_address(initcode: &[u8]) -> Address {
+        FACTORY.create2_from_code(B256::left_padding_from(&[SUBJECT_SALT]), initcode)
+    }
+
+    /// Code for [`FACTORY`]: CREATE2 `initcode` with `endowment` wei, then run `ops`.
+    fn factory_code(initcode: &[u8], endowment: u64, ops: &[Vec<u8>]) -> Vec<u8> {
+        let (mut code, offset, size) = op_store_bytes(initcode);
+        code.extend(op_create2(endowment, offset, size, SUBJECT_SALT));
+        for op in ops {
+            code.extend_from_slice(op);
+        }
+        code
+    }
+
+    /// `ADDRESS SELFDESTRUCT` — the executing account is its own beneficiary.
+    fn op_selfdestruct_self() -> Vec<u8> {
+        vec![0x30, 0xff]
+    }
+
+    /// `PUSH20 <beneficiary> SELFDESTRUCT`.
+    fn op_selfdestruct_to(beneficiary: Address) -> Vec<u8> {
+        let mut code = push(beneficiary.as_slice());
+        code.push(0xff); // SELFDESTRUCT
+        code
+    }
+
+    /// `SSTORE` a single-byte `value` into a single-byte `slot`.
+    fn op_sstore(slot: u8, value: u8) -> Vec<u8> {
+        let mut code = push(&[value]);
+        code.extend(push(&[slot]));
+        code.push(0x55); // SSTORE
+        code
+    }
+
+    /// `REVERT` over an empty data range.
+    fn op_revert() -> Vec<u8> {
+        let mut code = push(&[0]); // size
+        code.extend(push(&[0])); // offset
+        code.push(0xfd); // REVERT
+        code
+    }
+
+    /// `CALL(gas = all remaining, target, value, in = `selector` bytes, out = none)` then `POP`.
+    ///
+    /// The callee dispatches on `CALLDATASIZE`, so the argument *length* is the selector and the
+    /// bytes themselves are whatever the caller's memory happens to hold.
+    fn op_call_selector(target: Address, value: u64, selector: u8) -> Vec<u8> {
+        op_call_selector_forwarding(target, value, selector, None)
+    }
+
+    /// [`op_call_selector`] forwarding exactly `gas`, so the callee can be starved of it.
+    fn op_call_selector_with_gas(target: Address, value: u64, selector: u8, gas: u16) -> Vec<u8> {
+        op_call_selector_forwarding(target, value, selector, Some(gas))
+    }
+
+    fn op_call_selector_forwarding(
+        target: Address,
+        value: u64,
+        selector: u8,
+        gas: Option<u16>,
+    ) -> Vec<u8> {
+        let mut code = Vec::new();
+        code.extend(push(&[0])); // retLength
+        code.extend(push(&[0])); // retOffset
+        code.extend(push(&[selector])); // argsLength
+        code.extend(push(&[0])); // argsOffset
+        code.extend(push(&value.to_be_bytes())); // value
+        code.extend(push(target.as_slice())); // address
+        match gas {
+            Some(gas) => code.extend(push(&gas.to_be_bytes())),
+            None => code.push(0x5a), // GAS
+        }
+        code.push(0xf1); // CALL
+        code.push(0x50); // POP
+        code
+    }
+
+    /// Initcode returning `runtime` as the deployed code.
+    fn op_deploy(runtime: &[u8]) -> Vec<u8> {
+        let (mut code, offset, size) = op_store_bytes(runtime);
+        code.extend(push(&[size]));
+        code.extend(push(&[offset]));
+        code.push(0xf3); // RETURN
+        code
+    }
+
+    /// Writes `data` into memory at offset 0, one `MSTORE` per 32-byte word with the last word
+    /// zero-padded, and returns the bytecode plus the `(offset, size)` pair a CREATE, CREATE2 or
+    /// RETURN reads it back from.
+    ///
+    /// [`op_store_initcode`] left-pads a single word instead, which caps it at 32 bytes; the
+    /// dispatch runtime is larger than that.
+    fn op_store_bytes(data: &[u8]) -> (Vec<u8>, u8, u8) {
+        assert!(data.len() <= 255, "memory offsets and sizes are pushed as a single byte");
+
+        let mut code = Vec::new();
+        for (index, chunk) in data.chunks(32).enumerate() {
+            let mut word = [0u8; 32];
+            word[..chunk.len()].copy_from_slice(chunk);
+            code.extend(push(&word));
+            code.extend(push(&[(index * 32) as u8]));
+            code.push(0x52); // MSTORE
+        }
+        (code, 0, data.len() as u8)
+    }
+
+    /// Builds runtime code that dispatches on `CALLDATASIZE`: `bodies[i]` runs for a call
+    /// carrying `i` bytes of calldata. Every body must halt its own frame.
+    ///
+    /// Keying on the argument length rather than a calldata word keeps the prologue at seven
+    /// bytes per selector and the callers free of ABI encoding.
+    fn op_dispatch(bodies: &[Vec<u8>]) -> Vec<u8> {
+        // Per selector above zero: CALLDATASIZE, PUSH1 selector, EQ, PUSH1 dest, JUMPI.
+        const PROLOGUE_PER_SELECTOR: usize = 7;
+
+        let prologue_len = PROLOGUE_PER_SELECTOR * (bodies.len() - 1);
+
+        // Body 0 falls out of the prologue; every other body is entered through a JUMPDEST.
+        let mut starts = Vec::with_capacity(bodies.len());
+        let mut cursor = prologue_len;
+        for (index, body) in bodies.iter().enumerate() {
+            starts.push(cursor);
+            cursor += body.len() + usize::from(index > 0);
+        }
+        assert!(cursor <= 255, "jump destinations are pushed as a single byte");
+
+        let mut code = Vec::with_capacity(cursor);
+        for (index, start) in starts.iter().enumerate().skip(1) {
+            code.push(0x36); // CALLDATASIZE
+            code.extend(push(&[index as u8]));
+            code.push(0x14); // EQ
+            code.extend(push(&[*start as u8]));
+            code.push(0x57); // JUMPI
+        }
+        assert_eq!(code.len(), prologue_len);
+
+        for (index, body) in bodies.iter().enumerate() {
+            if index > 0 {
+                code.push(0x5b); // JUMPDEST
+            }
+            code.extend_from_slice(body);
+        }
+        code
+    }
+
+    /// Renders the first transaction's balance changes as ordinal-ordered
+    /// `"<address> <old>→<new> <REASON>"` lines, prefixed with `[reverted]` when the call
+    /// carrying them was rolled back.
+    ///
+    /// `GasRefund` and `RewardTransactionFee` are left out: the harness runs at `gas_price = 0`,
+    /// so both are zero-amount events that say nothing about SELFDESTRUCT.
+    fn balance_change_log(
+        block: &pb::sf::ethereum::r#type::v2::Block,
+        labels: &[(Address, &str)],
+    ) -> Vec<String> {
+        balance_change_log_of(block.transaction_traces.first().expect("one transaction"), labels)
+    }
+
+    fn balance_change_log_of(
+        trx: &pb::sf::ethereum::r#type::v2::TransactionTrace,
+        labels: &[(Address, &str)],
+    ) -> Vec<String> {
+        use pb::sf::ethereum::r#type::v2::balance_change::Reason;
+
+        let mut entries: Vec<_> = trx
+            .calls
+            .iter()
+            .flat_map(|call| call.balance_changes.iter().map(move |change| (call, change)))
+            .filter(|(_, change)| {
+                !matches!(
+                    Reason::try_from(change.reason),
+                    Ok(Reason::GasRefund | Reason::RewardTransactionFee)
+                )
+            })
+            .collect();
+        entries.sort_by_key(|(_, change)| change.ordinal);
+
+        entries
+            .iter()
+            .map(|(call, change)| {
+                format!(
+                    "{}{} {}→{} {:?}",
+                    if call.state_reverted { "[reverted] " } else { "" },
+                    label(labels, &change.address),
+                    big(&change.old_value),
+                    big(&change.new_value),
+                    Reason::try_from(change.reason).expect("a known reason"),
+                )
+            })
+            .collect()
+    }
+
+    /// Renders the first transaction's nonce, code and storage changes as ordinal-ordered lines.
+    /// Code is rendered by length: the scenarios deploy the same runtime everywhere, so its
+    /// bytes carry no information a test would assert on.
+    fn state_change_log(
+        block: &pb::sf::ethereum::r#type::v2::Block,
+        labels: &[(Address, &str)],
+    ) -> Vec<String> {
+        let trx = block.transaction_traces.first().expect("one transaction");
+
+        let mut entries: Vec<(u64, String)> = Vec::new();
+        for call in &trx.calls {
+            let reverted = if call.state_reverted { "[reverted] " } else { "" };
+            for change in &call.nonce_changes {
+                entries.push((
+                    change.ordinal,
+                    format!(
+                        "{reverted}{} nonce {}→{}",
+                        label(labels, &change.address),
+                        change.old_value,
+                        change.new_value
+                    ),
+                ));
+            }
+            for change in &call.code_changes {
+                entries.push((
+                    change.ordinal,
+                    format!(
+                        "{reverted}{} code {}B→{}B",
+                        label(labels, &change.address),
+                        change.old_code.len(),
+                        change.new_code.len()
+                    ),
+                ));
+            }
+            for change in &call.storage_changes {
+                entries.push((
+                    change.ordinal,
+                    format!(
+                        "{reverted}{} storage {}: {}→{}",
+                        label(labels, &change.address),
+                        U256::from_be_slice(&change.key),
+                        U256::from_be_slice(&change.old_value),
+                        U256::from_be_slice(&change.new_value)
+                    ),
+                ));
+            }
+        }
+        entries.sort_by_key(|(ordinal, _)| *ordinal);
+        entries.into_iter().map(|(_, line)| line).collect()
+    }
+
+    /// Labels of the calls the trace reports as self-destructed.
+    fn suicided_calls(
+        block: &pb::sf::ethereum::r#type::v2::Block,
+        labels: &[(Address, &str)],
+    ) -> Vec<String> {
+        let trx = block.transaction_traces.first().expect("one transaction");
+        trx.calls
+            .iter()
+            .filter(|call| call.suicide)
+            .map(|call| label(labels, &call.address))
+            .collect()
+    }
+
+    fn label(labels: &[(Address, &str)], raw: &[u8]) -> String {
+        let address = Address::from_slice(raw);
+        labels
+            .iter()
+            .find(|(candidate, _)| *candidate == address)
+            .map_or_else(|| address.to_string(), |(_, name)| (*name).to_string())
+    }
+
+    fn big(value: &Option<pb::sf::ethereum::r#type::v2::BigInt>) -> U256 {
+        value.as_ref().map_or(U256::ZERO, |value| U256::from_be_slice(&value.bytes))
+    }
+
+    /// EIP test case, instruction level 1: same-transaction `selfdestruct-to-self`.
+    ///
+    /// The burn this EIP removes, in its simplest form. Before Amsterdam the endowment leaves
+    /// the account as a `SuicideWithdraw` to nowhere; at Amsterdam the account keeps it and the
+    /// Firehose trace says nothing about the SELFDESTRUCT beyond marking the call.
+    #[test]
+    fn selfdestruct_to_self() {
+        Scenario { ops: vec![op_call_selector(subject(), 0, SD_SELF)], ..Default::default() }
+            .assert_balance_logs(
+                &[
+                    "factory 1000000→999000 Transfer",
+                    "subject 0→1000 Transfer",
+                    "subject 1000→0 SuicideWithdraw",
+                ],
+                &["factory 1000000→999000 Transfer", "subject 0→1000 Transfer"],
+            );
+    }
+
+    /// EIP test case, instruction level 2: `selfdestruct-to-self`, then `selfdestruct-to-self`
+    /// again.
+    ///
+    /// The second SELFDESTRUCT is a no-op on both sides of the fork, for different reasons:
+    /// before Amsterdam the first one already emptied the account, at Amsterdam a
+    /// self-beneficiary SELFDESTRUCT moves nothing in the first place.
+    #[test]
+    fn selfdestruct_to_self_then_to_self() {
+        Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, SD_SELF),
+                op_call_selector(subject(), 0, SD_SELF),
+            ],
+            ..Default::default()
+        }
+        .assert_balance_logs(
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "subject 1000→0 SuicideWithdraw",
+            ],
+            &["factory 1000000→999000 Transfer", "subject 0→1000 Transfer"],
+        );
+    }
+
+    /// EIP test case, instruction level 3: `selfdestruct-to-self`, then
+    /// `selfdestruct-to-other`.
+    ///
+    /// The clearest consequence of removing the burn: the balance the first SELFDESTRUCT used to
+    /// destroy is still there for the second one to pay out, so Amsterdam reports a refund where
+    /// Prague reported a withdrawal into nothing.
+    #[test]
+    fn selfdestruct_to_self_then_to_other() {
+        Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, SD_SELF),
+                op_call_selector(subject(), 0, SD_OTHER),
+            ],
+            ..Default::default()
+        }
+        .assert_balance_logs(
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "subject 1000→0 SuicideWithdraw",
+            ],
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "subject 1000→0 SuicideWithdraw",
+                "beneficiary 0→1000 SuicideRefund",
+            ],
+        );
+    }
+
+    /// EIP test case, instruction level 4: `selfdestruct-to-other`, then
+    /// `selfdestruct-to-self`.
+    ///
+    /// Unchanged by the fork: the first SELFDESTRUCT pays the beneficiary and the second finds
+    /// an empty account, so there is no burn to remove.
+    #[test]
+    fn selfdestruct_to_other_then_to_self() {
+        let expected = [
+            "factory 1000000→999000 Transfer",
+            "subject 0→1000 Transfer",
+            "subject 1000→0 SuicideWithdraw",
+            "beneficiary 0→1000 SuicideRefund",
+        ];
+
+        Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, SD_OTHER),
+                op_call_selector(subject(), 0, SD_SELF),
+            ],
+            ..Default::default()
+        }
+        .assert_balance_logs(&expected, &expected);
+    }
+
+    /// EIP test case, finalization 1: `selfdestruct-to-other`, then a CALL with value to the
+    /// self-destructed account.
+    ///
+    /// Unchanged by the fork on the reporting side. What the fork changes is invisible here: the
+    /// 500 wei the account receives after its own destruction is burned at finalization before
+    /// Amsterdam and kept after it, and neither Geth nor reth has ever reported that burn.
+    #[test]
+    fn selfdestruct_to_other_then_call_with_value() {
+        let expected = [
+            "factory 1000000→999000 Transfer",
+            "subject 0→1000 Transfer",
+            "subject 1000→0 SuicideWithdraw",
+            "beneficiary 0→1000 SuicideRefund",
+            "factory 999000→998500 Transfer",
+            "subject 0→500 Transfer",
+        ];
+
+        Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, SD_OTHER),
+                op_call_selector(subject(), 500, RECEIVE),
+            ],
+            ..Default::default()
+        }
+        .assert_balance_logs(&expected, &expected);
+    }
+
+    /// EIP test case, finalization 2: `selfdestruct-to-other`, then several CALLs with value to
+    /// the self-destructed account.
+    #[test]
+    fn selfdestruct_to_other_then_multiple_calls_with_value() {
+        let expected = [
+            "factory 1000000→999000 Transfer",
+            "subject 0→1000 Transfer",
+            "subject 1000→0 SuicideWithdraw",
+            "beneficiary 0→1000 SuicideRefund",
+            "factory 999000→998500 Transfer",
+            "subject 0→500 Transfer",
+            "factory 998500→998200 Transfer",
+            "subject 500→800 Transfer",
+        ];
+
+        Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, SD_OTHER),
+                op_call_selector(subject(), 500, RECEIVE),
+                op_call_selector(subject(), 300, RECEIVE),
+            ],
+            ..Default::default()
+        }
+        .assert_balance_logs(&expected, &expected);
+    }
+
+    /// EIP test case, finalization 3: `selfdestruct-to-other`, CALL with value, then
+    /// `selfdestruct-to-other` again.
+    ///
+    /// The repeat SELFDESTRUCT pays out what arrived after the first one, on both sides of the
+    /// fork — an already-destroyed account is not a dead end for value.
+    #[test]
+    fn selfdestruct_to_other_then_call_with_value_then_to_other() {
+        let expected = [
+            "factory 1000000→999000 Transfer",
+            "subject 0→1000 Transfer",
+            "subject 1000→0 SuicideWithdraw",
+            "beneficiary 0→1000 SuicideRefund",
+            "factory 999000→998500 Transfer",
+            "subject 0→500 Transfer",
+            "subject 500→0 SuicideWithdraw",
+            "beneficiary 1000→1500 SuicideRefund",
+        ];
+
+        Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, SD_OTHER),
+                op_call_selector(subject(), 500, RECEIVE),
+                op_call_selector(subject(), 0, SD_OTHER),
+            ],
+            ..Default::default()
+        }
+        .assert_balance_logs(&expected, &expected);
+    }
+
+    /// EIP test case, finalization 4: `selfdestruct-to-other`, CALL with value, then
+    /// `selfdestruct-to-self`.
+    ///
+    /// The value that arrived after the first destruction is burned by the second SELFDESTRUCT
+    /// before Amsterdam and kept after it.
+    #[test]
+    fn selfdestruct_to_other_then_call_with_value_then_to_self() {
+        Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, SD_OTHER),
+                op_call_selector(subject(), 500, RECEIVE),
+                op_call_selector(subject(), 0, SD_SELF),
+            ],
+            ..Default::default()
+        }
+        .assert_balance_logs(
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "subject 1000→0 SuicideWithdraw",
+                "beneficiary 0→1000 SuicideRefund",
+                "factory 999000→998500 Transfer",
+                "subject 0→500 Transfer",
+                "subject 500→0 SuicideWithdraw",
+            ],
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "subject 1000→0 SuicideWithdraw",
+                "beneficiary 0→1000 SuicideRefund",
+                "factory 999000→998500 Transfer",
+                "subject 0→500 Transfer",
+            ],
+        );
+    }
+
+    /// EIP test case, finalization 5: `selfdestruct-to-self`, then a CALL with value to the
+    /// self-destructed account.
+    ///
+    /// The `old_balance` of the incoming transfer is where the fork shows: at Amsterdam the
+    /// account still holds its endowment, so the CALL credits 1000 → 1500 rather than 0 → 500.
+    #[test]
+    fn selfdestruct_to_self_then_call_with_value() {
+        Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, SD_SELF),
+                op_call_selector(subject(), 500, RECEIVE),
+            ],
+            ..Default::default()
+        }
+        .assert_balance_logs(
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "subject 1000→0 SuicideWithdraw",
+                "factory 999000→998500 Transfer",
+                "subject 0→500 Transfer",
+            ],
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "factory 999000→998500 Transfer",
+                "subject 1000→1500 Transfer",
+            ],
+        );
+    }
+
+    /// EIP test case, finalization 6: `selfdestruct-to-self`, then several CALLs with value to
+    /// the self-destructed account.
+    #[test]
+    fn selfdestruct_to_self_then_multiple_calls_with_value() {
+        Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, SD_SELF),
+                op_call_selector(subject(), 500, RECEIVE),
+                op_call_selector(subject(), 300, RECEIVE),
+            ],
+            ..Default::default()
+        }
+        .assert_balance_logs(
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "subject 1000→0 SuicideWithdraw",
+                "factory 999000→998500 Transfer",
+                "subject 0→500 Transfer",
+                "factory 998500→998200 Transfer",
+                "subject 500→800 Transfer",
+            ],
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "factory 999000→998500 Transfer",
+                "subject 1000→1500 Transfer",
+                "factory 998500→998200 Transfer",
+                "subject 1500→1800 Transfer",
+            ],
+        );
+    }
+
+    /// EIP test case, finalization 7: `selfdestruct-to-self`, CALL with value, then
+    /// `selfdestruct-to-other`.
+    ///
+    /// The beneficiary collects the endowment as well as the later transfer at Amsterdam, and
+    /// only the later transfer before it.
+    #[test]
+    fn selfdestruct_to_self_then_call_with_value_then_to_other() {
+        Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, SD_SELF),
+                op_call_selector(subject(), 500, RECEIVE),
+                op_call_selector(subject(), 0, SD_OTHER),
+            ],
+            ..Default::default()
+        }
+        .assert_balance_logs(
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "subject 1000→0 SuicideWithdraw",
+                "factory 999000→998500 Transfer",
+                "subject 0→500 Transfer",
+                "subject 500→0 SuicideWithdraw",
+                "beneficiary 0→500 SuicideRefund",
+            ],
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "factory 999000→998500 Transfer",
+                "subject 1000→1500 Transfer",
+                "subject 1500→0 SuicideWithdraw",
+                "beneficiary 0→1500 SuicideRefund",
+            ],
+        );
+    }
+
+    /// EIP test case, finalization 8: `selfdestruct-to-self`, CALL with value, then
+    /// `selfdestruct-to-self`.
+    ///
+    /// Amsterdam reports no SELFDESTRUCT balance change at all: nothing ever leaves the account.
+    #[test]
+    fn selfdestruct_to_self_then_call_with_value_then_to_self() {
+        Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, SD_SELF),
+                op_call_selector(subject(), 500, RECEIVE),
+                op_call_selector(subject(), 0, SD_SELF),
+            ],
+            ..Default::default()
+        }
+        .assert_balance_logs(
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "subject 1000→0 SuicideWithdraw",
+                "factory 999000→998500 Transfer",
+                "subject 0→500 Transfer",
+                "subject 500→0 SuicideWithdraw",
+            ],
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "factory 999000→998500 Transfer",
+                "subject 1000→1500 Transfer",
+            ],
+        );
+    }
+
+    /// EIP test case, finalization 9: a created account raises its own nonce by creating other
+    /// accounts, then `selfdestruct-to-self`.
+    ///
+    /// The nonce reset the EIP specifies is the pre-fork cleanup unchanged: the inspector
+    /// already reported `nonce → 0` for a destroyed account, and at Amsterdam the same event
+    /// describes an account that survives with a balance instead of one that disappears.
+    #[test]
+    fn nonce_bumped_then_selfdestruct_to_self() {
+        let scenario = Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, BUMP_NONCE),
+                op_call_selector(subject(), 0, SD_SELF),
+            ],
+            ..Default::default()
+        };
+
+        scenario.assert_balance_logs(
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "subject 1000→0 SuicideWithdraw",
+            ],
+            &["factory 1000000→999000 Transfer", "subject 0→1000 Transfer"],
+        );
+
+        for spec in [SpecId::PRAGUE, SpecId::AMSTERDAM] {
+            let block = scenario.run(spec);
+            let cleanup: Vec<_> = state_change_log(&block, &scenario.labels())
+                .into_iter()
+                .filter(|line| line.starts_with("subject"))
+                .collect();
+
+            assert_eq!(
+                cleanup,
+                [
+                    "subject nonce 0→1",
+                    "subject code 0B→94B",
+                    "subject nonce 1→2",
+                    "subject nonce 2→3",
+                    "subject nonce 3→0",
+                    "subject code 94B→0B",
+                ],
+                "nonce and code cleanup at {spec:?}"
+            );
+        }
+    }
+
+    /// EIP test case, finalization 10: a created account raises its own nonce by creating other
+    /// accounts, then `selfdestruct-to-other`.
+    #[test]
+    fn nonce_bumped_then_selfdestruct_to_other() {
+        let expected = [
+            "factory 1000000→999000 Transfer",
+            "subject 0→1000 Transfer",
+            "subject 1000→0 SuicideWithdraw",
+            "beneficiary 0→1000 SuicideRefund",
+        ];
+
+        Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, BUMP_NONCE),
+                op_call_selector(subject(), 0, SD_OTHER),
+            ],
+            ..Default::default()
+        }
+        .assert_balance_logs(&expected, &expected);
+    }
+
+    /// EIP test case, finalization 11: a created account writes storage, then
+    /// `selfdestruct-to-self`.
+    ///
+    /// revm wipes the storage of a surviving balance-only account at finalization, and that wipe
+    /// is deliberately not reported: no event described it before the fork either, and the
+    /// Firehose protocol has no account-clearing event to carry it. A consumer learns the
+    /// account was cleared from the call's `suicide` marker, as it always has.
+    #[test]
+    fn storage_written_then_selfdestruct_to_self() {
+        let scenario = Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, SSTORE_SLOT),
+                op_call_selector(subject(), 0, SD_SELF),
+            ],
+            ..Default::default()
+        };
+
+        scenario.assert_balance_logs(
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "subject 1000→0 SuicideWithdraw",
+            ],
+            &["factory 1000000→999000 Transfer", "subject 0→1000 Transfer"],
+        );
+
+        for spec in [SpecId::PRAGUE, SpecId::AMSTERDAM] {
+            let block = scenario.run(spec);
+            let storage: Vec<_> = state_change_log(&block, &scenario.labels())
+                .into_iter()
+                .filter(|line| line.contains("storage"))
+                .collect();
+
+            assert_eq!(
+                storage,
+                ["subject storage 1: 0→1"],
+                "only the SSTORE itself is reported at {spec:?}, not the finalization wipe"
+            );
+        }
+    }
+
+    /// EIP test case, finalization 12: a created account writes storage, then
+    /// `selfdestruct-to-other`.
+    #[test]
+    fn storage_written_then_selfdestruct_to_other() {
+        let expected = [
+            "factory 1000000→999000 Transfer",
+            "subject 0→1000 Transfer",
+            "subject 1000→0 SuicideWithdraw",
+            "beneficiary 0→1000 SuicideRefund",
+        ];
+
+        Scenario {
+            ops: vec![
+                op_call_selector(subject(), 0, SSTORE_SLOT),
+                op_call_selector(subject(), 0, SD_OTHER),
+            ],
+            ..Default::default()
+        }
+        .assert_balance_logs(&expected, &expected);
+    }
+
+    /// EIP test case, multi-transaction 1: two identical transactions, each CREATE2-ing the
+    /// same account with a non-zero balance and having it `selfdestruct-to-self`.
+    ///
+    /// The second CREATE2 lands on the address again either way — before Amsterdam because the
+    /// account was deleted, at Amsterdam because what survives has nonce 0 and no code — but
+    /// the balance it starts from differs, and the endowment transfer says so.
+    #[test]
+    fn selfdestruct_to_self_repeated_in_a_second_transaction() {
+        let scenario = Scenario {
+            ops: vec![op_call_selector(subject(), 0, SD_SELF)],
+            transactions: 2,
+            ..Default::default()
+        };
+        let labels = scenario.labels();
+
+        let prague: Vec<Vec<String>> = scenario
+            .run(SpecId::PRAGUE)
+            .transaction_traces
+            .iter()
+            .map(|trx| balance_change_log_of(trx, &labels))
+            .collect();
+        assert_eq!(
+            prague,
+            [
+                vec![
+                    "factory 1000000→999000 Transfer".to_string(),
+                    "subject 0→1000 Transfer".to_string(),
+                    "subject 1000→0 SuicideWithdraw".to_string(),
+                ],
+                vec![
+                    "factory 999000→998000 Transfer".to_string(),
+                    "subject 0→1000 Transfer".to_string(),
+                    "subject 1000→0 SuicideWithdraw".to_string(),
+                ],
+            ]
+        );
+
+        let amsterdam: Vec<Vec<String>> = scenario
+            .run(SpecId::AMSTERDAM)
+            .transaction_traces
+            .iter()
+            .map(|trx| balance_change_log_of(trx, &labels))
+            .collect();
+        assert_eq!(
+            amsterdam,
+            [
+                vec![
+                    "factory 1000000→999000 Transfer".to_string(),
+                    "subject 0→1000 Transfer".to_string(),
+                ],
+                vec![
+                    "factory 999000→998000 Transfer".to_string(),
+                    // The endowment lands on the balance the first transaction left behind.
+                    "subject 1000→2000 Transfer".to_string(),
+                ],
+            ]
+        );
+    }
+
+    /// `SELFDESTRUCT` in initcode with the account under construction as beneficiary: no code is
+    /// ever deployed, so the only cleanup is the nonce.
+    #[test]
+    fn selfdestruct_to_self_in_initcode() {
+        let scenario =
+            Scenario { initcode: op_selfdestruct_self(), ops: Vec::new(), ..Default::default() };
+
+        scenario.assert_balance_logs(
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                "subject 1000→0 SuicideWithdraw",
+            ],
+            &["factory 1000000→999000 Transfer", "subject 0→1000 Transfer"],
+        );
+    }
+
+    /// `SELFDESTRUCT` in initcode to another account: unchanged by the fork, the endowment is
+    /// forwarded rather than burned in both cases.
+    #[test]
+    fn selfdestruct_to_other_in_initcode() {
+        let expected = [
+            "factory 1000000→999000 Transfer",
+            "subject 0→1000 Transfer",
+            "subject 1000→0 SuicideWithdraw",
+            "beneficiary 0→1000 SuicideRefund",
+        ];
+
+        Scenario {
+            initcode: op_selfdestruct_to(BENEFICIARY),
+            ops: Vec::new(),
+            ..Default::default()
+        }
+        .assert_balance_logs(&expected, &expected);
+    }
+
+    /// A zero-balance `selfdestruct-to-self` reports nothing on either side of the fork: there
+    /// is no burn to remove, and EIP-161 deletes the empty account at Amsterdam just as before.
+    #[test]
+    fn zero_balance_selfdestruct_to_self() {
+        Scenario {
+            endowment: 0,
+            ops: vec![op_call_selector(subject(), 0, SD_SELF)],
+            ..Default::default()
+        }
+        .assert_balance_logs(&[], &[]);
+    }
+
+    /// A `SELFDESTRUCT` that runs out of gas destroys nothing: no balance change, no nonce/code
+    /// cleanup, and the call is not marked as self-destructed.
+    ///
+    /// revm mutates the journal inside `Journal::selfdestruct` and charges the dynamic cost
+    /// afterwards, so the `AccountDestroyed` entry is already written when the instruction halts
+    /// on gas. Geth charges before running the opcode body, so its tracer never sees a suicide
+    /// here; the inspector matches that by reporting the opcode as failed for every instruction
+    /// result other than `SelfDestruct`.
+    #[test]
+    fn out_of_gas_selfdestruct_reports_nothing() {
+        let scenario = Scenario {
+            ops: vec![op_call_selector_with_gas(subject(), 0, SD_SELF, 100)],
+            ..Default::default()
+        };
+
+        scenario.assert_balance_logs(
+            &["factory 1000000→999000 Transfer", "subject 0→1000 Transfer"],
+            &["factory 1000000→999000 Transfer", "subject 0→1000 Transfer"],
+        );
+
+        for spec in [SpecId::PRAGUE, SpecId::AMSTERDAM] {
+            let block = scenario.run(spec);
+            let labels = scenario.labels();
+
+            assert!(
+                !state_change_log(&block, &labels).iter().any(|line| line.contains("nonce 1→0")),
+                "nothing was destroyed at {spec:?}, so no finalization cleanup is reported"
+            );
+            assert!(
+                suicided_calls(&block, &labels).is_empty(),
+                "the SELFDESTRUCT never took effect at {spec:?}, so no call is a suicide"
+            );
+        }
+    }
+
+    /// A `SELFDESTRUCT` inside a frame that later reverts destroys nothing: revm rolls the
+    /// journal entry back, the balance change the inspector emitted stays flagged as reverted,
+    /// and no finalization cleanup follows.
+    ///
+    /// The cleanup is the part worth pinning. `selfdestruct_addresses` is filled when the opcode
+    /// runs and revm truncates the journal entry without telling the inspector, so the set still
+    /// holds an account that kept its nonce and code; `capture_selfdestruct_cleanup` drops it by
+    /// checking the committed journal. Geth's journal reverts its own self-destruct set.
+    #[test]
+    fn reverted_selfdestruct_reports_no_cleanup() {
+        let scenario = Scenario {
+            ops: vec![op_call_selector(REVERTER, 0, RECEIVE)],
+            extra_accounts: vec![(
+                REVERTER,
+                code_account(&[op_call_selector(subject(), 0, SD_SELF), op_revert()].concat(), 0),
+            )],
+            ..Default::default()
+        };
+
+        scenario.assert_balance_logs(
+            &[
+                "factory 1000000→999000 Transfer",
+                "subject 0→1000 Transfer",
+                // Reported, but flagged: the frame it belongs to reverted.
+                "[reverted] subject 1000→0 SuicideWithdraw",
+            ],
+            &["factory 1000000→999000 Transfer", "subject 0→1000 Transfer"],
+        );
+
+        for spec in [SpecId::PRAGUE, SpecId::AMSTERDAM] {
+            let block = scenario.run(spec);
+            let cleanup: Vec<_> = state_change_log(&block, &scenario.labels())
+                .into_iter()
+                .filter(|line| {
+                    line.starts_with("subject nonce") || line.starts_with("subject code")
+                })
+                .collect();
+
+            assert_eq!(
+                cleanup,
+                ["subject nonce 0→1", "subject code 0B→94B"],
+                "the account survived the revert at {spec:?}, so only its creation is reported"
+            );
+        }
+    }
+
+    /// The same rollback one frame up: the root call itself reverts after a nested
+    /// `SELFDESTRUCT` committed. The filter has to hold here too, because `call_end` at depth 0
+    /// is where the cleanup is captured — if revm had not truncated the journal by then, a
+    /// whole-transaction revert would still report the account as cleared.
+    #[test]
+    fn root_reverted_selfdestruct_reports_no_cleanup() {
+        let scenario = Scenario {
+            ops: vec![op_call_selector(subject(), 0, SD_SELF), op_revert()],
+            ..Default::default()
+        };
+
+        for spec in [SpecId::PRAGUE, SpecId::AMSTERDAM] {
+            let block = scenario.run(spec);
+            let balances = balance_change_log(&block, &scenario.labels());
+            assert!(
+                balances.iter().all(|line| line.starts_with("[reverted]")),
+                "every change belongs to the reverted root call at {spec:?}: {balances:?}"
+            );
+            let state = state_change_log(&block, &scenario.labels());
+            assert!(
+                !state.iter().any(|line| line.contains("nonce 1→0")),
+                "no finalization cleanup at {spec:?}: {state:?}"
+            );
+        }
     }
 
     fn legacy_tx_event() -> firehose_tracer::types::TxEvent {

@@ -16,8 +16,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Stop reporting a call as self-destructed when its `SELFDESTRUCT` ran out of gas. revm mutates
+  the journal inside `Journal::selfdestruct` and charges the dynamic cost afterwards, so the
+  instruction can halt on gas with the account already marked destroyed; geth charges before
+  running the opcode body and never reports a suicide there. The opcode is now reported as failed
+  for every instruction result other than `SelfDestruct`, not only for an undefined instruction.
+
+- Stop reporting the finalization cleanup (`nonce → 0` and code cleared) for a `SELFDESTRUCT`
+  whose frame reverted. revm truncates the `AccountDestroyed` journal entry on revert without
+  notifying the inspector, so an account that survived with its nonce and code intact was reported
+  as cleared. The cleanup is now taken from the committed journal.
+
+- Resolve the post-transaction balance of an account that executed a self-beneficiary
+  `SELFDESTRUCT` correctly under [EIP-8246](https://eips.ethereum.org/EIPS/eip-8246): Amsterdam
+  keeps the balance on the account instead of burning it, so the `GasRefund` and
+  `RewardTransactionFee` events that follow no longer report `old_balance = 0` for an account that
+  still holds its ether. Reachable when a transaction creates and self-destructs the coinbase
+  address, or through a chain's post-transaction extras. Only affects chains with Amsterdam
+  
 - Populate `BlockHeader.slot_number` (EIP-7843, Amsterdam) from the block header instead of
   always emitting `None`.
+  
 - Populate `BlockHeader.block_access_list_hash`/`block_access_list_rlp` (EIP-7928, Amsterdam).
   The hash comes straight from the header. The RLP-encoded list isn't part of the header (it only
   commits to the hash), so it's sourced differently depending on path: on the live engine path
