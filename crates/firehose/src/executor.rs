@@ -200,6 +200,14 @@ pub struct FirehoseWrappedExecutor<Inner, Extras = NoPostTxExtras, Adjust = NoPr
     log_index: u32,
     extras: Extras,
     adjust: Adjust,
+    /// Whether the underlying DB's `bal_builder` was armed by the caller (see
+    /// [`Self::with_bal_tracking`]). When set, the wrapper advances the DB's BAL index at each
+    /// phase boundary (pre-execution changes, each committed transaction) so a caller-initialized
+    /// `bal_builder` accumulates a correctly-indexed EIP-7928 block access list. The wrapper does
+    /// not itself arm `bal_builder` or extract the result — that needs a concrete `State<DB>`,
+    /// which this generically-bounded type does not have direct access to (see
+    /// `run_wrapped_block`).
+    has_bal: bool,
 }
 
 impl Debug for FirehoseWrappedExecutor<()> {
@@ -212,7 +220,14 @@ impl<Inner> FirehoseWrappedExecutor<Inner, NoPostTxExtras, NoPreTxAdjust> {
     /// Wraps `inner` with Firehose tracer hooks. `withdrawals` is consumed inside
     /// [`Self::finish`] to emit per-address balance changes for EIP-4895 validator withdrawals.
     pub const fn new(inner: Inner, withdrawals: Option<Withdrawals>) -> Self {
-        Self { inner, withdrawals, log_index: 0, extras: NoPostTxExtras, adjust: NoPreTxAdjust }
+        Self {
+            inner,
+            withdrawals,
+            log_index: 0,
+            extras: NoPostTxExtras,
+            adjust: NoPreTxAdjust,
+            has_bal: false,
+        }
     }
 }
 
@@ -227,7 +242,7 @@ impl<Inner, Extras> FirehoseWrappedExecutor<Inner, Extras, NoPreTxAdjust> {
         withdrawals: Option<Withdrawals>,
         extras: Extras,
     ) -> Self {
-        Self { inner, withdrawals, log_index: 0, extras, adjust: NoPreTxAdjust }
+        Self { inner, withdrawals, log_index: 0, extras, adjust: NoPreTxAdjust, has_bal: false }
     }
 }
 
@@ -241,7 +256,20 @@ impl<Inner, Extras, Adjust> FirehoseWrappedExecutor<Inner, Extras, Adjust> {
         adjust: Adjust,
         extras: Extras,
     ) -> Self {
-        Self { inner, withdrawals, log_index: 0, extras, adjust }
+        Self { inner, withdrawals, log_index: 0, extras, adjust, has_bal: false }
+    }
+
+    /// Arms EIP-7928 BAL-index tracking: the wrapper will advance the underlying DB's BAL index
+    /// (via [`alloy_evm::block::BalIndexedDatabase`]) after pre-execution changes and after each
+    /// committed transaction, matching the indexing scheme `BasicBlockExecutor::execute_one` uses.
+    ///
+    /// The caller remains responsible for arming `bal_state.bal_builder` on the concrete DB before
+    /// execution starts, and for extracting the built list via `State::take_built_alloy_bal`
+    /// afterwards — this type only sees `Inner::Evm::DB` through the generic `BalIndexedDatabase`
+    /// bound, not the concrete `State<DB>` those two operations need.
+    pub const fn with_bal_tracking(mut self, has_bal: bool) -> Self {
+        self.has_bal = has_bal;
+        self
     }
 }
 
@@ -289,12 +317,18 @@ impl<Inner, Extras, Adjust> FirehoseWrappedExecutor<Inner, Extras, Adjust> {
 // existing default composes, re-run this triage: does the new/changed default matter for a wrapped
 // `Inner` that might override it, and if so, is it safely forwardable (does it need EVM/inspector
 // access from inside a closure `self.inner` already holds — if so, expect the same wall).
-impl<Inner, Extras, Adjust> BlockExecutor for FirehoseWrappedExecutor<Inner, Extras, Adjust>
+impl<'bal, Inner, Extras, Adjust, BalDB> BlockExecutor
+    for FirehoseWrappedExecutor<Inner, Extras, Adjust>
 where
-    Inner: BlockExecutor,
+    Inner: BlockExecutor<Evm: reth_evm::Evm<DB = &'bal mut State<BalDB>>>,
     Inner::Transaction: Transaction + TxHashRef + SignatureFields,
     <Inner::Evm as reth_evm::Evm>::Inspector: FirehoseInspectorApi,
-    <Inner::Evm as reth_evm::Evm>::DB: reth_revm::Database,
+    // Every real caller (`run_wrapped_block`, the live engine path) instantiates `Inner` with an
+    // EVM borrowing a `reth_revm::State<DB>`, never an owned or otherwise-shaped `Database`. That
+    // concrete shape is pinned down here (rather than bounding on the generic `Database` trait, as
+    // before) so `bump_bal_index`/`bal_state` — inherent on `State<DB>`, with no blanket
+    // `&mut State<DB>` trait impl available — resolve via ordinary auto-deref.
+    BalDB: reth_revm::Database + 'bal,
     Inner::Receipt: TxReceipt<Log = Log>,
     Extras: PostTxExtras<Inner::Evm>,
     Adjust: PreTxAdjust<Inner::Evm>,
@@ -308,6 +342,11 @@ where
         self.inner.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
         let res = self.inner.apply_pre_execution_changes();
         self.inner.evm_mut().inspector_mut().tracer_mut().on_system_call_end();
+        if res.is_ok() && self.has_bal {
+            // BAL index 0 is reserved for pre-transaction changes; advance to 1 so transaction 0
+            // (about to run) is attributed to index 1, matching `BasicBlockExecutor::execute_one`.
+            self.inner.evm_mut().db_mut().bump_bal_index();
+        }
         res
     }
 
@@ -435,6 +474,9 @@ where
         }
 
         let gas_output = self.inner.commit_transaction(result);
+        if self.has_bal {
+            self.inner.evm_mut().db_mut().bump_bal_index();
+        }
 
         let log_index_start = self.log_index;
         let receipt_data = {
@@ -724,6 +766,10 @@ where
         match block_result {
             Ok(result) => {
                 self.db.merge_transitions(BundleRetention::Reverts);
+                // EIP-7928: `block_access_list_rlp` is left unset on this path (pipeline/backfill
+                // replay) — there is no payload sidecar to source it from here, unlike the live
+                // engine path (see `payload_validator.rs`), and this executor does not (yet)
+                // reconstruct it by tracking BAL during re-execution.
                 self.pending_tracer = Some(tracer);
                 Ok(result)
             }
@@ -828,14 +874,46 @@ where
     let exec_ctx =
         evm_config.context_for_block(block.sealed_block()).map_err(BlockExecutionError::other)?;
 
+    // EIP-7928: this path (pipeline/backfill replay) has no payload sidecar to source the block
+    // access list from, unlike the live engine path (see
+    // `crates/engine/tree/src/tree/payload_validator.rs`), so it's reconstructed from
+    // re-execution via revm's BAL-index tracking, the same mechanism
+    // `BasicBlockExecutor::execute_one` uses, whenever the header declares a hash.
+    let has_bal = block.header().block_access_list_hash().is_some();
+    if has_bal {
+        db.bal_state.bal_builder = Some(reth_revm::revm::state::bal::Bal::new());
+    }
+
     let inspector = tracer_guard.inspector();
-    let evm = evm_config.evm_with_env_and_inspector(db, evm_env, inspector);
+    let evm = evm_config.evm_with_env_and_inspector(&mut *db, evm_env, inspector);
     let inner = evm_config.create_executor(evm, exec_ctx);
 
     let withdrawals = block.body().withdrawals().cloned();
-    let wrapped = FirehoseWrappedExecutor::with_hooks(inner, withdrawals, adjust, extras);
+    let wrapped = FirehoseWrappedExecutor::with_hooks(inner, withdrawals, adjust, extras)
+        .with_bal_tracking(has_bal);
 
-    wrapped.execute_block(block.transactions_recovered())
+    let result = wrapped.execute_block(block.transactions_recovered())?;
+
+    if has_bal && let Some(bal) = db.take_built_alloy_bal() {
+        let computed_hash = alloy_eip7928::compute_block_access_list_hash(bal.as_slice());
+        // Hard error rather than warn-and-continue: this is the first re-execution-based BAL
+        // reconstruction shipped, and a mismatch means the reconstruction is wrong somewhere, not
+        // that the block is invalid. Revisit once this has proven itself on testnets — the live
+        // path (payload-sourced, not reconstructed) is unaffected either way.
+        if Some(computed_hash) != block.header().block_access_list_hash() {
+            return Err(BlockExecutionError::msg(format!(
+                "reconstructed block access list hash mismatch for block {}: expected {}, computed {computed_hash}",
+                block.header().number(),
+                block.header().block_access_list_hash().unwrap_or_default(),
+            )));
+        }
+        if let Some(header) = tracer_guard.tracer_mut().block_mut().and_then(|b| b.header.as_mut())
+        {
+            header.block_access_list_rlp = Some(alloy_rlp::encode(&bal));
+        }
+    }
+
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------

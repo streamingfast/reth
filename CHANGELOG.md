@@ -7,6 +7,26 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Changed
+
+- Track `evm-firehose-tracer-rs` `5.4.4` from crates.io instead of a pinned git commit, now that
+  the protobuf bindings it needs have shipped in a release.
+
+### Fixed
+
+- Populate `BlockHeader.slot_number` (EIP-7843, Amsterdam) from the block header instead of
+  always emitting `None`.
+- Populate `BlockHeader.block_access_list_hash`/`block_access_list_rlp` (EIP-7928, Amsterdam).
+  The hash comes straight from the header. The RLP-encoded list isn't part of the header (it only
+  commits to the hash), so it's sourced differently depending on path: on the live engine path
+  it's read from the payload's decoded BAL sidecar; on the pipeline/backfill path, which has no
+  sidecar, it's reconstructed via re-execution (the same BAL-index tracking
+  `BasicBlockExecutor::execute_one` uses); the block execution hard-fails if the reconstructed
+  hash doesn't match the header's declared one, since this is the first re-execution-based
+  reconstruction shipped and a mismatch means the reconstruction is wrong, not the block.
+
 ## reth-v2.5.2-fh3.1-1
 
 ### Added
