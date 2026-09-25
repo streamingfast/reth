@@ -138,6 +138,34 @@ pub(super) fn drive_txs_with_gas(
     accounts: &[(Address, revm::state::AccountInfo)],
     txs: &[(Address, u64, u64)],
 ) -> pb::sf::ethereum::r#type::v2::Block {
+    let txs: Vec<_> = txs
+        .iter()
+        .map(|&(to, value, gas_limit)| DriveTx {
+            to: Some(to),
+            input: Bytes::new(),
+            value,
+            gas_limit,
+        })
+        .collect();
+    drive_block(spec, accounts, &txs)
+}
+
+/// One transaction for [`drive_block`]. A `to` of `None` is a contract creation running
+/// `input` as init code.
+pub(super) struct DriveTx {
+    pub(super) to: Option<Address>,
+    pub(super) input: Bytes,
+    pub(super) value: u64,
+    pub(super) gas_limit: u64,
+}
+
+/// The general driver behind [`drive_txs_with_gas`]: also lets a scenario send calldata or
+/// a contract creation.
+pub(super) fn drive_block(
+    spec: SpecId,
+    accounts: &[(Address, revm::state::AccountInfo)],
+    txs: &[DriveTx],
+) -> pb::sf::ethereum::r#type::v2::Block {
     use reth_revm::revm::{
         context::{Context, TxEnv},
         database::{CacheDB, EmptyDB},
@@ -187,20 +215,23 @@ pub(super) fn drive_txs_with_gas(
         // within this tx's own `ExecutionResult::logs()`.
         let mut block_log_offset = 0u32;
 
-        for (tx_index, &(to, value, gas_limit)) in txs.iter().enumerate() {
+        for (tx_index, drive_tx) in txs.iter().enumerate() {
+            let DriveTx { to, ref input, value, gas_limit } = *drive_tx;
             let tx = TxEnv {
                 caller: SENDER,
                 gas_limit,
                 gas_price: 0,
-                kind: TxKind::Call(to),
+                kind: to.map_or(TxKind::Create, TxKind::Call),
                 value: U256::from(value),
+                data: input.clone(),
                 nonce: tx_index as u64,
                 ..Default::default()
             };
 
             evm.inspector.tracer_mut().on_tx_start(
                 firehose_tracer::types::TxEvent {
-                    to: Some(to),
+                    to,
+                    input: input.clone(),
                     value: U256::from(value),
                     gas: gas_limit,
                     gas_price: U256::ZERO,
