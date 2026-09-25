@@ -167,3 +167,62 @@ fn value_sent_to_starved_precompile_keeps_transfer_changes() {
         assert_eq!(changes[1].address, MODEXP.to_vec(), "second change is the precompile credit");
     }
 }
+
+/// Regression for Sepolia block 8784485 (tx 0x1af75e60…), which made the Firehose-instrumented
+/// node panic with a Rust "capacity overflow" while tracing a call that burns its entire gas
+/// limit and reverts out of gas.
+///
+/// Reproduced the way the block came about: deploy the exact runtime with `slot0` (its
+/// `owner`) set to the deployer — otherwise the `onlyOwner` guard on `0xb757c638` reverts
+/// cheaply with `Unauthorized()` and never reaches the out-of-gas path — then call it from that
+/// deployer with the original calldata and gas limit.
+#[test]
+fn out_of_gas_revert_of_sepolia_8784485_traces_without_panicking() {
+    const CALL_GAS_LIMIT: u64 = 20_979_492;
+
+    let initcode = alloy_primitives::hex::decode(
+        include_str!("fixtures/capacity_overflow_initcode.hex").trim(),
+    )
+    .expect("init code is hex");
+    let calldata = alloy_primitives::hex::decode(
+        include_str!("fixtures/capacity_overflow_calldata.hex").trim(),
+    )
+    .expect("calldata is hex");
+
+    // The deployer sends the deployment at nonce 0, so the contract lands at this address.
+    let contract = SENDER.create(0);
+    let accounts = [(SENDER, balance_account(u64::MAX))];
+    let txs = [
+        DriveTx { to: None, input: Bytes::from(initcode), value: 0, gas_limit: 5_000_000 },
+        DriveTx {
+            to: Some(contract),
+            input: Bytes::from(calldata),
+            value: 0,
+            gas_limit: CALL_GAS_LIMIT,
+        },
+    ];
+
+    let block = drive_block(SpecId::PRAGUE, &accounts, &txs);
+
+    let [deploy, call] = block.transaction_traces.as_slice() else {
+        panic!(
+            "expected the deployment and the call, got {} traces",
+            block.transaction_traces.len()
+        );
+    };
+    assert_eq!(
+        deploy.status,
+        pb::sf::ethereum::r#type::v2::TransactionTraceStatus::Succeeded as i32,
+        "the deployment must succeed for the caller to be the owner"
+    );
+
+    let root = call.calls.first().expect("a root call");
+    assert_eq!(root.address, contract.to_vec());
+    assert!(root.status_failed);
+    assert!(
+        root.failure_reason.contains("out of gas"),
+        "expected an out-of-gas failure, got {:?}",
+        root.failure_reason
+    );
+    assert_eq!(root.gas_consumed, root.gas_limit, "the call burns all of its gas");
+}
