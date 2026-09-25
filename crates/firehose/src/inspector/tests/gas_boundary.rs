@@ -59,7 +59,8 @@ fn starved_value_call_consumes_all_its_gas_and_keeps_transfer_changes() {
     ];
 
     for spec in [SpecId::PRAGUE, SpecId::AMSTERDAM] {
-        let block = drive_txs_with_gas(spec, &accounts, &[(CALLER_CONTRACT, 0, 100_000)]);
+        let block =
+            drive_txs(spec, &accounts, &[DriveTx::call(CALLER_CONTRACT, 0).with_gas(100_000)]);
         let trx = block.transaction_traces.first().expect("one transaction");
         assert_eq!(trx.calls.len(), 2, "{spec:?}: root call plus the starved inner call");
 
@@ -113,8 +114,8 @@ fn create_at_intrinsic_gas_floor_gets_a_zero_gas_frame() {
     assert_eq!(gas_limit, 53_058, "hand-computed floor for this init code");
 
     let accounts = [(SENDER, balance_account(u64::MAX))];
-    let tx = DriveTx { to: None, input: Bytes::from(initcode.to_vec()), value: 0, gas_limit };
-    let block = drive_block(SpecId::PRAGUE, &accounts, &[tx]);
+    let tx = DriveTx::create(initcode.to_vec()).with_gas(gas_limit);
+    let block = drive_txs(SpecId::PRAGUE, &accounts, &[tx]);
 
     let trx = block.transaction_traces.first().expect("the transaction is included");
     assert_eq!(trx.gas_used, gas_limit, "the whole intrinsic floor is charged");
@@ -153,7 +154,11 @@ fn value_sent_to_starved_precompile_keeps_transfer_changes() {
     let accounts = [(SENDER, balance_account(u64::MAX)), (MODEXP, balance_account(1))];
 
     for spec in [SpecId::PRAGUE, SpecId::AMSTERDAM] {
-        let block = drive_txs_with_gas(spec, &accounts, &[(MODEXP, 1_000, TX_BASE_GAS + HEADROOM)]);
+        let block = drive_txs(
+            spec,
+            &accounts,
+            &[DriveTx::call(MODEXP, 1_000).with_gas(TX_BASE_GAS + HEADROOM)],
+        );
         let trx = block.transaction_traces.first().expect("the transaction is included");
 
         let root = trx.calls.first().expect("a root call");
@@ -193,16 +198,11 @@ fn out_of_gas_revert_of_sepolia_8784485_traces_without_panicking() {
     let contract = SENDER.create(0);
     let accounts = [(SENDER, balance_account(u64::MAX))];
     let txs = [
-        DriveTx { to: None, input: Bytes::from(initcode), value: 0, gas_limit: 5_000_000 },
-        DriveTx {
-            to: Some(contract),
-            input: Bytes::from(calldata),
-            value: 0,
-            gas_limit: CALL_GAS_LIMIT,
-        },
+        DriveTx::create(initcode).with_gas(5_000_000),
+        DriveTx::call(contract, 0).with_input(calldata).with_gas(CALL_GAS_LIMIT),
     ];
 
-    let block = drive_block(SpecId::PRAGUE, &accounts, &txs);
+    let block = drive_txs(SpecId::PRAGUE, &accounts, &txs);
 
     let [deploy, call] = block.transaction_traces.as_slice() else {
         panic!(

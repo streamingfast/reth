@@ -199,7 +199,11 @@ fn call_gas_consumed_is_independent_of_the_eip8037_reservoir() {
     let accounts = [(SENDER, balance_account(u64::MAX)), (RECIPIENT, code_account(SSTORE_ONE, 0))];
 
     let root_call_gas = |gas_limit: u64| {
-        let block = drive_txs_with_gas(SpecId::AMSTERDAM, &accounts, &[(RECIPIENT, 0, gas_limit)]);
+        let block = drive_txs(
+            SpecId::AMSTERDAM,
+            &accounts,
+            &[DriveTx::call(RECIPIENT, 0).with_gas(gas_limit)],
+        );
         let trx = block.transaction_traces.first().expect("one transaction").clone();
         let root = trx.calls.first().expect("a root call");
         (root.gas_consumed, trx.gas_used)

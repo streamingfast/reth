@@ -101,9 +101,8 @@ pub(super) fn op_create2(value: u64, offset: u8, size: u8, salt: u8) -> Vec<u8> 
     code
 }
 
-/// Runs `txs` (each a `(to, value)` pair) as separate transactions in one block through
-/// revm at `spec`, with the production inspector attached, then replays each resulting
-/// receipt through `on_tx_end`.
+/// Runs `txs` as separate transactions in one block through revm at `spec`, with the
+/// production inspector attached, then replays each resulting receipt through `on_tx_end`.
 ///
 /// `spec` is a parameter rather than a constant so a test can pin behaviour on both sides of
 /// a fork boundary — EIP-7708 only emits below `SpecId::AMSTERDAM`, and the absence of a log
@@ -121,47 +120,6 @@ pub(super) fn op_create2(value: u64, offset: u8, size: u8, salt: u8) -> Vec<u8> 
 /// called after each tx to advance its block-wide log counter, so a second tx's logs
 /// continue numbering after the first's rather than restarting at `block_index` 0.
 pub(super) fn drive_txs(
-    spec: SpecId,
-    accounts: &[(Address, revm::state::AccountInfo)],
-    txs: &[(Address, u64)],
-) -> pb::sf::ethereum::r#type::v2::Block {
-    const AMPLE_GAS: u64 = 1_000_000;
-
-    let txs: Vec<_> = txs.iter().map(|&(to, value)| (to, value, AMPLE_GAS)).collect();
-    drive_txs_with_gas(spec, accounts, &txs)
-}
-
-/// [`drive_txs`] with a per-transaction gas limit, so a scenario can starve a frame instead
-/// of always running to completion.
-pub(super) fn drive_txs_with_gas(
-    spec: SpecId,
-    accounts: &[(Address, revm::state::AccountInfo)],
-    txs: &[(Address, u64, u64)],
-) -> pb::sf::ethereum::r#type::v2::Block {
-    let txs: Vec<_> = txs
-        .iter()
-        .map(|&(to, value, gas_limit)| DriveTx {
-            to: Some(to),
-            input: Bytes::new(),
-            value,
-            gas_limit,
-        })
-        .collect();
-    drive_block(spec, accounts, &txs)
-}
-
-/// One transaction for [`drive_block`]. A `to` of `None` is a contract creation running
-/// `input` as init code.
-pub(super) struct DriveTx {
-    pub(super) to: Option<Address>,
-    pub(super) input: Bytes,
-    pub(super) value: u64,
-    pub(super) gas_limit: u64,
-}
-
-/// The general driver behind [`drive_txs_with_gas`]: also lets a scenario send calldata or
-/// a contract creation.
-pub(super) fn drive_block(
     spec: SpecId,
     accounts: &[(Address, revm::state::AccountInfo)],
     txs: &[DriveTx],
@@ -285,6 +243,42 @@ pub(super) fn drive_block(
     decode_fire_block(&buffer.get_bytes())
 }
 
+/// One transaction for [`drive_txs`]. Runs with [`DriveTx::AMPLE_GAS`] unless a scenario
+/// starves it on purpose with [`DriveTx::with_gas`].
+pub(super) struct DriveTx {
+    to: Option<Address>,
+    input: Bytes,
+    value: u64,
+    gas_limit: u64,
+}
+
+impl DriveTx {
+    pub(super) const AMPLE_GAS: u64 = 1_000_000;
+
+    /// A call to `to` carrying `value`.
+    pub(super) fn call(to: Address, value: u64) -> Self {
+        Self { to: Some(to), input: Bytes::new(), value, gas_limit: Self::AMPLE_GAS }
+    }
+
+    /// A contract creation running `initcode`.
+    pub(super) fn create(initcode: impl Into<Bytes>) -> Self {
+        Self { to: None, input: initcode.into(), value: 0, gas_limit: Self::AMPLE_GAS }
+    }
+
+    /// Sets the calldata (ignored by a creation, whose calldata is its init code).
+    pub(super) fn with_input(mut self, input: impl Into<Bytes>) -> Self {
+        self.input = input.into();
+        self
+    }
+
+    /// Sets the gas limit, so a scenario can starve a frame instead of always running to
+    /// completion.
+    pub(super) fn with_gas(mut self, gas_limit: u64) -> Self {
+        self.gas_limit = gas_limit;
+        self
+    }
+}
+
 /// Runs one real transaction through revm at `spec`, with the production inspector
 /// attached, then replays the resulting receipt through `on_tx_end`. See [`drive_txs`] for
 /// what this exercises and why.
@@ -294,7 +288,7 @@ pub(super) fn drive_tx(
     to: Address,
     value: u64,
 ) -> pb::sf::ethereum::r#type::v2::Block {
-    drive_txs(spec, accounts, &[(to, value)])
+    drive_txs(spec, accounts, &[DriveTx::call(to, value)])
 }
 
 pub(super) fn legacy_tx_event() -> firehose_tracer::types::TxEvent {

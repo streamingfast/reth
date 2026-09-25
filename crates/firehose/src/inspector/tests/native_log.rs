@@ -442,7 +442,7 @@ fn native_transfer_log_second_tx_continues_block_index() {
             (CONTRACT_A, balance_account(0)),
             (CONTRACT_B, balance_account(0)),
         ],
-        &[(CONTRACT_A, 1_000), (CONTRACT_B, 2_000)],
+        &[DriveTx::call(CONTRACT_A, 1_000), DriveTx::call(CONTRACT_B, 2_000)],
     );
 
     assert_eq!(block.transaction_traces.len(), 2, "two transactions in the block");
