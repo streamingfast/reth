@@ -7,6 +7,28 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Changed
+
+- Update to upstream reth [v2.7.0](https://github.com/paradigmxyz/reth/releases/tag/v2.7.0)
+  (through [v2.6.0](https://github.com/paradigmxyz/reth/releases/tag/v2.6.0)): revm 43, and
+  alloy-evm 0.39 through the `streamingfast/evm` fork tag `v0.39.0-sf`, which still routes system
+  calls through the inspector.
+
+- Amsterdam only: gas reported by Firehose follows revm 43's glamsterdam devnet-8
+  [EIP-8038](https://eips.ethereum.org/EIPS/eip-8038) costs. For example, a cold storage access
+  now costs 2,100 gas instead of 3,000.
+
+### Fixed
+
+- Build the [EIP-7928](https://eips.ethereum.org/EIPS/eip-7928) block access list when a block
+  runs through Firehose live tracing, the same way upstream does for untraced execution. Before,
+  the traced path built no access list. Blocks skipped the access-list hash check and nothing was
+  stored for them. From reth 2.7.0, consensus rejects an Amsterdam block that produced no access
+  list, so a node with tracing enabled would have rejected every Amsterdam block it received
+  through the Engine API.
+
 ## reth-v2.5.2-fh3.1-2
 
 ### Changed
