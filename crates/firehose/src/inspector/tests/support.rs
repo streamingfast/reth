@@ -101,9 +101,8 @@ pub(super) fn op_create2(value: u64, offset: u8, size: u8, salt: u8) -> Vec<u8> 
     code
 }
 
-/// Runs `txs` (each a `(to, value)` pair) as separate transactions in one block through
-/// revm at `spec`, with the production inspector attached, then replays each resulting
-/// receipt through `on_tx_end`.
+/// Runs `txs` as separate transactions in one block through revm at `spec`, with the
+/// production inspector attached, then replays each resulting receipt through `on_tx_end`.
 ///
 /// `spec` is a parameter rather than a constant so a test can pin behaviour on both sides of
 /// a fork boundary — EIP-7708 only emits below `SpecId::AMSTERDAM`, and the absence of a log
@@ -123,20 +122,7 @@ pub(super) fn op_create2(value: u64, offset: u8, size: u8, salt: u8) -> Vec<u8> 
 pub(super) fn drive_txs(
     spec: SpecId,
     accounts: &[(Address, revm::state::AccountInfo)],
-    txs: &[(Address, u64)],
-) -> pb::sf::ethereum::r#type::v2::Block {
-    const AMPLE_GAS: u64 = 1_000_000;
-
-    let txs: Vec<_> = txs.iter().map(|&(to, value)| (to, value, AMPLE_GAS)).collect();
-    drive_txs_with_gas(spec, accounts, &txs)
-}
-
-/// [`drive_txs`] with a per-transaction gas limit, so a scenario can starve a frame instead
-/// of always running to completion.
-pub(super) fn drive_txs_with_gas(
-    spec: SpecId,
-    accounts: &[(Address, revm::state::AccountInfo)],
-    txs: &[(Address, u64, u64)],
+    txs: &[DriveTx],
 ) -> pb::sf::ethereum::r#type::v2::Block {
     use reth_revm::revm::{
         context::{Context, TxEnv},
@@ -187,20 +173,23 @@ pub(super) fn drive_txs_with_gas(
         // within this tx's own `ExecutionResult::logs()`.
         let mut block_log_offset = 0u32;
 
-        for (tx_index, &(to, value, gas_limit)) in txs.iter().enumerate() {
+        for (tx_index, drive_tx) in txs.iter().enumerate() {
+            let DriveTx { to, ref input, value, gas_limit } = *drive_tx;
             let tx = TxEnv {
                 caller: SENDER,
                 gas_limit,
                 gas_price: 0,
-                kind: TxKind::Call(to),
+                kind: to.map_or(TxKind::Create, TxKind::Call),
                 value: U256::from(value),
+                data: input.clone(),
                 nonce: tx_index as u64,
                 ..Default::default()
             };
 
             evm.inspector.tracer_mut().on_tx_start(
                 firehose_tracer::types::TxEvent {
-                    to: Some(to),
+                    to,
+                    input: input.clone(),
                     value: U256::from(value),
                     gas: gas_limit,
                     gas_price: U256::ZERO,
@@ -254,6 +243,42 @@ pub(super) fn drive_txs_with_gas(
     decode_fire_block(&buffer.get_bytes())
 }
 
+/// One transaction for [`drive_txs`]. Runs with [`DriveTx::AMPLE_GAS`] unless a scenario
+/// starves it on purpose with [`DriveTx::with_gas`].
+pub(super) struct DriveTx {
+    to: Option<Address>,
+    input: Bytes,
+    value: u64,
+    gas_limit: u64,
+}
+
+impl DriveTx {
+    pub(super) const AMPLE_GAS: u64 = 1_000_000;
+
+    /// A call to `to` carrying `value`.
+    pub(super) fn call(to: Address, value: u64) -> Self {
+        Self { to: Some(to), input: Bytes::new(), value, gas_limit: Self::AMPLE_GAS }
+    }
+
+    /// A contract creation running `initcode`.
+    pub(super) fn create(initcode: impl Into<Bytes>) -> Self {
+        Self { to: None, input: initcode.into(), value: 0, gas_limit: Self::AMPLE_GAS }
+    }
+
+    /// Sets the calldata (ignored by a creation, whose calldata is its init code).
+    pub(super) fn with_input(mut self, input: impl Into<Bytes>) -> Self {
+        self.input = input.into();
+        self
+    }
+
+    /// Sets the gas limit, so a scenario can starve a frame instead of always running to
+    /// completion.
+    pub(super) fn with_gas(mut self, gas_limit: u64) -> Self {
+        self.gas_limit = gas_limit;
+        self
+    }
+}
+
 /// Runs one real transaction through revm at `spec`, with the production inspector
 /// attached, then replays the resulting receipt through `on_tx_end`. See [`drive_txs`] for
 /// what this exercises and why.
@@ -263,7 +288,7 @@ pub(super) fn drive_tx(
     to: Address,
     value: u64,
 ) -> pb::sf::ethereum::r#type::v2::Block {
-    drive_txs(spec, accounts, &[(to, value)])
+    drive_txs(spec, accounts, &[DriveTx::call(to, value)])
 }
 
 pub(super) fn legacy_tx_event() -> firehose_tracer::types::TxEvent {

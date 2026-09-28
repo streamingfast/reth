@@ -3,6 +3,7 @@
 
 mod balance;
 mod gas;
+mod gas_boundary;
 mod native_log;
 mod precompile;
 mod scenario;

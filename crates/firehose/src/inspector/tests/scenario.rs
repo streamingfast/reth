@@ -73,8 +73,10 @@ impl Scenario {
         ];
         accounts.extend(self.extra_accounts.iter().cloned());
 
-        let txs: Vec<_> = (0..self.transactions).map(|_| (FACTORY, 0, self.gas_limit)).collect();
-        drive_txs_with_gas(spec, &accounts, &txs)
+        let txs: Vec<_> = (0..self.transactions)
+            .map(|_| DriveTx::call(FACTORY, 0).with_gas(self.gas_limit))
+            .collect();
+        drive_txs(spec, &accounts, &txs)
     }
 
     /// Address labels for [`balance_change_log`] and [`state_change_log`].
