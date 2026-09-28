@@ -2,6 +2,7 @@
 //! [`support`]; [`scenario`] holds the SELFDESTRUCT harness [`selfdestruct`] drives.
 
 mod balance;
+mod call_input;
 mod gas;
 mod gas_boundary;
 mod native_log;

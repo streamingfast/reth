@@ -173,6 +173,68 @@ pub struct FirehoseInspector<'a> {
     // SSTORE opcode in step_end, or by the precompile gather in call_end). Prevents the
     // call_end precompile-storage gather from re-emitting opcode SSTOREs.
     storage_processed_up_to: usize,
+
+    /// Budget of internal-call input bytes traced per transaction, from
+    /// [`MAX_CALL_INPUT_BYTES_PER_TX_ENV`]. `None` traces every input in full.
+    max_call_input_bytes_per_tx: Option<usize>,
+
+    /// Internal-call input bytes traced so far in the current transaction.
+    tx_call_input_bytes: usize,
+
+    /// Calls whose input was capped in the current transaction.
+    tx_call_inputs_capped: u32,
+
+    /// Input bytes left out of the trace in the current transaction.
+    tx_call_input_bytes_dropped: usize,
+
+    /// Selector bytes still traced for capped calls in the current transaction. Reported in the
+    /// summary but not charged to the budget.
+    tx_call_input_bytes_kept_capped: usize,
+}
+
+/// Environment variable capping the internal-call input bytes traced per transaction.
+///
+/// Unset or `0` traces every call input in full (the default). When set, once a transaction's
+/// internal calls have used the budget, the input of each further call that does not fit in
+/// what remains is traced as its first 4 bytes (the selector). The root call is never capped:
+/// its input is the transaction input, bounded by transaction size and also carried by
+/// `TransactionTrace.input`. Execution is unaffected; only the traced copy is shortened.
+///
+/// Every reader of a chain must use the same value, or they produce different blocks.
+/// Interim protection against blocks exceeding the Firehose message size limit, see
+/// <https://github.com/pinax-network/arc-node/issues/6>.
+pub const MAX_CALL_INPUT_BYTES_PER_TX_ENV: &str = "FIREHOSE_MAX_CALL_INPUT_BYTES_PER_TX";
+
+/// Parses a [`MAX_CALL_INPUT_BYTES_PER_TX_ENV`] value: a positive byte count enables the cap,
+/// unset, empty or `0` disables it. Anything else is rejected.
+fn parse_max_call_input_bytes(value: Option<&str>) -> Result<Option<usize>, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(v) => v
+            .parse::<usize>()
+            .map(|n| (n > 0).then_some(n))
+            .map_err(|e| format!("invalid {MAX_CALL_INPUT_BYTES_PER_TX_ENV}={v:?}: {e}")),
+    }
+}
+
+/// The configured per-transaction call input budget, read once from the environment.
+///
+/// Called from the tracer init functions, so an invalid value panics at startup rather than
+/// tracing in full, since readers of a chain must agree on the limit.
+pub(crate) fn max_call_input_bytes_per_tx() -> Option<usize> {
+    static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let value = std::env::var(MAX_CALL_INPUT_BYTES_PER_TX_ENV).ok();
+        let limit = parse_max_call_input_bytes(value.as_deref()).unwrap_or_else(|e| panic!("{e}"));
+        if let Some(limit) = limit {
+            reth_tracing::tracing::warn!(
+                target: "firehose",
+                limit,
+                "tracing internal-call input capped per transaction ({MAX_CALL_INPUT_BYTES_PER_TX_ENV})"
+            );
+        }
+        limit
+    })
 }
 
 impl<'a> Debug for FirehoseInspector<'a> {
@@ -214,7 +276,71 @@ impl<'a> FirehoseInspector<'a> {
             log_block_index: 0,
             trx_logs_count: 0,
             storage_processed_up_to: 0,
+            max_call_input_bytes_per_tx: max_call_input_bytes_per_tx(),
+            tx_call_input_bytes: 0,
+            tx_call_inputs_capped: 0,
+            tx_call_input_bytes_dropped: 0,
+            tx_call_input_bytes_kept_capped: 0,
         }
+    }
+
+    /// Starts a new per-transaction call input budget. Called at every root frame (depth 0),
+    /// call or create, so each transaction and system call gets its own budget.
+    const fn reset_tx_call_input_budget(&mut self) {
+        self.tx_call_input_bytes = 0;
+        self.tx_call_inputs_capped = 0;
+        self.tx_call_input_bytes_dropped = 0;
+        self.tx_call_input_bytes_kept_capped = 0;
+    }
+
+    /// Returns the part of a call's `input` to trace, applying the per-transaction budget
+    /// ([`MAX_CALL_INPUT_BYTES_PER_TX_ENV`]). The root call (depth 0) starts a new budget and is
+    /// traced in full.
+    fn traced_call_input<'i>(&mut self, depth: i32, to: Address, input: &'i [u8]) -> &'i [u8] {
+        if depth == 0 {
+            self.reset_tx_call_input_budget();
+            return input;
+        }
+        let Some(limit) = self.max_call_input_bytes_per_tx else { return input };
+        let total = self.tx_call_input_bytes.saturating_add(input.len());
+        if total <= limit {
+            self.tx_call_input_bytes = total;
+            return input;
+        }
+        let kept = input.len().min(4);
+        self.tx_call_inputs_capped += 1;
+        self.tx_call_input_bytes_dropped += input.len() - kept;
+        self.tx_call_input_bytes_kept_capped += kept;
+        if self.tx_call_inputs_capped == 1 {
+            reth_tracing::tracing::warn!(
+                target: "firehose",
+                depth,
+                %to,
+                input_len = input.len(),
+                traced_so_far = self.tx_call_input_bytes,
+                limit,
+                "transaction exceeded {MAX_CALL_INPUT_BYTES_PER_TX_ENV}, tracing further call inputs as their 4-byte selector"
+            );
+        }
+        &input[..kept]
+    }
+
+    /// Logs a per-transaction summary when the call input cap was applied. Called once per
+    /// transaction from [`Self::process_post_tx_balance_changes`].
+    fn log_tx_call_input_cap_summary(&self, sender: Address, gas_used: u64) {
+        if self.tx_call_inputs_capped == 0 {
+            return;
+        }
+        reth_tracing::tracing::warn!(
+            target: "firehose",
+            %sender,
+            gas_used,
+            capped_calls = self.tx_call_inputs_capped,
+            dropped_bytes = self.tx_call_input_bytes_dropped,
+            traced_bytes = self.tx_call_input_bytes + self.tx_call_input_bytes_kept_capped,
+            limit = self.max_call_input_bytes_per_tx.unwrap_or(0),
+            "transaction call inputs capped by {MAX_CALL_INPUT_BYTES_PER_TX_ENV}"
+        );
     }
 
     /// Returns a mutable reference to the tracer, allowing the runner to call tracer lifecycle
@@ -1218,6 +1344,8 @@ impl<'a> FirehoseInspector<'a> {
     ) where
         F: FnMut(Address) -> U256,
     {
+        self.log_tx_call_input_cap_summary(sender, gas_used);
+
         use pb::sf::ethereum::r#type::v2::balance_change::Reason;
 
         let gas_buy_cost = U256::from(gas_limit) * U256::from(accounting.refund_gas_price);
@@ -1620,12 +1748,14 @@ where
 
         self.enter_frame_pre_hook(context, inputs.caller);
 
+        let input = inputs.input.bytes(context);
+        let traced_input = self.traced_call_input(depth, to, input.as_ref());
         self.tracer.on_call_enter(
             depth,
             call_type,
             from,
             to,
-            inputs.input.bytes(context).as_ref(),
+            traced_input,
             inputs.gas_limit,
             inputs.value.get(),
         );
@@ -1778,6 +1908,12 @@ where
         log_journal("create_enter", context);
 
         self.enter_frame_pre_hook(context, inputs.caller());
+
+        // A root CREATE starts a transaction too: give it a fresh call input budget. Init code
+        // itself is not capped (it is paid for per word, unlike reused calldata).
+        if depth == 0 {
+            self.reset_tx_call_input_budget();
+        }
 
         // `on_call_enter` auto-patches the transaction's `to` field for root CREATE/CREATE2
         // (the original `TxEvent.to` is None for contract-creation txs), so no explicit patch

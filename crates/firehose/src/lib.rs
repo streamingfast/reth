@@ -112,6 +112,9 @@ pub fn is_tracer_initialized() -> bool {
 ///
 /// Must be called exactly once before any call to [`tracer`]. Panics if called more than once.
 pub fn init_tracer(config: firehose_tracer::config::Config) {
+    // Read and validate FIREHOSE_MAX_CALL_INPUT_BYTES_PER_TX now, so an invalid value fails at
+    // startup instead of panicking when the first block is traced.
+    inspector::max_call_input_bytes_per_tx();
     let lock = init_stdout_lock();
     let writer = SynchronizedStdout::new(lock);
     let tracer = firehose_tracer::Tracer::new_with_writer(config, Box::new(writer));
@@ -142,6 +145,9 @@ pub fn init_tracer_with_buffer(
     cancun_time: Option<u64>,
     prague_time: Option<u64>,
 ) -> firehose_tracer::InMemoryBuffer {
+    // Read and validate FIREHOSE_MAX_CALL_INPUT_BYTES_PER_TX now, so an invalid value fails at
+    // startup instead of panicking when the first block is traced.
+    inspector::max_call_input_bytes_per_tx();
     // Mirror `init_tracer`: ensure the shared stdout lock exists so any code path that later
     // reaches for it (e.g. an additional flashblock tracer) does not panic.
     let _ = init_stdout_lock();

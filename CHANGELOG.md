@@ -7,6 +7,19 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Added
+
+- `FIREHOSE_MAX_CALL_INPUT_BYTES_PER_TX` caps the internal-call input traced per transaction.
+  Unset or `0` (the default) traces every input in full, so output is unchanged unless it is set.
+  When set, once a transaction's internal calls have used the budget, each further call input
+  that does not fit what remains is traced as its first 4 bytes (the selector); the root call is
+  never capped and init code is not counted. Execution is unaffected. Protects against Firehose
+  blocks exceeding the ~2 GiB message limit
+  ([pinax-network/arc-node#6](https://github.com/pinax-network/arc-node/issues/6)). Every reader of
+  a chain must use the same value.
+
 ## reth-v2.5.2-fh3.1-2
 
 ### Changed
