@@ -232,8 +232,8 @@ where
         // wiring already keeps JIT off when the Firehose tracer is active, but this RPC method is
         // a second, independent way to flip it on at runtime — reject any action that would leave
         // JIT enabled (or resumed) while Firehose is tracing, rather than silently degrading.
-        if reth_firehose::is_tracer_initialized()
-            && matches!(action, RethJitAction::Enable | RethJitAction::Unpause)
+        if reth_firehose::is_tracer_initialized() &&
+            matches!(action, RethJitAction::Enable | RethJitAction::Unpause)
         {
             return Err(EthApiError::Internal(RethError::msg(
                 "reth_jit: refusing to enable/unpause JIT while the Firehose tracer is active — \

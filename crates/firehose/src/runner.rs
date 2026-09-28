@@ -7,9 +7,7 @@ use reth_chainspec::EthChainSpec;
 use reth_ethereum_forks::EthereumHardforks;
 use reth_evm::execute::BlockExecutor;
 use reth_exex::{ExExContext, ExExEvent};
-use reth_provider::{
-    BlockIdReader, BlockNumReader, BlockReader, StateProviderBox, StateProviderFactory,
-};
+use reth_provider::{BlockIdReader, BlockReader, StateProviderBox, StateProviderFactory};
 use reth_revm::{
     database::StateProviderDatabase,
     revm::{context::Block as _, Database as _},
