@@ -7,6 +7,12 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Changed
+
+- Firehose `Call.keccak_preimages` now keeps only the preimages that explain a storage change key of the transaction or system call; set `FIREHOSE_ETHEREUM_TRACER_DISABLE_KECCAK_FILTER=true` to keep them all (streamingfast/evm-firehose-tracer-rs#36).
+
 ## arc-v2.2.0-fh3.1-4
 
 ### Fixed
