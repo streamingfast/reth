@@ -11,8 +11,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
-- Firehose `Call.keccak_preimages` now keeps only the preimages that explain a storage change key of the transaction or system call (streamingfast/evm-firehose-tracer-rs#36).
-- Firehose limits the call input and return data a block records (firehose-tracer 5.5.0): past 50 MiB of internal call input or 25 MiB of return data in a transaction, later calls keep only their 4-byte selector or no return data, and set `Call.input_truncated` / `Call.return_data_truncated`.
+- Firehose `Call.keccak_preimages` now keeps only the preimages that explain a storage slot written by the transaction: the hash is the storage key, the storage key is the hash plus a small offset (a struct field or array position), or the hash appears inside another kept preimage (up to 16 levels). Preimages of hashes that never lead to a written storage slot, and preimages over 256 bytes, are no longer recorded (see streamingfast/reth#57).
+- Firehose limits the call input and return data a transaction records: past 50 MiB of internal call input or 25 MiB of return data, later calls keep only the 4-byte selector of their input and no return data, and set `Call.input_truncated` / `Call.return_data_truncated`. The root call is never cut, and a block that would still encode to more than 1 GiB has both limits halved until it fits (see streamingfast/reth#57).
 
 ## op-reth-v2.4.2-fh3.1-2
 
