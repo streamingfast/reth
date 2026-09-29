@@ -29,6 +29,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   list, so a node with tracing enabled would have rejected every Amsterdam block it received
   through the Engine API.
 
+- Trace Amsterdam transactions that run out of gas before their root call starts. Under
+  [EIP-2780](https://eips.ethereum.org/EIPS/eip-2780), the state gas for a created or newly
+  funded account is charged before the first frame opens. When it can't be paid, the transaction
+  is still included as an out-of-gas failure, but no frame ever runs. Such a transaction used to
+  come out with no call, no receipt, zero gas used and an unknown status. It now carries a failed
+  root call, its gas buy and nonce change, and a receipt matching what the node reports over RPC.
+
 ## reth-v2.5.2-fh3.1-2
 
 ### Changed

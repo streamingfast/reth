@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use firehose_tracer::pb::sf::ethereum::r#type::v2::{CallType, TransactionTraceStatus};
 use reth_firehose_tests::{assert_block_equals_golden, run_prestate};
 
 #[test]
@@ -94,6 +95,38 @@ fn amsterdam_builder_execution_requests() {
     let folder = case_dir("amsterdam_builder_execution_requests");
     let outcome = run_prestate(&folder)
         .expect("running amsterdam_builder_execution_requests prestate must succeed");
+
+    let golden = golden_dir(&folder, "block.2099.binpb");
+    assert_block_equals_golden(&outcome.block, &golden).expect("captured block must match golden");
+}
+
+/// Amsterdam: a creation transaction whose gas covers its intrinsic cost but not the EIP-8037
+/// account-creation state gas that EIP-2780 charges before the root frame opens. revm includes it
+/// as an out-of-gas halt without ever opening that frame, so the root `CREATE` has to be traced
+/// by the executor, and it has to be the transaction's own even though the block's system calls
+/// opened depth-0 frames before it ran. Left untraced, the transaction had no call at all, and
+/// the tracer dropped its receipt and left its status unknown.
+///
+/// Battlefield `contract_fail_code_copy` hits this with a 99309 gas deployment.
+#[test]
+fn amsterdam_create_runtime_out_of_gas() {
+    const GAS_LIMIT: u64 = 30_000;
+
+    let folder = case_dir("amsterdam_create_runtime_out_of_gas");
+    let outcome =
+        run_prestate(&folder).expect("running amsterdam_create_runtime_out_of_gas must succeed");
+
+    let trx = outcome.block.transaction_traces.first().expect("the transaction is included");
+    assert_eq!(trx.status, TransactionTraceStatus::Failed as i32);
+    assert_eq!(trx.gas_used, GAS_LIMIT, "an out-of-gas halt charges the whole gas limit");
+    let receipt = trx.receipt.as_ref().expect("the receipt is kept");
+    assert_eq!(receipt.cumulative_gas_used, GAS_LIMIT);
+
+    let root = trx.calls.first().expect("a root call");
+    assert_eq!(root.call_type, CallType::Create as i32);
+    assert!(root.status_failed);
+    assert_eq!(root.gas_consumed, root.gas_limit);
+    assert_eq!(root.nonce_changes.len(), 1, "the creation's nonce bump survives the halt");
 
     let golden = golden_dir(&folder, "block.2099.binpb");
     assert_block_equals_golden(&outcome.block, &golden).expect("captured block must match golden");
