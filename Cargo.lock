@@ -3968,8 +3968,8 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "firehose-tracer"
-version = "5.4.4"
-source = "git+https://github.com/streamingfast/evm-firehose-tracer-rs.git?branch=feature%2Fcall-data-truncation#84d260b183e6f331f09425d3c8121608166a56c7"
+version = "5.5.0"
+source = "git+https://github.com/streamingfast/evm-firehose-tracer-rs.git?branch=feature%2Fcall-data-truncation#bc50b273c1f547ae6cb4a3c99863d2fcd64da7e5"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",

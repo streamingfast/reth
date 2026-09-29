@@ -708,14 +708,14 @@ vergen-git2 = "10.0.1"
 ipnet = "2.11"
 
 ## Firehose Additions
-firehose-tracer = "5.4.4"
+firehose-tracer = "5.5.0"
 reth-firehose = { path = "crates/firehose" }
 reth-firehose-tests = { path = "crates/firehose-tests" }
 
 [patch.crates-io]
 ## Firehose additions
-# Temporary: the keccak preimage filter and the call input and return data limits are not on
-# crates.io yet. Remove once firehose-tracer 5.5.0 is published and the lock points to it.
+# Temporary: firehose-tracer 5.5.0 is not on crates.io yet. Remove once it is published and
+# the lock points to it.
 firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "feature/call-data-truncation" }
 
 ## Firehose additions

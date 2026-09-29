@@ -11,7 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- Firehose blocks now limit the call input and return data they record (streamingfast/evm-firehose-tracer-rs#37). Once the internal calls of a transaction have passed more than 50 MiB of input, every later internal call records only its 4-byte selector and sets `Call.input_truncated`. Once they have returned more than 25 MiB, every later internal call records no return data and sets `Call.return_data_truncated`. When a block would still encode to more than 1 GiB, both limits are halved until it fits. The root call is never truncated, and execution is not affected. This keeps blocks under the ~2 GiB Firehose message limit.
+- Firehose blocks now limit the call input and return data they record (streamingfast/evm-firehose-tracer-rs#37). When the internal calls that started before a call in the same transaction have passed more than 50 MiB of input, the call records only its 4-byte selector and sets `Call.input_truncated`. When the internal calls that ended before it have returned more than 25 MiB, it records no return data and sets `Call.return_data_truncated`. When a block would still encode to more than 1 GiB, both limits are halved until it fits. The root call is never truncated, and execution is not affected. This keeps blocks under the ~2 GiB Firehose message limit.
 
 ### Changed
 
