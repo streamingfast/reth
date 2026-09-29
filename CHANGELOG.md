@@ -7,7 +7,7 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## Unreleased
+## world-chain-v2.4.3-fh3.1-3
 
 ### Changed
 
