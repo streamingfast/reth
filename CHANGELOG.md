@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 
 - Firehose `Call.keccak_preimages` now keeps only the preimages that explain a storage change key of the transaction or system call (streamingfast/evm-firehose-tracer-rs#36).
+- Firehose limits the call input and return data a block records (firehose-tracer 5.5.0): past 50 MiB of internal call input or 25 MiB of return data in a transaction, later calls keep only their 4-byte selector or no return data, and set `Call.input_truncated` / `Call.return_data_truncated`.
 
 ## reth-v2.5.2-fh3.1-2
 
