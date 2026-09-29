@@ -712,7 +712,7 @@ reth-firehose-tests = { path = "crates/firehose-tests" }
 ## Firehose additions
 # Temporary: the keccak preimage filter is not on crates.io yet. Remove once firehose-tracer
 # 5.5.0 is published and the lock points to it.
-firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "feature/keccak-preimage-filter" }
+firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", rev = "3321aec1ebb9e215de2bd9cc58e7f1726496e47f" }
 
 ## Firehose additions
 # SF fork of alloy-evm that routes system calls (EIP-4788, EIP-2935, etc.) through the Inspector.
