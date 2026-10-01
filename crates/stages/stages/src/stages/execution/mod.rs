@@ -1,5 +1,6 @@
 use crate::stages::MERKLE_STAGE_DEFAULT_INCREMENTAL_THRESHOLD;
 use alloy_consensus::BlockHeader;
+use alloy_eip7928::bal::Bal;
 use alloy_primitives::BlockNumber;
 use num_traits::Zero;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
@@ -14,8 +15,8 @@ use reth_provider::{
     providers::{StaticFileProvider, StaticFileWriter},
     BlockHashReader, BlockReader, DBProvider, EitherWriter, ExecutionOutcome,
     HashedPostStateProvider, HeaderProvider, LatestStateProviderRef, OriginalValuesKnown,
-    ProviderError, StateWriteConfig, StateWriter, StaticFileProviderFactory, StatsReader,
-    StoragePath, StorageSettingsCache, TransactionVariant,
+    ProviderError, StateProvider, StateWriteConfig, StateWriter, StaticFileProviderFactory,
+    StatsReader, StoragePath, StorageSettingsCache, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages_api::{
@@ -304,7 +305,8 @@ where
 
         self.ensure_consistency(provider, input.checkpoint().block_number, None)?;
 
-        let db = StateProviderDatabase(LatestStateProviderRef::new(provider));
+        let db =
+            StateProviderDatabase(LatestStateProviderRef::new(provider).into_evm_state_provider());
         let mut executor = self.evm_config.batch_executor(db);
 
         // Progress tracking
@@ -333,6 +335,8 @@ where
 
         let mut blocks = Vec::new();
         let mut results = Vec::new();
+        // Reused across blocks for BAL hash encoding.
+        let mut bal_buf = Vec::new();
         for block_number in start_block..=max_block {
             // Fetch the block
             let fetch_block_start = Instant::now();
@@ -359,8 +363,19 @@ where
                 })
             })?;
 
+            let built_bal = executor.take_bal().map(Bal::from);
+            if let Some(bal) = &built_bal &&
+                let Err(err) = bal.validate_gas_limit(block.header().gas_limit())
+            {
+                return Err(StageError::Block {
+                    block: Box::new(block.block_with_parent()),
+                    error: BlockErrorKind::Validation(err.into()),
+                })
+            }
+            let bal_hash = built_bal.as_ref().map(|bal| bal.compute_hash_with_buf(&mut bal_buf));
+
             if let Err(err) =
-                self.consensus.validate_block_post_execution(&block, &result, None, None)
+                self.consensus.validate_block_post_execution(&block, &result, None, bal_hash)
             {
                 return Err(StageError::Block {
                     block: Box::new(block.block_with_parent()),
@@ -424,30 +439,21 @@ where
             "Finished executing block range"
         );
 
-        // Prepare the input for post execute commit hook, where an `ExExNotification` will be sent.
-        //
-        // Note: Since we only write to `blocks` if there are any ExExes, we don't need to perform
-        // the `has_exexs` check here as well
-        if !blocks.is_empty() {
-            let previous_input = self.post_execute_commit_input.replace(Chain::new(
-                blocks,
-                state.clone(),
-                BTreeMap::new(),
-            ));
-
-            if previous_input.is_some() {
-                // Not processing the previous post execute commit input is a critical error, as it
-                // means that we didn't send the notification to ExExes
-                return Err(StageError::PostExecuteCommit(
-                    "Previous post execute commit input wasn't processed",
-                ))
-            }
-        }
+        // The ExEx notification must carry the outcome as executed, so a copy is only taken if the
+        // state is modified below before it is written.
+        let mut exex_state = None;
 
         let time = Instant::now();
 
         if self.can_prune_changesets(provider, start_block, max_block)? {
             let prune_modes = provider.prune_modes_ref();
+
+            if !blocks.is_empty() &&
+                prune_modes.account_history.is_some() &&
+                prune_modes.storage_history.is_some()
+            {
+                exex_state = Some(state.clone());
+            }
 
             // Iterate over all reverts and clear them if pruning is configured.
             for block_number in start_block..=max_block {
@@ -484,6 +490,9 @@ where
 
             let path = provider.storage_path().join("preimage");
             if !provider.chain_spec().is_cancun_active_at_timestamp(start_header.timestamp()) {
+                if !blocks.is_empty() && exex_state.is_none() {
+                    exex_state = Some(state.clone());
+                }
                 slot_preimages::inject_plain_wipe_slots(&path, provider, &mut state)?;
             } else if path.exists() {
                 // Post-Cancun: no more self-destructs, preimage db is no longer needed.
@@ -511,6 +520,26 @@ where
             write = ?db_write_duration,
             "Execution time"
         );
+
+        // Prepare the input for post execute commit hook, where an `ExExNotification` will be sent.
+        //
+        // Note: Since we only write to `blocks` if there are any ExExes, we don't need to perform
+        // the `has_exexs` check here as well
+        if !blocks.is_empty() {
+            let previous_input = self.post_execute_commit_input.replace(Chain::new(
+                blocks,
+                exex_state.unwrap_or(state),
+                BTreeMap::new(),
+            ));
+
+            if previous_input.is_some() {
+                // Not processing the previous post execute commit input is a critical error, as it
+                // means that we didn't send the notification to ExExes
+                return Err(StageError::PostExecuteCommit(
+                    "Previous post execute commit input wasn't processed",
+                ))
+            }
+        }
 
         let done = stage_progress == max_block;
         Ok(ExecOutput {
@@ -832,7 +861,6 @@ mod tests {
         let hashed_state = provider.latest().hashed_post_state(&state.bundle).unwrap();
 
         let storage = &hashed_state.storages[&hashed_address];
-        assert!(!storage.wiped);
         assert_eq!(storage.storage[&first_slot], U256::ZERO);
         assert_eq!(storage.storage[&second_slot], U256::ZERO);
         assert!(state.bundle.reverts.is_empty());
@@ -1016,14 +1044,11 @@ mod tests {
         db_tx
             .put::<tables::PlainAccountState>(
                 acc1,
-                Account { nonce: 0, balance: U256::ZERO, bytecode_hash: Some(code_hash) },
+                Account { bytecode_hash: Some(code_hash), ..Default::default() },
             )
             .unwrap();
         db_tx
-            .put::<tables::PlainAccountState>(
-                acc2,
-                Account { nonce: 0, balance, bytecode_hash: None },
-            )
+            .put::<tables::PlainAccountState>(acc2, Account { balance, ..Default::default() })
             .unwrap();
         db_tx.put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(code.to_vec().into())).unwrap();
         provider.commit().unwrap();
@@ -1076,18 +1101,15 @@ mod tests {
                 // check post state
                 let account1 = address!("0x1000000000000000000000000000000000000000");
                 let account1_info =
-                    Account { balance: U256::ZERO, nonce: 0x00, bytecode_hash: Some(code_hash) };
+                    Account { bytecode_hash: Some(code_hash), ..Default::default() };
                 let account2 = address!("0x2adc25665018aa1fe0e6bc666dac8fc2697ff9ba");
-                let account2_info = Account {
-                    balance: U256::from(0x1bc16d674ece94bau128),
-                    nonce: 0x00,
-                    bytecode_hash: None,
-                };
+                let account2_info =
+                    Account { balance: U256::from(0x1bc16d674ece94bau128), ..Default::default() };
                 let account3 = address!("0xa94f5374fce5edbc8e2a8697c15331677e6ebf0b");
                 let account3_info = Account {
                     balance: U256::from(0x3635c9adc5de996b46u128),
                     nonce: 0x01,
-                    bytecode_hash: None,
+                    ..Default::default()
                 };
 
                 // assert accounts
@@ -1126,6 +1148,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::clone_on_copy)]
     async fn sanity_execute_unwind() {
         let factory = create_test_provider_factory();
         let provider = factory.provider_rw().unwrap();
@@ -1160,12 +1183,12 @@ mod tests {
 
         let db_tx = provider.tx_ref();
         let acc1 = address!("0x1000000000000000000000000000000000000000");
-        let acc1_info = Account { nonce: 0, balance: U256::ZERO, bytecode_hash: Some(code_hash) };
+        let acc1_info = Account { bytecode_hash: Some(code_hash), ..Default::default() };
         let acc2 = address!("0xa94f5374fce5edbc8e2a8697c15331677e6ebf0b");
-        let acc2_info = Account { nonce: 0, balance, bytecode_hash: None };
+        let acc2_info = Account { balance, ..Default::default() };
 
-        db_tx.put::<tables::PlainAccountState>(acc1, acc1_info).unwrap();
-        db_tx.put::<tables::PlainAccountState>(acc2, acc2_info).unwrap();
+        db_tx.put::<tables::PlainAccountState>(acc1, acc1_info.clone()).unwrap();
+        db_tx.put::<tables::PlainAccountState>(acc2, acc2_info.clone()).unwrap();
         db_tx.put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(code.to_vec().into())).unwrap();
         provider.commit().unwrap();
 
@@ -1197,7 +1220,7 @@ mod tests {
             // Test Unwind
             provider = factory.database_provider_rw().unwrap();
             let mut stage = stage();
-            provider.set_prune_modes(mode.clone().unwrap_or_default());
+            provider.set_prune_modes(mode.unwrap_or_default());
 
             let result = stage
                 .unwind(
@@ -1305,6 +1328,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::clone_on_copy)]
     async fn test_selfdestruct() {
         let test_db = TestStageDB::default();
         let provider = test_db.factory.database_provider_rw().unwrap();
@@ -1340,16 +1364,18 @@ mod tests {
         let code_hash = keccak256(code);
 
         // pre state
-        let caller_info = Account { nonce: 0, balance, bytecode_hash: None };
-        let destroyed_info =
-            Account { nonce: 0, balance: U256::ZERO, bytecode_hash: Some(code_hash) };
+        let caller_info = Account { balance, ..Default::default() };
+        let destroyed_info = Account { bytecode_hash: Some(code_hash), ..Default::default() };
 
         // set account
         let provider = test_db.factory.provider_rw().unwrap();
-        provider.tx_ref().put::<tables::PlainAccountState>(caller_address, caller_info).unwrap();
         provider
             .tx_ref()
-            .put::<tables::PlainAccountState>(destroyed_address, destroyed_info)
+            .put::<tables::PlainAccountState>(caller_address, caller_info.clone())
+            .unwrap();
+        provider
+            .tx_ref()
+            .put::<tables::PlainAccountState>(destroyed_address, destroyed_info.clone())
             .unwrap();
         provider
             .tx_ref()
@@ -1397,18 +1423,14 @@ mod tests {
             vec![
                 (
                     beneficiary_address,
-                    Account {
-                        nonce: 0,
-                        balance: U256::from(0x1bc16d674eca30a0u64),
-                        bytecode_hash: None
-                    }
+                    Account { balance: U256::from(0x1bc16d674eca30a0u64), ..Default::default() }
                 ),
                 (
                     caller_address,
                     Account {
                         nonce: 1,
                         balance: U256::from(0xde0b6b3a761cf60u64),
-                        bytecode_hash: None
+                        ..Default::default()
                     }
                 )
             ]

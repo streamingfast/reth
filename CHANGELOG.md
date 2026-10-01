@@ -7,6 +7,35 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## reth-v2.7.0-fh3.1
+
+### Changed
+
+- Update to upstream reth [v2.7.0](https://github.com/paradigmxyz/reth/releases/tag/v2.7.0)
+  (through [v2.6.0](https://github.com/paradigmxyz/reth/releases/tag/v2.6.0)): revm 43, and
+  alloy-evm 0.39 through the `streamingfast/evm` fork tag `v0.39.0-sf`, which still routes system
+  calls through the inspector.
+
+- Amsterdam only: gas reported by Firehose follows revm 43's glamsterdam devnet-8
+  [EIP-8038](https://eips.ethereum.org/EIPS/eip-8038) costs. For example, a cold storage access
+  now costs 2,100 gas instead of 3,000.
+
+### Fixed
+
+- Build the [EIP-7928](https://eips.ethereum.org/EIPS/eip-7928) block access list when a block
+  runs through Firehose live tracing, the same way upstream does for untraced execution. Before,
+  the traced path built no access list. Blocks skipped the access-list hash check and nothing was
+  stored for them. From reth 2.7.0, consensus rejects an Amsterdam block that produced no access
+  list, so a node with tracing enabled would have rejected every Amsterdam block it received
+  through the Engine API.
+
+- Trace Amsterdam transactions that run out of gas before their root call starts. Under
+  [EIP-2780](https://eips.ethereum.org/EIPS/eip-2780), the state gas for a created or newly
+  funded account is charged before the first frame opens. When it can't be paid, the transaction
+  is still included as an out-of-gas failure, but no frame ever runs. Such a transaction used to
+  come out with no call, no receipt, zero gas used and an unknown status. It now carries a failed
+  root call, its gas buy and nonce change, and a receipt matching what the node reports over RPC.
+
 ## reth-v2.5.2-fh3.1-3
 
 ### Changed

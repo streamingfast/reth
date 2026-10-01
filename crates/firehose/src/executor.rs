@@ -35,7 +35,7 @@ use std::{collections::HashMap, fmt::Debug};
 
 use crate::{
     block_tracer::FirehoseBlockTracer,
-    inspector::{FirehoseInspector, FirehoseInspectorApi, PostTxGasAccounting},
+    inspector::{FirehoseInspector, FirehoseInspectorApi, FramelessTx, PostTxGasAccounting},
     mapper,
     mapper::SignatureFields,
 };
@@ -45,7 +45,7 @@ use alloy_evm::{
     block::{BlockExecutor, CommitChanges, ExecutableTx, GasOutput},
     RecoveredTx,
 };
-use alloy_primitives::{Address, Log, Sealable, U256};
+use alloy_primitives::{Address, Bytes, Log, Sealable, TxKind, U256};
 use reth_evm::{
     execute::{BlockExecutionError, Executor},
     ConfigureEvm, Evm as _, EvmFor, OnStateHook,
@@ -53,10 +53,12 @@ use reth_evm::{
 use reth_execution_types::BlockExecutionResult;
 use reth_node_api::NodePrimitives;
 use reth_primitives_traits::{Block as BlockTrait, BlockBody, BlockTy, RecoveredBlock, TxTy};
-use reth_provider::StateProviderBox;
+use reth_provider::EvmStateProviderBox;
 use reth_revm::{
-    database::StateProviderDatabase, db::states::bundle_state::BundleRetention,
-    revm::context::Block as RevmBlock, Database as _, State,
+    database::StateProviderDatabase,
+    db::states::bundle_state::BundleRetention,
+    revm::{context::Block as RevmBlock, context_interface::Cfg},
+    Database as _, State,
 };
 
 /// Chain-specific hook that emits additional post-tx balance changes after the generic
@@ -323,6 +325,7 @@ where
     Inner: BlockExecutor<Evm: reth_evm::Evm<DB = &'bal mut State<BalDB>>>,
     Inner::Transaction: Transaction + TxHashRef + SignatureFields,
     <Inner::Evm as reth_evm::Evm>::Inspector: FirehoseInspectorApi,
+    <Inner::Evm as reth_evm::Evm>::Spec: Into<reth_revm::revm::primitives::hardfork::SpecId>,
     // Every real caller (`run_wrapped_block`, the live engine path) instantiates `Inner` with an
     // EVM borrowing a `reth_revm::State<DB>`, never an owned or otherwise-shaped `Database`. That
     // concrete shape is pinned down here (rather than bounding on the generic `Database` trait, as
@@ -369,6 +372,7 @@ where
             gas_price_opt,
             gas_limit,
             blob_gas_used,
+            frameless_parts,
             mut tx_event,
         ) = {
             let inner_tx: &Inner::Transaction = recovered.tx();
@@ -383,6 +387,7 @@ where
                 // EIP-4844: total blob gas consumed by this tx (num_blobs × GAS_PER_BLOB); 0 for
                 // non-blob tx types. Geth populates `receipt.BlobGasUsed` from this value.
                 inner_tx.blob_gas_used().unwrap_or(0),
+                FramelessParts::of(inner_tx),
                 tx_event,
             )
         };
@@ -425,6 +430,7 @@ where
         // `execute_transaction_with_commit_condition` does not run through this wrapper —
         // see the GUARD comment above `impl BlockExecutor for FirehoseWrappedExecutor` for
         // what that means in practice.
+        self.inner.evm_mut().inspector_mut().start_transaction();
         let result = self.inner.execute_transaction_without_commit((tx_env, recovered))?;
 
         let gas_used = result.result().result.tx_gas_used();
@@ -441,6 +447,19 @@ where
             self.inner.evm_mut(),
             PostTxGasAccounting::ethereum(effective_gas_price, base_fee),
         );
+
+        // An Amsterdam transaction whose EIP-2780 runtime gas phase ran out of gas is included
+        // without its root frame ever opening, see `trace_frameless_root_call`.
+        if !self.inner.evm().inspector().root_frame_entered() {
+            let tx = frameless_parts.into_tx(self.inner.evm().cfg_env(), sender, gas_limit);
+            let gas_buy_cost = U256::from(gas_limit) * U256::from(effective_gas_price) +
+                U256::from(blob_gas_used) * blob_gas_price.unwrap_or_default();
+            let (evm_db, inspector, _) = self.inner.evm_mut().components_mut();
+            let mut get_pre = |addr: Address| -> U256 {
+                evm_db.basic(addr).ok().flatten().map(|i| i.balance).unwrap_or(U256::ZERO)
+            };
+            inspector.trace_frameless_root_call_erased(sender, gas_buy_cost, tx, &mut get_pre);
+        }
 
         // Post-tx balance changes (gas refund to sender, fee reward to coinbase). The DB at
         // this point reflects state up to but not including this transaction's commit, so
@@ -618,7 +637,7 @@ where
 /// EVM type the live engine-API path executes Firehose-traced blocks with.
 pub type LiveTracedEvm<'db, 'tracer, Evm> = EvmFor<
     Evm,
-    &'db mut State<StateProviderDatabase<StateProviderBox>>,
+    &'db mut State<StateProviderDatabase<EvmStateProviderBox>>,
     FirehoseInspector<'tracer>,
 >;
 
@@ -931,6 +950,60 @@ where
 ///
 /// Must be called with `tracer.transaction == None` (i.e. outside any system-call window) so
 /// that `on_balance_change` routes the events to `block.balance_changes` directly.
+/// The fields of a transaction [`FramelessTx`] is built from, captured before the transaction is
+/// handed to the EVM, which takes it by value. Only turned into a [`FramelessTx`] for the rare
+/// transaction whose root frame never opened.
+struct FramelessParts {
+    kind: TxKind,
+    value: U256,
+    input: Bytes,
+    nonce: u64,
+    access_list_accounts: u64,
+    access_list_storages: u64,
+    authorization_count: u64,
+}
+
+impl FramelessParts {
+    fn of(tx: &impl Transaction) -> Self {
+        let (access_list_accounts, access_list_storages) =
+            tx.access_list().map_or((0, 0), |list| {
+                list.iter().fold((0, 0), |(accounts, storages), item| {
+                    (accounts + 1, storages + item.storage_keys.len() as u64)
+                })
+            });
+        Self {
+            kind: tx.kind(),
+            value: tx.value(),
+            input: tx.input().clone(),
+            nonce: tx.nonce(),
+            access_list_accounts,
+            access_list_storages,
+            authorization_count: tx.authorization_list().map_or(0, |list| list.len() as u64),
+        }
+    }
+
+    fn into_tx(self, cfg: &impl Cfg, sender: Address, gas_limit: u64) -> FramelessTx {
+        let root_gas_limit = FramelessTx::root_gas_limit(
+            cfg,
+            self.kind,
+            sender,
+            self.value,
+            &self.input,
+            gas_limit,
+            self.access_list_accounts,
+            self.access_list_storages,
+            self.authorization_count,
+        );
+        FramelessTx {
+            kind: self.kind,
+            value: self.value,
+            input: self.input,
+            nonce: self.nonce,
+            root_gas_limit,
+        }
+    }
+}
+
 fn emit_withdrawal_balance_changes<E>(evm: &mut E, withdrawals: Option<&Withdrawals>)
 where
     E: reth_evm::Evm,
