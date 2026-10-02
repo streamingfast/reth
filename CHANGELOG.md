@@ -7,6 +7,21 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Changed
+
+- `reth` no longer installs a Firehose execution extension (ExEx). It only emitted `FIRE INIT`
+  and the genesis block; blocks are traced by the engine. Both are now emitted at startup before
+  the consensus engine exists, so no block can be traced ahead of `FIRE INIT`, and the node
+  stops writing the ExEx write-ahead log.
+
+### Removed
+
+- `reth_firehose::run_exex` and `reth_firehose::emit_genesis_block_if_empty`. Call
+  `reth_firehose::init_blockchain(&provider)` from the node builder's `on_component_initialized`
+  hook instead. `reth-firehose` no longer depends on `reth-exex`.
+
 ## reth-v2.7.0-fh3.1
 
 ### Changed
