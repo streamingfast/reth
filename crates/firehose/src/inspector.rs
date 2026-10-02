@@ -1766,15 +1766,21 @@ where
 
         self.enter_frame_pre_hook(context, inputs.caller);
 
-        self.tracer.on_call_enter(
-            depth,
-            call_type,
-            from,
-            to,
-            inputs.input.bytes(context).as_ref(),
-            inputs.gas_limit,
-            inputs.value.get(),
-        );
+        // `as_bytes` reads an internal call's input from the shared memory buffer without copying
+        // it, since the tracer copies only the part it records. It borrows `context` until the
+        // end of this block.
+        {
+            let input = inputs.input.as_bytes(context);
+            self.tracer.on_call_enter(
+                depth,
+                call_type,
+                from,
+                to,
+                &input,
+                inputs.gas_limit,
+                inputs.value.get(),
+            );
+        }
 
         // EIP-7702: override address_delegates_to using the live EVM state.
         // on_call_enter uses the pre-block state reader which misses delegations committed
