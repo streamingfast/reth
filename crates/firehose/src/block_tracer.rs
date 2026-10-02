@@ -54,7 +54,7 @@ impl FirehoseBlockTracer<GlobalTracerGuard> {
     ///
     /// The genesis block (block 0) never goes through this guard: reth writes it directly to
     /// the database without executing it, and it is emitted standalone via
-    /// [`crate::runner::emit_genesis_block_if_empty`] at startup.
+    /// [`crate::init::emit_genesis_block_on_empty_chain`] at startup.
     ///
     /// Takes a [`SealedBlock`] rather than a `RecoveredBlock` so the guard can be started before
     /// transaction senders have been recovered. Block-level data read by the mapper is signer-free.

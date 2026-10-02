@@ -15,7 +15,7 @@ use firehose_tracer::types::{
     AccessTuple, BlockData, GenesisAlloc, SetCodeAuthorization, TxEvent, UncleData, WithdrawalData,
 };
 use reth_primitives_traits::{Block as BlockTrait, BlockBody};
-use reth_provider::{AccountReader, ProviderResult};
+use reth_provider::AccountReader;
 
 pub(crate) fn to_genesis_alloc(genesis: &Genesis) -> GenesisAlloc {
     genesis
@@ -122,12 +122,6 @@ where
             amount: w.amount,
         })
         .collect()
-}
-
-pub(crate) fn to_finalized_ref(
-    block_ref: ProviderResult<Option<alloy_eips::BlockNumHash>>,
-) -> Option<firehose_tracer::types::FinalizedBlockRef> {
-    finalized_ref_from_num_hash(block_ref.ok().flatten())
 }
 
 /// Builds a Firehose [`FinalizedBlockRef`](firehose_tracer::types::FinalizedBlockRef) from the

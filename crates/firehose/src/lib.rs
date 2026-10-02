@@ -1,6 +1,6 @@
 //! Firehose crate providing blockchain data processing modules.
 //!
-//! This crate contains modules for inspection, mapping, prelude utilities, and running tasks.
+//! This crate contains modules for inspection, mapping, prelude utilities, and node startup.
 
 /// Block-level drop guard that manages the Firehose tracer lifecycle across validation.
 pub mod block_tracer;
@@ -8,14 +8,14 @@ pub mod block_tracer;
 pub mod executor;
 /// Resolves which finalized block a Firehose block event may advertise.
 pub mod finality;
+/// Startup module emitting `FIRE INIT` and the genesis block.
+pub mod init;
 /// Inspector module for analyzing blockchain data.
 pub mod inspector;
 /// Mapper module for transforming blockchain data.
 pub mod mapper;
 /// Prelude module with common imports and utilities.
 pub mod prelude;
-/// Runner module for executing processing tasks.
-pub mod runner;
 
 pub use block_tracer::{FirehoseBlockTracer, GlobalTracerGuard};
 pub use executor::{
@@ -25,8 +25,8 @@ pub use executor::{
 };
 pub use finality::finalized_ref_for_block;
 pub use firehose_tracer::types::FinalizedBlockRef;
+pub use init::{emit_genesis_block_on_empty_chain, init_blockchain};
 pub use inspector::{FramelessTx, PostTxGasAccounting};
-pub use runner::{emit_genesis_block_if_empty, emit_genesis_block_on_empty_chain, run_exex};
 
 use std::{
     io::Write,
