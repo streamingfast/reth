@@ -612,7 +612,10 @@ where
         // Get an iterator over the transactions in the payload
         let txs = self.tx_iterator_for(&input)?;
 
-        let parallel_bal_execution = ensure_ok!(self.bal_path_eligible(env.decoded_bal.as_deref()));
+        // Firehose executes sequentially, and in BAL mode the payload processor streams
+        // transactions in conversion-completion order instead of block order.
+        let parallel_bal_execution = ensure_ok!(self.bal_path_eligible(env.decoded_bal.as_deref())) &&
+            !reth_firehose::is_tracer_initialized();
 
         // Prepare the state-root job before execution so it can provide streaming hooks.
         let mut state_root_job =
@@ -762,6 +765,8 @@ where
             //
             // BAL parallel execution is incompatible with sequential Firehose tracing, so a block
             // carrying a BAL is executed sequentially here, building its BAL like `execute_block`.
+            // `parallel_bal_execution` is forced off while tracing so the transactions arrive in
+            // block order.
             match make_state_provider(false) {
                 Ok(state_provider) => self.execute_and_trace_block(
                     state_provider,
