@@ -39,8 +39,9 @@ fn amsterdam_slot_number() {
 }
 
 /// EIP-7928: `run_wrapped_block` (this repo's pipeline/backfill path) has no payload sidecar to
-/// source the block access list from, so it must reconstruct it via re-execution and only surface
-/// it once the reconstructed hash matches the header's declared `block_access_list_hash`.
+/// source the block access list from, so it must reconstruct it via re-execution, and
+/// `take_traced_block_access_list` only surfaces it once the reconstructed hash matches the
+/// header's declared `block_access_list_hash`.
 ///
 /// Because of that check the fixture's `context.blockAccessListHash` is not free-standing: it has
 /// to be regenerated from the reconstructed value whenever anything about the block changes,

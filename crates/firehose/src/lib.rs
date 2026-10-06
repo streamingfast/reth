@@ -19,9 +19,9 @@ pub mod prelude;
 
 pub use block_tracer::{FirehoseBlockTracer, GlobalTracerGuard};
 pub use executor::{
-    run_wrapped_block, ChainHooks, FirehoseBlockExecutor, FirehoseEvmConfig, FirehoseLiveHooks,
-    FirehoseWrappedExecutor, LiveTracedEvm, NoChainHooks, NoPostTxExtras, NoPreTxAdjust,
-    PostTxExtras, PreTxAdjust,
+    run_wrapped_block, take_traced_block_access_list, ChainHooks, FirehoseBlockExecutor,
+    FirehoseEvmConfig, FirehoseLiveHooks, FirehoseWrappedExecutor, LiveTracedEvm, NoChainHooks,
+    NoPostTxExtras, NoPreTxAdjust, PostTxExtras, PreTxAdjust,
 };
 pub use finality::finalized_ref_for_block;
 pub use firehose_tracer::types::FinalizedBlockRef;
