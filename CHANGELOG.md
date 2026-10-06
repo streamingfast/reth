@@ -7,6 +7,20 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## reth-v2.7.0-fh3.1-2
+
+### Fixed
+
+- Staged sync no longer rejects Amsterdam blocks with `BlockAccessListHashMissing`. The Firehose
+  block executor now rebuilds each block's access list on both its traced and untraced paths and
+  hands it to the execution stage for validation.
+
+### Changed
+
+- `reth_firehose::run_wrapped_block` leaves the rebuilt block access list in the state. Call the
+  new `reth_firehose::take_traced_block_access_list` afterwards to check its hash and record its
+  RLP on the traced block; `FirehoseBlockExecutor` already does.
+
 ## reth-v2.7.0-fh3.1-1
 
 ### Fixed
