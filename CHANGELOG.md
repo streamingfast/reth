@@ -7,7 +7,11 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## Unreleased
+## reth-v2.7.0-fh3.1-1
+
+### Fixed
+
+- Fixed glamsterdam hard fork crash when BAL executes in parallel (when a block has more than 30 transactions)
 
 ### Changed
 
