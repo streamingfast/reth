@@ -7,6 +7,14 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## base-v2.5.2.8-fh3.1
+
+### Changed
+
+- Rebase on Base's reth fork at `base-v2.5.2.8`, the reth version pinned by Base `v1.5.0`. It adds
+  snapshot download options (`--prune-unlisted`, retry delays) and faster history pruning; no
+  Firehose code changed.
+
 ## base-v2.5.2.6-fh3.1-1
 
 ### Changed
