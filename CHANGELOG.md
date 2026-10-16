@@ -17,6 +17,16 @@ garbage collection, an optional minimal storage mode, a RocksDB `max_open_files`
 an engine fix that registers the pending changeset entry inside the background task. It touches
 no Firehose file, so the instrumentation is carried across unchanged.
 
+### Added
+
+- `reth_firehose::precompile_effects` lets a stateful precompile report each storage write,
+  code install and log as it makes it. The inspector then emits them in that order when the
+  precompile call ends, as geth's hooked state does: storage changes and logs keep their
+  relative order, a slot written twice in one call reports its intermediate value, and a call
+  that reverts keeps its writes and logs. Precompiles that do not report keep the previous
+  behavior, which reads their writes back from the journal when the call ends. BSC's CAS20
+  precompiles use it.
+
 ## bnb-v0.1.2-fh3.1-2
 
 ### Changed
