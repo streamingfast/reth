@@ -1254,6 +1254,9 @@ where
             withdrawals,
             <Evm as reth_firehose::FirehoseLiveHooks>::PreTxAdjust::default(),
             <Evm as reth_firehose::FirehoseLiveHooks>::PostTxExtras::default(),
+        )
+        .with_pre_execution_writes(
+            <Evm as reth_firehose::FirehoseLiveHooks>::PreExecutionWrites::default(),
         );
 
         if !self.config.precompile_cache_disabled() {

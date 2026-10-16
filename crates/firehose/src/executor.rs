@@ -35,12 +35,12 @@ use crate::{
     mapper::SignatureFields,
 };
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction, TxReceipt};
-use alloy_eips::eip4895::Withdrawals;
+use alloy_eips::{eip4788::SYSTEM_ADDRESS, eip4895::Withdrawals};
 use alloy_evm::{
     block::{BlockExecutor, CommitChanges, ExecutableTx, GasOutput},
     RecoveredTx,
 };
-use alloy_primitives::{Address, Log, Sealable, U256};
+use alloy_primitives::{Address, Bytes, Log, Sealable, B256, KECCAK256_EMPTY, U256};
 use reth_evm::{
     execute::{BlockExecutionError, Executor},
     ConfigureEvm, Evm as _, EvmFor, OnStateHook,
@@ -144,6 +144,38 @@ where
     }
 }
 
+/// State a chain's pre-execution changes may write outside the EVM.
+///
+/// Some chains apply irregular state transitions in `apply_pre_execution_changes` by committing
+/// straight to the state DB, for example OP Stack's `create2deployer` install at Canyon or Base's
+/// BaseTime predeploy at Denim. No inspector hook fires for those writes.
+/// [`FirehoseWrappedExecutor`] reads every location listed here before and after the pre-execution
+/// changes and emits what changed: code as block-level code changes, and storage inside a system
+/// call to the written account, since the block model has no block-level storage changes.
+///
+/// Every listed location is read from the state DB on every block, so keep the lists short.
+pub trait PreExecutionWrites {
+    /// Accounts whose code the pre-execution changes may set.
+    fn code_addresses(&self) -> &[Address];
+    /// Storage slots the pre-execution changes may write. Consecutive slots of the same account
+    /// are emitted in one system call.
+    fn storage_slots(&self) -> &[(Address, U256)];
+}
+
+/// [`PreExecutionWrites`] for chains whose pre-execution changes all run through the EVM.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoPreExecutionWrites;
+
+impl PreExecutionWrites for NoPreExecutionWrites {
+    fn code_addresses(&self) -> &[Address] {
+        &[]
+    }
+
+    fn storage_slots(&self) -> &[(Address, U256)] {
+        &[]
+    }
+}
+
 /// A [`BlockExecutor`] wrapper that fires Firehose tracer hooks around a delegate executor.
 ///
 /// The inner executor's EVM must have been configured with a [`FirehoseInspectorApi`]-capable
@@ -177,7 +209,16 @@ where
 /// per-tx [`firehose_tracer::types::TxEvent`] before it is handed to the tracer, used by OP Stack
 /// variants to overwrite the deposit-tx nonce (deposit envelopes carry no nonce — the effective
 /// value lives on the sender account). Defaults to [`NoPreTxAdjust`].
-pub struct FirehoseWrappedExecutor<Inner, Extras = NoPostTxExtras, Adjust = NoPreTxAdjust> {
+///
+/// The `Writes` type parameter lists the state the chain's pre-execution changes write outside
+/// the EVM (see [`PreExecutionWrites`]). Defaults to [`NoPreExecutionWrites`]; set it with
+/// [`Self::with_pre_execution_writes`].
+pub struct FirehoseWrappedExecutor<
+    Inner,
+    Extras = NoPostTxExtras,
+    Adjust = NoPreTxAdjust,
+    Writes = NoPreExecutionWrites,
+> {
     inner: Inner,
     withdrawals: Option<Withdrawals>,
     /// Running count of logs emitted so far in this block, used to derive each receipt's
@@ -185,6 +226,7 @@ pub struct FirehoseWrappedExecutor<Inner, Extras = NoPostTxExtras, Adjust = NoPr
     log_index: u32,
     extras: Extras,
     adjust: Adjust,
+    writes: Writes,
 }
 
 impl Debug for FirehoseWrappedExecutor<()> {
@@ -197,7 +239,14 @@ impl<Inner> FirehoseWrappedExecutor<Inner, NoPostTxExtras, NoPreTxAdjust> {
     /// Wraps `inner` with Firehose tracer hooks. `withdrawals` is consumed inside
     /// [`Self::finish`] to emit per-address balance changes for EIP-4895 validator withdrawals.
     pub const fn new(inner: Inner, withdrawals: Option<Withdrawals>) -> Self {
-        Self { inner, withdrawals, log_index: 0, extras: NoPostTxExtras, adjust: NoPreTxAdjust }
+        Self {
+            inner,
+            withdrawals,
+            log_index: 0,
+            extras: NoPostTxExtras,
+            adjust: NoPreTxAdjust,
+            writes: NoPreExecutionWrites,
+        }
     }
 }
 
@@ -212,7 +261,14 @@ impl<Inner, Extras> FirehoseWrappedExecutor<Inner, Extras, NoPreTxAdjust> {
         withdrawals: Option<Withdrawals>,
         extras: Extras,
     ) -> Self {
-        Self { inner, withdrawals, log_index: 0, extras, adjust: NoPreTxAdjust }
+        Self {
+            inner,
+            withdrawals,
+            log_index: 0,
+            extras,
+            adjust: NoPreTxAdjust,
+            writes: NoPreExecutionWrites,
+        }
     }
 }
 
@@ -226,11 +282,28 @@ impl<Inner, Extras, Adjust> FirehoseWrappedExecutor<Inner, Extras, Adjust> {
         adjust: Adjust,
         extras: Extras,
     ) -> Self {
-        Self { inner, withdrawals, log_index: 0, extras, adjust }
+        Self { inner, withdrawals, log_index: 0, extras, adjust, writes: NoPreExecutionWrites }
+    }
+
+    /// Installs the [`PreExecutionWrites`] the chain's pre-execution changes make outside the
+    /// EVM, so they are emitted as tracer events.
+    pub fn with_pre_execution_writes<Writes>(
+        self,
+        writes: Writes,
+    ) -> FirehoseWrappedExecutor<Inner, Extras, Adjust, Writes> {
+        FirehoseWrappedExecutor {
+            inner: self.inner,
+            withdrawals: self.withdrawals,
+            log_index: self.log_index,
+            extras: self.extras,
+            adjust: self.adjust,
+            writes,
+        }
     }
 }
 
-impl<Inner, Extras, Adjust> BlockExecutor for FirehoseWrappedExecutor<Inner, Extras, Adjust>
+impl<Inner, Extras, Adjust, Writes> BlockExecutor
+    for FirehoseWrappedExecutor<Inner, Extras, Adjust, Writes>
 where
     Inner: BlockExecutor,
     Inner::Transaction: Transaction + TxHashRef + SignatureFields,
@@ -239,6 +312,7 @@ where
     Inner::Receipt: TxReceipt<Log = Log>,
     Extras: PostTxExtras<Inner::Evm>,
     Adjust: PreTxAdjust<Inner::Evm>,
+    Writes: PreExecutionWrites,
 {
     type Transaction = Inner::Transaction;
     type Receipt = Inner::Receipt;
@@ -246,10 +320,16 @@ where
     type Result = Inner::Result;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
+        let before = PreExecutionState::read(self.inner.evm_mut().db_mut(), &self.writes)?;
+
         self.inner.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
         let res = self.inner.apply_pre_execution_changes();
         self.inner.evm_mut().inspector_mut().tracer_mut().on_system_call_end();
-        res
+        res?;
+
+        // Emitted after the system-call window has closed, so code changes land in
+        // `block.code_changes`.
+        before.emit_changes(self.inner.evm_mut(), &self.writes)
     }
 
     fn execute_transaction_with_commit_condition(
@@ -509,6 +589,8 @@ pub trait FirehoseLiveHooks: ConfigureEvm {
     type PreTxAdjust: for<'db, 'tracer> PreTxAdjust<LiveTracedEvm<'db, 'tracer, Self>> + Default;
     /// Hook that emits chain-specific balance changes after each transaction.
     type PostTxExtras: for<'db, 'tracer> PostTxExtras<LiveTracedEvm<'db, 'tracer, Self>> + Default;
+    /// State the chain's pre-execution changes write outside the EVM.
+    type PreExecutionWrites: PreExecutionWrites + Default;
 }
 
 impl<F> FirehoseLiveHooks for FirehoseEvmConfig<F>
@@ -517,6 +599,7 @@ where
 {
     type PreTxAdjust = NoPreTxAdjust;
     type PostTxExtras = NoPostTxExtras;
+    type PreExecutionWrites = NoPreExecutionWrites;
 }
 
 impl<ChainSpec, EvmF> FirehoseLiveHooks for reth_evm_ethereum::EthEvmConfig<ChainSpec, EvmF>
@@ -525,6 +608,7 @@ where
 {
     type PreTxAdjust = NoPreTxAdjust;
     type PostTxExtras = NoPostTxExtras;
+    type PreExecutionWrites = NoPreExecutionWrites;
 }
 
 impl<Inner> FirehoseLiveHooks for reth_evm::noop::NoopEvmConfig<Inner>
@@ -534,6 +618,7 @@ where
 {
     type PreTxAdjust = Inner::PreTxAdjust;
     type PostTxExtras = Inner::PostTxExtras;
+    type PreExecutionWrites = Inner::PreExecutionWrites;
 }
 
 /// Pipeline [`Executor`] that runs each block through a per-block wrapping strategy
@@ -777,6 +862,114 @@ where
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The locations of a [`PreExecutionWrites`], read before the pre-execution changes run.
+struct PreExecutionState {
+    /// Code hash and code of each [`PreExecutionWrites::code_addresses`] entry, in order.
+    code: Vec<(B256, Bytes)>,
+    /// Value of each [`PreExecutionWrites::storage_slots`] entry, in order.
+    storage: Vec<U256>,
+}
+
+impl PreExecutionState {
+    fn read<DB: reth_revm::Database>(
+        db: &mut DB,
+        writes: &impl PreExecutionWrites,
+    ) -> Result<Self, BlockExecutionError> {
+        let code = writes
+            .code_addresses()
+            .iter()
+            .map(|address| account_code(db, *address))
+            .collect::<Result<_, _>>()?;
+        let storage = writes
+            .storage_slots()
+            .iter()
+            .map(|(address, slot)| db.storage(*address, *slot).map_err(BlockExecutionError::other))
+            .collect::<Result<_, _>>()?;
+        Ok(Self { code, storage })
+    }
+
+    /// Emits every location that differs from this snapshot. Must be called outside any
+    /// transaction or system-call window.
+    fn emit_changes<E>(
+        self,
+        evm: &mut E,
+        writes: &impl PreExecutionWrites,
+    ) -> Result<(), BlockExecutionError>
+    where
+        E: reth_evm::Evm,
+        E::Inspector: FirehoseInspectorApi,
+        E::DB: reth_revm::Database,
+    {
+        for (address, (old_hash, old_code)) in writes.code_addresses().iter().zip(self.code) {
+            let (new_hash, new_code) = account_code(evm.db_mut(), *address)?;
+            if new_hash != old_hash {
+                evm.inspector_mut()
+                    .tracer_mut()
+                    .on_code_change(*address, old_hash, new_hash, &old_code, &new_code);
+            }
+        }
+
+        let mut storage_changes = Vec::new();
+        for ((address, slot), old_value) in writes.storage_slots().iter().zip(self.storage) {
+            let new_value =
+                evm.db_mut().storage(*address, *slot).map_err(BlockExecutionError::other)?;
+            if new_value != old_value {
+                storage_changes.push((*address, *slot, old_value, new_value));
+            }
+        }
+        if storage_changes.is_empty() {
+            return Ok(());
+        }
+
+        // The block model has no block-level storage changes and the tracer rejects storage
+        // changes outside a transaction, so each written account gets a system call that holds
+        // its changes.
+        let tracer = evm.inspector_mut().tracer_mut();
+        tracer.on_system_call_start();
+        for account_changes in storage_changes.chunk_by(|a, b| a.0 == b.0) {
+            let address = account_changes[0].0;
+            tracer.on_call_enter(
+                0,
+                firehose_tracer::types::Opcode::Call as u8,
+                SYSTEM_ADDRESS,
+                address,
+                &[],
+                0,
+                U256::ZERO,
+            );
+            for (_, slot, old_value, new_value) in account_changes {
+                tracer.on_storage_change(
+                    address,
+                    B256::from(*slot),
+                    B256::from(*old_value),
+                    B256::from(*new_value),
+                );
+            }
+            tracer.on_call_exit(0, &[], 0, None, false);
+        }
+        tracer.on_system_call_end();
+        Ok(())
+    }
+}
+
+/// Code hash and code of `address`, with the empty code hash for a missing account.
+fn account_code<DB: reth_revm::Database>(
+    db: &mut DB,
+    address: Address,
+) -> Result<(B256, Bytes), BlockExecutionError> {
+    let Some(info) = db.basic(address).map_err(BlockExecutionError::other)? else {
+        return Ok((KECCAK256_EMPTY, Bytes::new()));
+    };
+    if info.is_empty_code_hash() {
+        return Ok((KECCAK256_EMPTY, Bytes::new()));
+    }
+    let code = match info.code {
+        Some(code) => code,
+        None => db.code_by_hash(info.code_hash).map_err(BlockExecutionError::other)?,
+    };
+    Ok((info.code_hash, code.original_bytes()))
+}
 
 /// Emits EIP-4895 withdrawal balance changes to the tracer after the post-execution system-call
 /// window has closed.

@@ -1785,6 +1785,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.0",
+ "rayon-core",
 ]
 
 [[package]]
@@ -7711,8 +7712,12 @@ dependencies = [
  "alloy-rpc-types-eth",
  "aquamarine",
  "backon",
+ "blake3",
  "clap",
  "firehose-tracer",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "reth-chainspec",
  "reth-cli-runner",
  "reth-cli-util",
