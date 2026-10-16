@@ -9,11 +9,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## base-v2.5.2.8-fh3.1
 
+### Added
+
+- `PreExecutionWrites` lets a chain list the code and storage its pre-execution changes commit
+  straight to the state DB, outside the EVM (OP Stack's Canyon `create2deployer`, Base's Denim
+  BaseTime predeploy). `FirehoseWrappedExecutor::with_pre_execution_writes` installs it, and
+  `FirehoseLiveHooks::PreExecutionWrites` selects it for the live engine path. The wrapper reads
+  those locations before and after the pre-execution changes and emits what changed: code as
+  block-level code changes, storage inside a system call from the system address to the written
+  account.
+
 ### Changed
 
 - Rebase on Base's reth fork at `base-v2.5.2.8`, the reth version pinned by Base `v1.5.0`. It adds
-  snapshot download options (`--prune-unlisted`, retry delays) and faster history pruning; no
-  Firehose code changed.
+  snapshot download options (`--prune-unlisted`, retry delays) and faster history pruning.
+- A transaction whose type the block model cannot represent still stops the node, now with a
+  message naming the transaction hash and its type.
 
 ## base-v2.5.2.6-fh3.1-1
 
