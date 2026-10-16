@@ -14,6 +14,8 @@ pub mod finality;
 pub mod inspector;
 /// Mapper module for transforming blockchain data.
 pub mod mapper;
+/// Live record of the state changes a stateful precompile makes, for geth-ordered traces.
+pub mod precompile_effects;
 /// Prelude module with common imports and utilities.
 pub mod prelude;
 /// Runner module for executing processing tasks.

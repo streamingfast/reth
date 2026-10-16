@@ -1,3 +1,4 @@
+use crate::precompile_effects::PrecompileEffect;
 use alloy_primitives::{Address, Bytes, Log as AlloyLog, B256, U256};
 use firehose_tracer::{
     pb,
@@ -130,6 +131,11 @@ pub struct FirehoseInspector<'a> {
     // SSTORE opcode in step_end, or by the precompile gather in call_end). Prevents the
     // call_end precompile-storage gather from re-emitting opcode SSTOREs.
     storage_processed_up_to: usize,
+
+    // Addresses whose code install the current precompile call recorded live (see
+    // `crate::precompile_effects`). `process_journal_changes` skips their `CodeChange` entry
+    // so the install is not emitted twice.
+    recorded_code_changes: HashSet<Address>,
 }
 
 impl<'a> Debug for FirehoseInspector<'a> {
@@ -171,6 +177,7 @@ impl<'a> FirehoseInspector<'a> {
             log_block_index: 0,
             trx_logs_count: 0,
             storage_processed_up_to: 0,
+            recorded_code_changes: HashSet::new(),
         }
     }
 
@@ -343,7 +350,9 @@ impl<'a> FirehoseInspector<'a> {
                     let old_nonce = new_nonce.saturating_sub(1);
                     self.tracer.on_nonce_change(address, old_nonce, new_nonce);
                 }
-                JournalEntry::CodeChange { address } => {
+                JournalEntry::CodeChange { address }
+                    if !self.recorded_code_changes.contains(&address) =>
+                {
                     let account = context.journal().evm_state().get(&address);
                     if let Some(account) = account {
                         let new_hash = account.info.code_hash;
@@ -384,6 +393,54 @@ impl<'a> FirehoseInspector<'a> {
                 _ => {}
             }
         }
+    }
+
+    /// Emit the effects a precompile recorded live (see [`crate::precompile_effects`]), in the
+    /// order it made them, and mark its journal writes as emitted so the gathers skip them.
+    ///
+    /// The recorded logs of a successful call are the tail of the journal's logs; those of a
+    /// failed call were truncated, so they take the indices that follow the surviving logs,
+    /// the same indices `log_full` gives opcode logs of a reverted frame.
+    fn emit_recorded_precompile_effects<CTX>(
+        &mut self,
+        context: &CTX,
+        effects: Vec<PrecompileEffect>,
+        succeeded: bool,
+    ) where
+        CTX: ContextTr,
+        CTX::Journal: JournalExt,
+    {
+        let total = context.journal().logs().len() as u32;
+        let recorded_logs =
+            effects.iter().filter(|effect| matches!(effect, PrecompileEffect::Log(_))).count()
+                as u32;
+        let mut tx_log_index = if succeeded { total.saturating_sub(recorded_logs) } else { total };
+
+        for effect in effects {
+            match effect {
+                PrecompileEffect::Storage { address, key, old_value, new_value } => {
+                    self.tracer.on_storage_change(
+                        address,
+                        B256::from(key.to_be_bytes::<32>()),
+                        B256::from(old_value.to_be_bytes::<32>()),
+                        B256::from(new_value.to_be_bytes::<32>()),
+                    );
+                }
+                PrecompileEffect::Code { address, old_hash, old_code, new_hash, new_code } => {
+                    self.tracer.on_code_change(address, old_hash, new_hash, &old_code, &new_code);
+                }
+                PrecompileEffect::Log(log) => {
+                    let block_index = tx_log_index +
+                        self.log_block_index +
+                        crate::chain_tracing::block_log_offset();
+                    self.tracer.on_log(log.address, log.topics(), &log.data.data, block_index);
+                    tx_log_index += 1;
+                }
+            }
+        }
+
+        self.trx_logs_count = total;
+        self.storage_processed_up_to = context.journal().journal().len();
     }
 
     /// Emit logs appended to the journal directly by native precompiles.
@@ -582,6 +639,7 @@ impl<'a> FirehoseInspector<'a> {
         }
 
         self.journal_processed_up_to = context.journal().journal().len();
+        crate::precompile_effects::start_transaction();
 
         // Clear the previous tx's journal snapshot at the start of this tx. It is re-seeded
         // at this tx's root call/create exit (see `call_end` / `create_end`) and read by
@@ -1509,15 +1567,28 @@ where
         }
         log_journal("call_exit", context);
 
+        // Effects a precompile recorded while it ran. A precompile frame has no child frames,
+        // so anything recorded since the last take belongs to this call.
+        let recorded = crate::precompile_effects::take();
+        self.recorded_code_changes.extend(recorded.iter().filter_map(|effect| match effect {
+            PrecompileEffect::Code { address, .. } => Some(*address),
+            _ => None,
+        }));
+
         // Scan journal entries accumulated during this call's execution BEFORE popping it,
         // so changes are attributed to the call that caused them.
         self.process_journal_changes(context);
+        self.recorded_code_changes.clear();
 
-        // Gather state changes a native precompile made straight on the journal (no
-        // opcode fired, so step_end/log_full were never called) and attach them to this
-        // call frame. Storage before logs to match the usual effects-then-event order.
-        self.gather_precompile_storage_changes(context);
-        self.gather_precompile_logs(context);
+        if recorded.is_empty() {
+            // Gather state changes a native precompile made straight on the journal (no
+            // opcode fired, so step_end/log_full were never called) and attach them to this
+            // call frame. Storage before logs to match the usual effects-then-event order.
+            self.gather_precompile_storage_changes(context);
+            self.gather_precompile_logs(context);
+        } else {
+            self.emit_recorded_precompile_effects(context, recorded, outcome.result.is_ok());
+        }
 
         // Emit synthetic balance changes for a pending self-transfer if the call succeeded
         // (no-code target: step never fires but the transfer did happen). On failure
@@ -1578,6 +1649,7 @@ where
         // sender/coinbase balances to use as old_balance for gas refund and miner reward.
         if depth == 0 {
             self.tx_journal_snapshot = context.journal().journal().to_vec();
+            crate::precompile_effects::end_transaction();
         }
 
         // The `reverted` parameter in on_call_exit means "did the call fail"
@@ -1686,6 +1758,7 @@ where
         // process_post_tx_balance_changes can derive correct post-execution balances.
         if depth == 0 {
             self.tx_journal_snapshot = context.journal().journal().to_vec();
+            crate::precompile_effects::end_transaction();
         }
 
         self.tracer.on_call_exit(
@@ -2880,6 +2953,192 @@ mod tests {
             ));
             // Panics ("mismatch between call logs and receipt logs") if the precompile log was
             // skipped — the pre-fix behaviour.
+            insp.tracer_mut().on_tx_end(Some(&receipt), None);
+        }
+
+        tracer.on_block_end(None);
+        drop(tracer);
+
+        buffer.get_bytes()
+    }
+
+    /// A precompile that records its writes live gets them in the order it made them,
+    /// interleaved with its logs, with the intermediate value of a slot it wrote twice, and
+    /// its code install emitted once.
+    #[test]
+    fn recorded_precompile_effects_keep_write_order() {
+        let block = decode_fire_block(&drive_recorded_precompile_call(false));
+        let call = &block.transaction_traces[0].calls[0];
+
+        assert!(!call.state_reverted);
+        assert_eq!(call.code_changes.len(), 1, "code install must be emitted exactly once");
+        assert_eq!(call.code_changes[0].address, RECORDED_TOKEN.to_vec());
+
+        let values: Vec<_> = call
+            .storage_changes
+            .iter()
+            .map(|c| (c.old_value.clone(), c.new_value.clone()))
+            .collect();
+        let word = |v: u64| B256::from(U256::from(v)).to_vec();
+        assert_eq!(values, vec![(word(0), word(5)), (word(5), word(9))]);
+
+        assert_eq!(call.logs.len(), 1);
+        assert_eq!(call.logs[0].block_index, 0);
+
+        let code = call.code_changes[0].ordinal;
+        let first_write = call.storage_changes[0].ordinal;
+        let log = call.logs[0].ordinal;
+        let second_write = call.storage_changes[1].ordinal;
+        assert!(
+            code < first_write && first_write < log && log < second_write,
+            "ordinals must follow write order: code {code}, write {first_write}, log {log}, \
+             write {second_write}"
+        );
+    }
+
+    /// revm truncates a reverted precompile's journal writes before `call_end`; the effects
+    /// it recorded live still reach the reverted call, as in geth.
+    #[test]
+    fn recorded_precompile_effects_survive_revert() {
+        let block = decode_fire_block(&drive_recorded_precompile_call(true));
+        let call = &block.transaction_traces[0].calls[0];
+
+        assert!(call.state_reverted);
+        assert_eq!(call.code_changes.len(), 1);
+        assert_eq!(call.storage_changes.len(), 2);
+        assert_eq!(call.logs.len(), 1);
+        assert_eq!(call.logs[0].block_index, 0);
+    }
+
+    const RECORDED_TOKEN: Address = Address::repeat_byte(0xbb);
+
+    /// Drives one transaction whose only call is a precompile that installs code on
+    /// `RECORDED_TOKEN`, writes slot 7 (0 -> 5), emits a log, then writes slot 7 again
+    /// (5 -> 9), recording each write live the way a stateful precompile does. With `revert`,
+    /// the precompile's checkpoint is reverted before `call_end`, as revm does for a failed
+    /// precompile. Returns the raw FIRE output buffer.
+    fn drive_recorded_precompile_call(revert: bool) -> Vec<u8> {
+        use crate::precompile_effects::{record_code_change, record_log, record_storage_change};
+        use reth_revm::{
+            bytecode::Bytecode,
+            revm::{
+                context::Context,
+                database::{CacheDB, EmptyDB},
+                interpreter::{
+                    interpreter_action::CallScheme, CallInput, CallValue, Gas, InstructionResult,
+                    InterpreterResult,
+                },
+                state::AccountInfo,
+                MainContext,
+            },
+        };
+
+        let key = U256::from(7u64);
+        let topic = B256::repeat_byte(0xcc);
+        let code = Bytecode::new_raw(Bytes::from_static(&[0xef]));
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(PRECOMPILE, AccountInfo::default());
+        db.insert_account_info(RECORDED_TOKEN, AccountInfo::default());
+        let mut ctx = Context::mainnet().with_db(db);
+
+        let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+            firehose_tracer::config::Config::default(),
+            firehose_tracer::config::ChainConfig {
+                chain_id: 56,
+                shanghai_time: Some(0),
+                cancun_time: Some(0),
+                prague_time: None,
+                verkle_time: None,
+            },
+            "reth-firehose-test",
+            "0",
+        );
+
+        {
+            let mut insp = FirehoseInspector::new(&mut tracer);
+            insp.tracer_mut().on_block_start(firehose_tracer::types::BlockEvent {
+                block: firehose_tracer::types::BlockData { number: 2, ..Default::default() },
+                finalized: None,
+                flash_block: None,
+            });
+            insp.tracer_mut().on_tx_start(legacy_tx_event(), None);
+
+            let mut inputs = CallInputs {
+                input: CallInput::Bytes(Bytes::new()),
+                return_memory_offset: 0..0,
+                gas_limit: 100_000,
+                reservoir: 0,
+                bytecode_address: PRECOMPILE,
+                known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
+                target_address: PRECOMPILE,
+                caller: SENDER,
+                value: CallValue::Transfer(U256::ZERO),
+                scheme: CallScheme::Call,
+                is_static: false,
+            };
+            let _ = insp.call(&mut ctx, &mut inputs);
+
+            let journal = ctx.journal_mut();
+            let checkpoint = journal.checkpoint();
+            journal.load_account(RECORDED_TOKEN).expect("load token");
+            journal.set_code(RECORDED_TOKEN, code.clone());
+            record_code_change(
+                RECORDED_TOKEN,
+                KECCAK_EMPTY,
+                Bytes::new(),
+                code.hash_slow(),
+                code.original_bytes(),
+            );
+            journal.sload(RECORDED_TOKEN, key).expect("sload");
+            for (old, new) in [(0u64, 5u64), (5, 9)] {
+                journal.sstore(RECORDED_TOKEN, key, U256::from(new)).expect("sstore");
+                record_storage_change(RECORDED_TOKEN, key, U256::from(old), U256::from(new));
+                if old == 0 {
+                    let log = AlloyLog {
+                        address: RECORDED_TOKEN,
+                        data: alloy_primitives::LogData::new_unchecked(vec![topic], Bytes::new()),
+                    };
+                    record_log(&log);
+                    journal.log(log);
+                }
+            }
+            if revert {
+                journal.checkpoint_revert(checkpoint);
+            } else {
+                journal.checkpoint_commit();
+            }
+
+            let mut outcome = CallOutcome {
+                result: InterpreterResult {
+                    result: if revert {
+                        InstructionResult::Revert
+                    } else {
+                        InstructionResult::Return
+                    },
+                    output: Bytes::new(),
+                    gas: Gas::new(100_000),
+                },
+                memory_offset: 0..0,
+                was_precompile_called: true,
+                precompile_call_logs: Vec::new(),
+            };
+            insp.call_end(&mut ctx, &inputs, &mut outcome);
+
+            let mut receipt = firehose_tracer::types::ReceiptData::new(
+                0,
+                21_000,
+                if revert { 0 } else { 1 },
+                21_000,
+            );
+            if !revert {
+                receipt.add_log(firehose_tracer::types::LogData::new(
+                    RECORDED_TOKEN,
+                    vec![topic],
+                    Bytes::new(),
+                    0,
+                ));
+            }
             insp.tracer_mut().on_tx_end(Some(&receipt), None);
         }
 
