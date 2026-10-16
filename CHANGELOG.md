@@ -7,6 +7,16 @@ This changelog covers Firehose-specific changes only. For upstream changes, see 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## bnb-v0.1.3-fh3.1
+
+Rebased onto bnb-chain/reth `v0.1.3` (`6e08308b`), the reth release that bnb-chain/reth-bsc
+`v0.1.3` (Chapel Jenner hardfork) depends on. That upstream range covers RPC fixes (state
+overrides reaching chain execution metadata, a block-env override hook, buffered `trace_filter`
+replays, a blocking-task deadlock), pruner fixes and a header history segment, blob store
+garbage collection, an optional minimal storage mode, a RocksDB `max_open_files` setting, and
+an engine fix that registers the pending changeset entry inside the background task. It touches
+no Firehose file, so the instrumentation is carried across unchanged.
+
 ## bnb-v0.1.2-fh3.1-2
 
 ### Changed
