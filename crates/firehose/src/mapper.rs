@@ -226,11 +226,20 @@ pub fn signed_tx_to_tx_event<Tx>(
 where
     Tx: alloy_consensus::Transaction + TxHashRef,
 {
+    // A transaction the block model cannot represent must stop the node: dropping it would emit
+    // a block that differs from the chain, and failing block execution would make the node
+    // reject a valid block.
+    let tx_type = tx.ty().try_into().unwrap_or_else(|_| {
+        panic!(
+            "Firehose cannot trace transaction {} of type {:#x}: the block model has no such \
+             transaction type, so this node cannot emit this block",
+            tx.tx_hash(),
+            tx.ty()
+        )
+    });
+
     TxEvent {
-        // FIXME: That is not true, what about Optimism specialized transaction types? We might
-        // to have a special mapper that knows the chain and as such is aware of some types
-        // that could not exists anywhere else. We will need to deal with this.
-        tx_type: tx.ty().try_into().expect("All transaction types handled for now"),
+        tx_type,
         hash: *tx.tx_hash(),
         from: signer,
         to: tx.to(),
