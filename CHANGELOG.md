@@ -7,6 +7,19 @@ This changelog covers Firehose-specific changes only. For upstream changes, see 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## bnb-v0.1.3-fh3.1-1
+
+### Fixed
+
+- `FirehoseEvmConfig` now forwards `evm_with_env`, `evm_with_env_and_inspector` and
+  `create_block_builder` to the wrapped config. BSC applies its block-override fork rules in
+  `evm_with_env`, so `eth_call`, `eth_estimateGas`, `debug_traceCall` and `eth_simulateV1` with
+  a time or number override that crosses a hardfork ran under the original block's fork.
+- `ChainTracingConfig::is_deferred_system_tx` now receives the transaction's effective gas price
+  at the block's base fee instead of its fee cap. A BSC system transaction sent as a dynamic-fee
+  transaction with a zero tip and a non-zero fee cap was traced as a normal transaction, which
+  panicked the node when the BSC executor deferred it without pushing a receipt.
+
 ## bnb-v0.1.3-fh3.1
 
 Rebased onto bnb-chain/reth `v0.1.3` (`6e08308b`), the reth release that bnb-chain/reth-bsc
