@@ -989,6 +989,47 @@ where
         self.inner.evm_env(header)
     }
 
+    fn evm_with_env<DB: reth_evm::Database>(
+        &self,
+        db: DB,
+        evm_env: reth_evm::EvmEnvFor<Self>,
+    ) -> reth_evm::EvmFor<Self, DB> {
+        self.inner.evm_with_env(db, evm_env)
+    }
+
+    fn evm_with_env_and_inspector<DB, I>(
+        &self,
+        db: DB,
+        evm_env: reth_evm::EvmEnvFor<Self>,
+        inspector: I,
+    ) -> reth_evm::EvmFor<Self, DB, I>
+    where
+        DB: reth_evm::Database,
+        I: reth_evm::InspectorFor<Self, DB>,
+    {
+        self.inner.evm_with_env_and_inspector(db, evm_env, inspector)
+    }
+
+    fn create_block_builder<'a, DB, I>(
+        &'a self,
+        evm: reth_evm::EvmFor<Self, &'a mut reth_revm::db::State<DB>, I>,
+        parent: &'a reth_primitives_traits::SealedHeader<
+            reth_primitives_traits::HeaderTy<Self::Primitives>,
+        >,
+        ctx: <Self::BlockExecutorFactory as alloy_evm::block::BlockExecutorFactory>::ExecutionCtx<
+            'a,
+        >,
+    ) -> impl reth_evm::execute::BlockBuilder<
+        Primitives = Self::Primitives,
+        Executor = reth_evm::BlockExecutorForEvm<'a, Self, DB, I>,
+    >
+    where
+        DB: reth_evm::Database,
+        I: reth_evm::InspectorFor<Self, &'a mut reth_revm::db::State<DB>> + 'a,
+    {
+        self.inner.create_block_builder(evm, parent, ctx)
+    }
+
     fn next_evm_env(
         &self,
         parent: &reth_primitives_traits::HeaderTy<Self::Primitives>,
