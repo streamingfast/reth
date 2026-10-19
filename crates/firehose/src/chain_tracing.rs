@@ -47,7 +47,10 @@ pub struct ChainTracingConfig {
     /// which matches the geth reference where system txs are traced when the consensus engine
     /// applies them.
     ///
-    /// Arguments: `to`, `max_fee_per_gas`, `signer`, `block_beneficiary`.
+    /// Arguments: `to`, the effective gas price at the block's base fee, `signer`,
+    /// `block_beneficiary`. For a dynamic-fee transaction the effective price is
+    /// `min(max_fee_per_gas, base_fee + max_priority_fee_per_gas)`, so a fee cap above zero with
+    /// a zero tip is still a system transaction on BSC.
     pub is_deferred_system_tx: fn(Option<Address>, u128, Address, Address) -> bool,
 
     /// Wrap the inner executor's `finish()` in an `on_system_call_start`/`end` window.

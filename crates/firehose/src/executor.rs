@@ -300,8 +300,14 @@ where
         // emits the tx trace at that point (matching geth, which traces system txs when the
         // consensus engine applies them). Emit nothing here — just delegate so the inner
         // executor's buffering still happens.
+        let effective_gas_price: u128 = if is_dynamic_fee {
+            std::cmp::min(max_fee_per_gas, base_fee as u128 + max_priority_fee_per_gas)
+        } else {
+            gas_price_opt.unwrap_or(0)
+        };
+
         if let Some(cfg) = crate::chain_tracing::chain_tracing_config() {
-            if (cfg.is_deferred_system_tx)(to, max_fee_per_gas, sender, coinbase) {
+            if (cfg.is_deferred_system_tx)(to, effective_gas_price, sender, coinbase) {
                 let result = self.inner.execute_transaction_without_commit((tx_env, recovered))?;
                 if !f(&result).should_commit() {
                     return Ok(None);
@@ -325,12 +331,6 @@ where
         // Committed log count: logs that survived after revert rollback; used to advance
         // the block-wide log counter inside `process_post_tx_balance_changes`.
         let committed_log_count = result.result().result.logs().len() as u32;
-
-        let effective_gas_price: u128 = if is_dynamic_fee {
-            std::cmp::min(max_fee_per_gas, base_fee as u128 + max_priority_fee_per_gas)
-        } else {
-            gas_price_opt.unwrap_or(0)
-        };
 
         // Post-tx balance changes (gas refund to sender, priority fee to coinbase). The DB at
         // this point reflects state up to but not including this transaction's commit, so
