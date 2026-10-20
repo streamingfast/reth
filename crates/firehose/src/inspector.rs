@@ -162,6 +162,11 @@ pub struct FirehoseInspector<'a> {
     /// calls, see [`RootJournalReasons`]. Cleared by `process_post_tx_balance_changes`.
     root_journal_reasons: Option<RootJournalReasons>,
 
+    /// While `root_journal_reasons` is set, the journal entries up to `journal_processed_up_to`,
+    /// used to detect a rollback the inspector did not see (see
+    /// `rewind_to_processed_journal_prefix`).
+    root_journal_processed: Vec<JournalEntry>,
+
     // increments at the end of each transaction, to get proper block index for logs
     log_block_index: u32,
 
@@ -211,6 +216,7 @@ impl<'a> FirehoseInspector<'a> {
             tx_post_pre_exec_sender_balance: None,
             root_balance_reason_override: None,
             root_journal_reasons: None,
+            root_journal_processed: Vec::new(),
             log_block_index: 0,
             trx_logs_count: 0,
             storage_processed_up_to: 0,
@@ -332,6 +338,9 @@ impl<'a> FirehoseInspector<'a> {
         if self.journal_processed_up_to > journal_len {
             self.journal_processed_up_to = journal_len;
         }
+        if self.root_journal_reasons.is_some() {
+            self.rewind_to_processed_journal_prefix(context);
+        }
 
         if self.journal_processed_up_to == journal_len {
             return;
@@ -345,6 +354,9 @@ impl<'a> FirehoseInspector<'a> {
             .cloned()
             .collect();
         self.journal_processed_up_to = journal_len;
+        if self.root_journal_reasons.is_some() {
+            self.root_journal_processed.extend(entries.iter().cloned());
+        }
 
         let reason = pb::sf::ethereum::r#type::v2::balance_change::Reason::Transfer;
         // Entries read outside the calls below the root call carry the transaction's own
@@ -830,6 +842,34 @@ impl<'a> FirehoseInspector<'a> {
         // Advance past the selfdestruct journal entries so process_journal_changes
         // doesn't re-emit them with wrong reasons.
         self.journal_processed_up_to = context.journal().journal().len();
+        if self.root_journal_reasons.is_some() {
+            let processed = self.root_journal_processed.len();
+            self.root_journal_processed
+                .extend(context.journal().journal()[processed..].iter().cloned());
+        }
+    }
+
+    /// Moves `journal_processed_up_to` back to the end of the longest journal prefix that still
+    /// holds the entries already processed.
+    ///
+    /// revm truncates the journal of a failed call before the inspector's `call_end`, so
+    /// clamping the watermark to the journal length is enough for ordinary transactions. A
+    /// transaction recording its fees from the journal can also roll back a group of calls after
+    /// they returned (Base's account abstraction phases) and then append new entries outside any
+    /// call. The journal can then be longer than the watermark while its tail past the rollback
+    /// point holds entries never processed, which the length alone does not reveal.
+    fn rewind_to_processed_journal_prefix<CTX>(&mut self, context: &mut CTX)
+    where
+        CTX: ContextTr,
+        CTX::Journal: JournalExt,
+    {
+        let journal = context.journal().journal();
+        let mut prefix = self.journal_processed_up_to.min(self.root_journal_processed.len());
+        while prefix > 0 && journal[prefix - 1] != self.root_journal_processed[prefix - 1] {
+            prefix -= 1;
+        }
+        self.journal_processed_up_to = prefix;
+        self.root_journal_processed.truncate(prefix);
     }
 
     /// Process EIP-7702 auth list delegations that occur during pre-execution.
@@ -1236,6 +1276,8 @@ impl<'a> FirehoseInspector<'a> {
     /// Emits the self-destruct cleanups and resets the per-transaction state, the part of
     /// `process_post_tx_balance_changes` that every transaction needs.
     fn finish_tx_post_processing(&mut self, committed_log_count: u32) {
+        self.root_journal_processed.clear();
+
         // Emit nonce reset and code clearing for self-destructed accounts.
         // This matches Geth 1.17.x's Finalise() ordering: nonce/code cleanup happens
         // AFTER gas refund and coinbase reward, so ordinals are sequenced correctly.
@@ -2663,6 +2705,37 @@ mod tests {
                 charged_new_account_state_gas: false,
             };
             let _ = insp.call(&mut ctx, &mut inputs);
+
+            // A child call that writes state, then is rolled back after it returned, the way a
+            // failed account abstraction phase is. The settlement entries below then reuse the
+            // rolled-back journal positions.
+            let checkpoint = ctx.journal_mut().checkpoint();
+            let mut child =
+                CallInputs { target_address: VAULT, bytecode_address: VAULT, ..inputs.clone() };
+            let _ = insp.call(&mut ctx, &mut child);
+            ctx.journal_mut()
+                .load_account_mut(SENDER)
+                .expect("load sender")
+                .data
+                .set_balance(U256::from(7u64));
+            ctx.journal_mut()
+                .load_account_mut(VAULT)
+                .expect("load vault")
+                .data
+                .set_balance(U256::from(8u64));
+            let mut child_outcome = CallOutcome {
+                result: InterpreterResult {
+                    result: InstructionResult::Return,
+                    output: Bytes::new(),
+                    gas: Gas::new(50_000),
+                },
+                memory_offset: 0..0,
+                was_precompile_called: false,
+                precompile_call_logs: Vec::new(),
+                charged_new_account_state_gas: false,
+            };
+            insp.call_end(&mut ctx, &child, &mut child_outcome);
+            ctx.journal_mut().checkpoint_revert(checkpoint);
 
             // After the calls, still inside the root call: payer refund and vault credit.
             ctx.journal_mut()
