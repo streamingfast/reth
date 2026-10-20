@@ -663,6 +663,12 @@ impl<'a> FirehoseInspector<'a> {
         // (see `replay_pre_root_journal`), in place of the sender's gas purchase derived below.
         if self.root_journal_reasons.is_some() {
             self.tx_journal_snapshot.clear();
+            // The block's system calls leave these positions behind; this transaction's
+            // journal starts empty.
+            self.journal_processed_up_to = 0;
+            self.storage_processed_up_to = 0;
+            self.trx_logs_count = 0;
+            self.root_journal_processed.clear();
             return;
         }
 
