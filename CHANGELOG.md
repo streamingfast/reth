@@ -7,6 +7,19 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Added
+
+- `RootJournalReasons`, set per transaction with `FirehoseInspectorApi::set_root_journal_reasons`,
+  for transactions whose fees and protocol writes are journal writes made outside their calls
+  (Base's account abstraction transactions, type `0x79`). For such a transaction the inspector
+  records the state written before the root call (balances, nonces, code, storage and logs) inside
+  the root call, gives the balance changes read outside the calls below the root call the
+  configured reasons, and synthesizes no gas purchase, refund or fee reward of its own.
+- The mapper accepts type `0x79` transactions (`firehose-tracer` 5.6.0 `TxType::Aa`). The chain's
+  `PreTxAdjust` fills their `aa_trx_input`.
+
 ## base-v2.5.2.8-fh3.1
 
 ### Added
