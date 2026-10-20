@@ -275,7 +275,7 @@ where
             .authorization_list()
             .map(|auths| auths.iter().map(map_signed_authorization).collect())
             .unwrap_or_default(),
-        aa_trx_input: None,
+        account_abstraction_trx_input: None,
     }
 }
 

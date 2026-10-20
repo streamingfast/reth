@@ -3185,7 +3185,7 @@ mod tests {
             blob_gas_fee_cap: None,
             blob_hashes: Vec::new(),
             set_code_authorizations: Vec::new(),
-            aa_trx_input: None,
+            account_abstraction_trx_input: None,
         }
     }
 
