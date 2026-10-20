@@ -20,6 +20,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The mapper accepts type `0x79` transactions (`firehose-tracer` 5.6.0 `TxType::Aa`). The chain's
   `PreTxAdjust` fills their `aa_trx_input`.
 
+### Changed
+
+- `PreTxAdjust::adjust_tx_event` receives the transaction environment about to execute. The EVM
+  context does not hold it yet when the hook runs, so a chain could not read transaction fields the
+  envelope-derived event does not carry.
+
 ## base-v2.5.2.8-fh3.1
 
 ### Added
