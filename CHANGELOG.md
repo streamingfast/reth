@@ -7,6 +7,25 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## reth-v2.8.0-fh3.1
+
+### Changed
+
+- Update to upstream reth [v2.8.0](https://github.com/paradigmxyz/reth/releases/tag/v2.8.0).
+  revm and alloy-evm are unchanged, so alloy-evm still comes from the `streamingfast/evm` fork tag
+  `v0.39.0-sf`.
+
+- Hoodi activates Amsterdam at timestamp `1793036568` (2026-10-26 17:42:48 UTC). Hoodi nodes must
+  run this release or later before then.
+
+- The new `--engine.prewarm-reuse` flag has no effect while Firehose traces. Reusing a prewarm
+  result commits the transaction without executing it, so Firehose would miss it; the traced path
+  executes every transaction.
+
+- The new `--snap.v2` flag syncs a fresh node by downloading state at a recent block instead of
+  executing the chain. Firehose emits no block below that point, and the first traced block is the
+  one after it. Don't use it on a node that must produce Firehose blocks from genesis.
+
 ## reth-v2.7.0-fh3.1-2
 
 ### Fixed
