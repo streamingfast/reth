@@ -57,24 +57,81 @@ struct StepContext {
 ///   holds them.
 #[derive(Debug, Clone, Default)]
 pub struct RootJournalReasons {
-    /// Reason of a balance decrease, by account.
+    /// Reason of a balance decrease, by account, in the order the transaction makes them.
     pub decreases: Vec<(Address, pb::sf::ethereum::r#type::v2::balance_change::Reason)>,
-    /// Reason of a balance increase, by account. The first entry of an account applies.
+    /// Reason of a balance increase, by account, in the order the transaction makes them.
     pub increases: Vec<(Address, pb::sf::ethereum::r#type::v2::balance_change::Reason)>,
 }
 
 impl RootJournalReasons {
-    fn reason(
-        &self,
+    /// Returns the reason of the next balance change of `address` in the given direction. An
+    /// account listed several times takes its reasons in list order, one per change, and keeps
+    /// its last one for any further change. A change the transaction skips because it moves no
+    /// value has no journal entry, so the next change of that account takes its reason.
+    fn take_reason(
+        &mut self,
         address: Address,
         increase: bool,
     ) -> pb::sf::ethereum::r#type::v2::balance_change::Reason {
-        let reasons = if increase { &self.increases } else { &self.decreases };
-        reasons
+        let reasons = if increase { &mut self.increases } else { &mut self.decreases };
+        let mut matching = reasons
             .iter()
-            .find(|(account, _)| *account == address)
-            .map_or(pb::sf::ethereum::r#type::v2::balance_change::Reason::Transfer, |(_, r)| *r)
+            .enumerate()
+            .filter(|(_, (account, _))| *account == address)
+            .map(|(index, _)| index);
+        let Some(first) = matching.next() else {
+            return pb::sf::ethereum::r#type::v2::balance_change::Reason::Transfer;
+        };
+        let reason = reasons[first].1;
+        if matching.next().is_some() {
+            reasons.remove(first);
+        }
+        reason
     }
+}
+
+/// Returns, for each entry of `entries`, the balances it leaves its accounts with:
+/// `(new, 0)` for a `BalanceChange`, `(new_from, new_to)` for a `BalanceTransfer`, and zeros for
+/// the other entries.
+///
+/// An account's balance after an entry is the balance its next entry in `entries` starts from,
+/// and `final_balance` after its last one. An account changed twice in the same batch must not get
+/// the final balance twice.
+fn balances_after_entries(
+    entries: &[JournalEntry],
+    final_balance: impl Fn(Address) -> U256,
+) -> Vec<(U256, U256)> {
+    let mut after: HashMap<Address, U256> = HashMap::new();
+    let mut balances = vec![(U256::ZERO, U256::ZERO); entries.len()];
+    for (index, entry) in entries.iter().enumerate().rev() {
+        let balance_after = |after: &HashMap<Address, U256>, address: Address| {
+            after.get(&address).copied().unwrap_or_else(|| final_balance(address))
+        };
+        match entry {
+            JournalEntry::BalanceChange { address, old_balance } => {
+                balances[index].0 = balance_after(&after, *address);
+                after.insert(*address, *old_balance);
+            }
+            JournalEntry::BalanceTransfer { from, to, balance } => {
+                let new_from = balance_after(&after, *from);
+                let new_to = balance_after(&after, *to);
+                balances[index] = (new_from, new_to);
+                if from != to {
+                    after.insert(*from, new_from.saturating_add(*balance));
+                    after.insert(*to, new_to.saturating_sub(*balance));
+                }
+            }
+            JournalEntry::AccountDestroyed { address, target, had_balance, .. } => {
+                if target != address {
+                    let new_target = balance_after(&after, *target);
+                    after.insert(*target, new_target.saturating_sub(*had_balance));
+                }
+                after.insert(*address, *had_balance);
+            }
+            _ => {}
+        }
+    }
+    balances
 }
 
 /// FirehoseInspector captures execution traces for the Firehose format
@@ -361,33 +418,31 @@ impl<'a> FirehoseInspector<'a> {
         let reason = pb::sf::ethereum::r#type::v2::balance_change::Reason::Transfer;
         // Entries read outside the calls below the root call carry the transaction's own
         // reasons when it records its fees from the journal.
-        let root_reasons =
-            self.root_journal_reasons.as_ref().filter(|_| context.journal().depth() == 0);
+        let at_root = context.journal().depth() == 0;
+        let balances_after = {
+            let evm_state = context.journal().evm_state();
+            balances_after_entries(&entries, |address| {
+                evm_state.get(&address).map(|a| a.info.balance).unwrap_or(U256::ZERO)
+            })
+        };
 
-        for entry in entries {
+        for (entry, (new_balance, new_to)) in entries.into_iter().zip(balances_after) {
             match entry {
                 JournalEntry::BalanceChange { address, old_balance } => {
-                    let new_balance = context
-                        .journal()
-                        .evm_state()
-                        .get(&address)
-                        .map(|a| a.info.balance)
-                        .unwrap_or(U256::ZERO);
                     if old_balance != new_balance {
-                        let reason = root_reasons.map_or(reason, |reasons| {
-                            reasons.reason(address, new_balance > old_balance)
-                        });
+                        let reason = match self.root_journal_reasons.as_mut().filter(|_| at_root) {
+                            Some(reasons) => {
+                                reasons.take_reason(address, new_balance > old_balance)
+                            }
+                            None => reason,
+                        };
                         self.tracer.on_balance_change(address, old_balance, new_balance, reason);
                     }
                 }
                 JournalEntry::BalanceTransfer { from, to, balance } => {
                     if !balance.is_zero() {
-                        let evm_state = context.journal().evm_state();
-                        let new_from =
-                            evm_state.get(&from).map(|a| a.info.balance).unwrap_or(U256::ZERO);
+                        let new_from = new_balance;
                         let old_from = new_from.saturating_add(balance);
-                        let new_to =
-                            evm_state.get(&to).map(|a| a.info.balance).unwrap_or(U256::ZERO);
                         let old_to = new_to.saturating_sub(balance);
 
                         self.tracer.on_balance_change(from, old_from, new_from, reason);
@@ -2590,7 +2645,7 @@ mod tests {
     fn root_journal_reasons_record_writes_around_the_root_call() {
         use pb::sf::ethereum::r#type::v2::balance_change::Reason;
 
-        let block = decode_fire_block(&drive_root_journal_transaction());
+        let block = decode_fire_block(&drive_root_journal_transaction(false));
         let trx = block.transaction_traces.first().expect("one transaction");
         let root = trx.calls.first().expect("root call");
 
@@ -2619,13 +2674,54 @@ mod tests {
         assert_eq!(root.logs[0].address, PRECOMPILE.to_vec());
     }
 
+    /// A payer that is also the block beneficiary gets its refund and then the tip after the
+    /// calls, read in the same batch: each credit starts where the previous one ended, and takes
+    /// the next reason listed for the payer.
+    #[test]
+    fn root_journal_reasons_split_two_credits_of_the_same_account() {
+        use pb::sf::ethereum::r#type::v2::balance_change::Reason;
+
+        let block = decode_fire_block(&drive_root_journal_transaction(true));
+        let trx = block.transaction_traces.first().expect("one transaction");
+        let root = trx.calls.first().expect("root call");
+
+        let balance_changes: Vec<_> = root
+            .balance_changes
+            .iter()
+            .map(|change| {
+                (
+                    Address::from_slice(&change.address),
+                    change.old_value.as_ref().map_or(U256::ZERO, |v| U256::from_be_slice(&v.bytes)),
+                    change.new_value.as_ref().map_or(U256::ZERO, |v| U256::from_be_slice(&v.bytes)),
+                    change.reason,
+                )
+            })
+            .collect();
+        assert_eq!(
+            balance_changes,
+            vec![
+                (PAYER, U256::from(1_000_000u64), U256::from(900_000u64), Reason::GasBuy as i32),
+                (PAYER, U256::from(900_000u64), U256::from(950_000u64), Reason::GasRefund as i32),
+                (VAULT, U256::ZERO, U256::from(40_000u64), Reason::RewardTransactionFee as i32),
+                (
+                    PAYER,
+                    U256::from(950_000u64),
+                    U256::from(960_000u64),
+                    Reason::RewardTransactionFee as i32
+                ),
+            ],
+            "the refund and the tip each move the payer's balance once"
+        );
+    }
+
     const PAYER: Address = Address::repeat_byte(0xbb);
     const VAULT: Address = Address::repeat_byte(0x19);
 
     /// Drives one transaction that writes a payer debit, a storage slot and a log on the journal
     /// before its root call, and credits the payer and a vault after it, the way Base's account
-    /// abstraction executor does. Returns the raw FIRE output buffer.
-    fn drive_root_journal_transaction() -> Vec<u8> {
+    /// abstraction executor does. With `payer_is_beneficiary`, the payer is also credited the tip
+    /// last. Returns the raw FIRE output buffer.
+    fn drive_root_journal_transaction(payer_is_beneficiary: bool) -> Vec<u8> {
         use pb::sf::ethereum::r#type::v2::balance_change::Reason;
         use reth_revm::{
             bytecode::Bytecode,
@@ -2672,9 +2768,14 @@ mod tests {
                 flash_block: None,
             });
             insp.tracer_mut().on_tx_start(legacy_tx_event(), None);
+            let mut increases =
+                vec![(PAYER, Reason::GasRefund), (VAULT, Reason::RewardTransactionFee)];
+            if payer_is_beneficiary {
+                increases.push((PAYER, Reason::RewardTransactionFee));
+            }
             insp.set_root_journal_reasons(RootJournalReasons {
                 decreases: vec![(PAYER, Reason::GasBuy)],
-                increases: vec![(PAYER, Reason::GasRefund), (VAULT, Reason::RewardTransactionFee)],
+                increases,
             });
 
             // Before the root call: payer debit, storage write and log, all on the journal.
@@ -2750,6 +2851,9 @@ mod tests {
                 .data
                 .set_balance(U256::from(950_000u64));
             ctx.journal_mut().balance_incr(VAULT, U256::from(40_000u64)).expect("credit vault");
+            if payer_is_beneficiary {
+                ctx.journal_mut().balance_incr(PAYER, U256::from(10_000u64)).expect("tip payer");
+            }
 
             let mut outcome = CallOutcome {
                 result: InterpreterResult {
