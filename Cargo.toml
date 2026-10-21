@@ -708,7 +708,7 @@ vergen-git2 = "10.0.1"
 ipnet = "2.11"
 
 ## Firehose Additions
-firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "feature/aa-keystore" }
+firehose-tracer = "5.7.0"
 reth-firehose = { path = "crates/firehose" }
 reth-firehose-tests = { path = "crates/firehose-tests" }
 
