@@ -7,6 +7,19 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## base-v2.5.2.8-fh3.1-2
+
+### Fixed
+
+- Record the right balances when one account's balance changes several times between two points
+  where the inspector reads the journal. Each change read from the journal took the account's
+  final balance as its new value, so an account changed twice in the same read showed the final
+  amount twice. On Base, a type `0x79` transaction whose payer is also the block beneficiary got
+  its refund and its tip in the same read: the tip was counted twice, and both credits were
+  labelled `GasRefund`. Each change now ends where the next change of that account starts, and an
+  account listed several times in `RootJournalReasons` takes its reasons in list order, one per
+  change.
+
 ## base-v2.5.2.8-fh3.1-1
 
 ### Added
