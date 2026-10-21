@@ -39,6 +39,44 @@ struct StepContext {
     keccak_preimage: Option<(B256, Vec<u8>)>,
 }
 
+/// Balance change reasons for a transaction whose fees and protocol writes are journal writes
+/// made outside its calls, rather than revm's handler charging the caller and rewarding the
+/// beneficiary. Base's account abstraction transactions (type `0x79`) work this way: their
+/// executor charges a payer, applies account changes and increments nonces before the root call
+/// starts, and refunds the payer and credits the fee recipients after the last call returns.
+///
+/// Set with [`FirehoseInspector::set_root_journal_reasons`] before the transaction starts. For
+/// that transaction the inspector:
+///
+/// - emits the state written before the root call (balances, nonces, code, storage and logs) inside
+///   the root call, read from the journal, instead of deriving the caller's gas purchase and nonce
+///   increment;
+/// - gives each balance change read from the journal outside the calls below the root call the
+///   reason listed here for its account and direction, and `Transfer` otherwise;
+/// - emits no gas refund or fee reward of its own after the transaction, since the journal already
+///   holds them.
+#[derive(Debug, Clone, Default)]
+pub struct RootJournalReasons {
+    /// Reason of a balance decrease, by account.
+    pub decreases: Vec<(Address, pb::sf::ethereum::r#type::v2::balance_change::Reason)>,
+    /// Reason of a balance increase, by account. The first entry of an account applies.
+    pub increases: Vec<(Address, pb::sf::ethereum::r#type::v2::balance_change::Reason)>,
+}
+
+impl RootJournalReasons {
+    fn reason(
+        &self,
+        address: Address,
+        increase: bool,
+    ) -> pb::sf::ethereum::r#type::v2::balance_change::Reason {
+        let reasons = if increase { &self.increases } else { &self.decreases };
+        reasons
+            .iter()
+            .find(|(account, _)| *account == address)
+            .map_or(pb::sf::ethereum::r#type::v2::balance_change::Reason::Transfer, |(_, r)| *r)
+    }
+}
+
 /// FirehoseInspector captures execution traces for the Firehose format
 /// It hooks into EVM execution via the Inspector trait to build a complete call tree
 pub struct FirehoseInspector<'a> {
@@ -120,6 +158,15 @@ pub struct FirehoseInspector<'a> {
     /// follow the same pattern from its own `PreTxAdjust`.
     root_balance_reason_override: Option<pb::sf::ethereum::r#type::v2::balance_change::Reason>,
 
+    /// Set for a transaction whose fees and protocol writes are journal writes made outside its
+    /// calls, see [`RootJournalReasons`]. Cleared by `process_post_tx_balance_changes`.
+    root_journal_reasons: Option<RootJournalReasons>,
+
+    /// While `root_journal_reasons` is set, the journal entries up to `journal_processed_up_to`,
+    /// used to detect a rollback the inspector did not see (see
+    /// `rewind_to_processed_journal_prefix`).
+    root_journal_processed: Vec<JournalEntry>,
+
     // increments at the end of each transaction, to get proper block index for logs
     log_block_index: u32,
 
@@ -168,6 +215,8 @@ impl<'a> FirehoseInspector<'a> {
             tx_journal_snapshot: Vec::new(),
             tx_post_pre_exec_sender_balance: None,
             root_balance_reason_override: None,
+            root_journal_reasons: None,
+            root_journal_processed: Vec::new(),
             log_block_index: 0,
             trx_logs_count: 0,
             storage_processed_up_to: 0,
@@ -188,6 +237,25 @@ impl<'a> FirehoseInspector<'a> {
         reason: pb::sf::ethereum::r#type::v2::balance_change::Reason,
     ) {
         self.root_balance_reason_override = Some(reason);
+    }
+
+    /// Records the next transaction's state from the journal around its root call, with the
+    /// given balance change reasons. See [`RootJournalReasons`]. Intended for chain-specific
+    /// `PreTxAdjust` impls.
+    pub fn set_root_journal_reasons(&mut self, reasons: RootJournalReasons) {
+        self.root_journal_reasons = Some(reasons);
+    }
+
+    /// Emits the state the transaction wrote before its root call, read from the journal, inside
+    /// the root call that was just entered.
+    fn replay_pre_root_journal<CTX>(&mut self, context: &mut CTX)
+    where
+        CTX: ContextTr,
+        CTX::Journal: JournalExt,
+    {
+        self.process_journal_changes(context);
+        self.gather_precompile_storage_changes(context);
+        self.gather_precompile_logs(context);
     }
 
     /// Capture KECCAK256 preimage from the interpreter state.
@@ -270,6 +338,9 @@ impl<'a> FirehoseInspector<'a> {
         if self.journal_processed_up_to > journal_len {
             self.journal_processed_up_to = journal_len;
         }
+        if self.root_journal_reasons.is_some() {
+            self.rewind_to_processed_journal_prefix(context);
+        }
 
         if self.journal_processed_up_to == journal_len {
             return;
@@ -283,8 +354,15 @@ impl<'a> FirehoseInspector<'a> {
             .cloned()
             .collect();
         self.journal_processed_up_to = journal_len;
+        if self.root_journal_reasons.is_some() {
+            self.root_journal_processed.extend(entries.iter().cloned());
+        }
 
         let reason = pb::sf::ethereum::r#type::v2::balance_change::Reason::Transfer;
+        // Entries read outside the calls below the root call carry the transaction's own
+        // reasons when it records its fees from the journal.
+        let root_reasons =
+            self.root_journal_reasons.as_ref().filter(|_| context.journal().depth() == 0);
 
         for entry in entries {
             match entry {
@@ -296,6 +374,9 @@ impl<'a> FirehoseInspector<'a> {
                         .map(|a| a.info.balance)
                         .unwrap_or(U256::ZERO);
                     if old_balance != new_balance {
+                        let reason = root_reasons.map_or(reason, |reasons| {
+                            reasons.reason(address, new_balance > old_balance)
+                        });
                         self.tracer.on_balance_change(address, old_balance, new_balance, reason);
                     }
                 }
@@ -578,6 +659,19 @@ impl<'a> FirehoseInspector<'a> {
             return;
         }
 
+        // The journal written before the root call is replayed inside it once it is entered
+        // (see `replay_pre_root_journal`), in place of the sender's gas purchase derived below.
+        if self.root_journal_reasons.is_some() {
+            self.tx_journal_snapshot.clear();
+            // The block's system calls leave these positions behind; this transaction's
+            // journal starts empty.
+            self.journal_processed_up_to = 0;
+            self.storage_processed_up_to = 0;
+            self.trx_logs_count = 0;
+            self.root_journal_processed.clear();
+            return;
+        }
+
         self.journal_processed_up_to = context.journal().journal().len();
 
         // Clear the previous tx's journal snapshot at the start of this tx. It is re-seeded
@@ -754,6 +848,34 @@ impl<'a> FirehoseInspector<'a> {
         // Advance past the selfdestruct journal entries so process_journal_changes
         // doesn't re-emit them with wrong reasons.
         self.journal_processed_up_to = context.journal().journal().len();
+        if self.root_journal_reasons.is_some() {
+            let processed = self.root_journal_processed.len();
+            self.root_journal_processed
+                .extend(context.journal().journal()[processed..].iter().cloned());
+        }
+    }
+
+    /// Moves `journal_processed_up_to` back to the end of the longest journal prefix that still
+    /// holds the entries already processed.
+    ///
+    /// revm truncates the journal of a failed call before the inspector's `call_end`, so
+    /// clamping the watermark to the journal length is enough for ordinary transactions. A
+    /// transaction recording its fees from the journal can also roll back a group of calls after
+    /// they returned (Base's account abstraction phases) and then append new entries outside any
+    /// call. The journal can then be longer than the watermark while its tail past the rollback
+    /// point holds entries never processed, which the length alone does not reveal.
+    fn rewind_to_processed_journal_prefix<CTX>(&mut self, context: &mut CTX)
+    where
+        CTX: ContextTr,
+        CTX::Journal: JournalExt,
+    {
+        let journal = context.journal().journal();
+        let mut prefix = self.journal_processed_up_to.min(self.root_journal_processed.len());
+        while prefix > 0 && journal[prefix - 1] != self.root_journal_processed[prefix - 1] {
+            prefix -= 1;
+        }
+        self.journal_processed_up_to = prefix;
+        self.root_journal_processed.truncate(prefix);
     }
 
     /// Process EIP-7702 auth list delegations that occur during pre-execution.
@@ -1085,6 +1207,14 @@ impl<'a> FirehoseInspector<'a> {
     {
         use pb::sf::ethereum::r#type::v2::balance_change::Reason;
 
+        // A transaction that records its fees from the journal already emitted its refund and
+        // fee payouts at its root call exit.
+        if self.root_journal_reasons.take().is_some() {
+            self.tx_post_pre_exec_sender_balance = None;
+            self.finish_tx_post_processing(committed_log_count);
+            return;
+        }
+
         let gas_buy_cost = U256::from(gas_limit) * U256::from(effective_gas_price);
         let remaining_gas = gas_limit.saturating_sub(gas_used);
         let refund_amount = U256::from(remaining_gas) * U256::from(effective_gas_price);
@@ -1145,6 +1275,14 @@ impl<'a> FirehoseInspector<'a> {
                 Reason::RewardTransactionFee,
             );
         }
+
+        self.finish_tx_post_processing(committed_log_count);
+    }
+
+    /// Emits the self-destruct cleanups and resets the per-transaction state, the part of
+    /// `process_post_tx_balance_changes` that every transaction needs.
+    fn finish_tx_post_processing(&mut self, committed_log_count: u32) {
+        self.root_journal_processed.clear();
 
         // Emit nonce reset and code clearing for self-destructed accounts.
         // This matches Geth 1.17.x's Finalise() ordering: nonce/code cleanup happens
@@ -1395,6 +1533,10 @@ where
             inputs.gas_limit,
             inputs.value.get(),
         );
+
+        if depth == 0 && self.root_journal_reasons.is_some() {
+            self.replay_pre_root_journal(context);
+        }
 
         // EIP-7702: override address_delegates_to using the live EVM state.
         // on_call_enter uses the pre-block state reader which misses delegations committed
@@ -1680,6 +1822,10 @@ pub trait FirehoseInspectorApi {
         reason: pb::sf::ethereum::r#type::v2::balance_change::Reason,
     );
 
+    /// Records the next transaction's state from the journal around its root call. See
+    /// [`RootJournalReasons`].
+    fn set_root_journal_reasons(&mut self, reasons: RootJournalReasons);
+
     /// Type-erased version of [`FirehoseInspector::process_post_tx_balance_changes`].
     ///
     /// `get_pre_tx_balance` is passed as a trait object so the call site does not need to be
@@ -1720,6 +1866,10 @@ impl<'a> FirehoseInspectorApi for FirehoseInspector<'a> {
         reason: pb::sf::ethereum::r#type::v2::balance_change::Reason,
     ) {
         Self::set_root_balance_reason(self, reason);
+    }
+
+    fn set_root_journal_reasons(&mut self, reasons: RootJournalReasons) {
+        Self::set_root_journal_reasons(self, reasons);
     }
 
     fn process_post_tx_balance_changes_erased(
@@ -2433,6 +2583,215 @@ mod tests {
         );
     }
 
+    /// A transaction recording its fees from the journal (Base's account abstraction type) gets
+    /// the payer debit, storage write and log made before its root call inside that call, its
+    /// settlement credits with the configured reasons, and no synthesized refund or tip.
+    #[test]
+    fn root_journal_reasons_record_writes_around_the_root_call() {
+        use pb::sf::ethereum::r#type::v2::balance_change::Reason;
+
+        let block = decode_fire_block(&drive_root_journal_transaction());
+        let trx = block.transaction_traces.first().expect("one transaction");
+        let root = trx.calls.first().expect("root call");
+
+        let balance_changes: Vec<_> = root
+            .balance_changes
+            .iter()
+            .map(|change| (Address::from_slice(&change.address), change.reason))
+            .collect();
+        assert_eq!(
+            balance_changes,
+            vec![
+                (PAYER, Reason::GasBuy as i32),
+                (PAYER, Reason::GasRefund as i32),
+                (VAULT, Reason::RewardTransactionFee as i32),
+            ],
+            "payer debit before the root call, settlement after it, nothing synthesized"
+        );
+        assert!(
+            root.balance_changes.iter().all(|change| change.ordinal > root.begin_ordinal),
+            "the pre-root writes are recorded inside the root call"
+        );
+
+        assert_eq!(root.storage_changes.len(), 1, "pre-root storage write");
+        assert_eq!(root.storage_changes[0].address, PRECOMPILE.to_vec());
+        assert_eq!(root.logs.len(), 1, "pre-root log");
+        assert_eq!(root.logs[0].address, PRECOMPILE.to_vec());
+    }
+
+    const PAYER: Address = Address::repeat_byte(0xbb);
+    const VAULT: Address = Address::repeat_byte(0x19);
+
+    /// Drives one transaction that writes a payer debit, a storage slot and a log on the journal
+    /// before its root call, and credits the payer and a vault after it, the way Base's account
+    /// abstraction executor does. Returns the raw FIRE output buffer.
+    fn drive_root_journal_transaction() -> Vec<u8> {
+        use pb::sf::ethereum::r#type::v2::balance_change::Reason;
+        use reth_revm::{
+            bytecode::Bytecode,
+            revm::{
+                context::{journaled_state::account::JournaledAccountTr, Context},
+                database::{CacheDB, EmptyDB},
+                interpreter::{
+                    interpreter_action::CallScheme, CallInput, CallValue, Gas, InstructionResult,
+                    InterpreterResult,
+                },
+                state::AccountInfo,
+                MainContext,
+            },
+        };
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(PRECOMPILE, AccountInfo::default());
+        db.insert_account_info(SENDER, AccountInfo::default());
+        db.insert_account_info(VAULT, AccountInfo::default());
+        db.insert_account_info(
+            PAYER,
+            AccountInfo { balance: U256::from(1_000_000u64), ..Default::default() },
+        );
+        let mut ctx = Context::mainnet().with_db(db);
+
+        let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+            firehose_tracer::config::Config::default(),
+            firehose_tracer::config::ChainConfig {
+                chain_id: 8453,
+                shanghai_time: Some(0),
+                cancun_time: Some(0),
+                prague_time: None,
+                verkle_time: None,
+            },
+            "reth-firehose-test",
+            "0",
+        );
+
+        {
+            let mut insp = FirehoseInspector::new(&mut tracer);
+            insp.tracer_mut().on_block_start(firehose_tracer::types::BlockEvent {
+                block: firehose_tracer::types::BlockData { number: 2, ..Default::default() },
+                finalized: None,
+                flash_block: None,
+            });
+            insp.tracer_mut().on_tx_start(legacy_tx_event(), None);
+            insp.set_root_journal_reasons(RootJournalReasons {
+                decreases: vec![(PAYER, Reason::GasBuy)],
+                increases: vec![(PAYER, Reason::GasRefund), (VAULT, Reason::RewardTransactionFee)],
+            });
+
+            // Before the root call: payer debit, storage write and log, all on the journal.
+            ctx.journal_mut()
+                .load_account_mut(PAYER)
+                .expect("load payer")
+                .data
+                .set_balance(U256::from(900_000u64));
+            ctx.journal_mut().load_account(PRECOMPILE).expect("load account");
+            ctx.journal_mut().sload(PRECOMPILE, U256::from(1u64)).expect("sload");
+            ctx.journal_mut()
+                .sstore(PRECOMPILE, U256::from(1u64), U256::from(2u64))
+                .expect("sstore");
+            ctx.journal_mut().log(AlloyLog {
+                address: PRECOMPILE,
+                data: alloy_primitives::LogData::new_unchecked(
+                    vec![B256::repeat_byte(0x01)],
+                    Bytes::new(),
+                ),
+            });
+
+            let mut inputs = CallInputs {
+                input: CallInput::Bytes(Bytes::new()),
+                return_memory_offset: 0..0,
+                gas_limit: 100_000,
+                reservoir: 0,
+                bytecode_address: SENDER,
+                known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
+                target_address: SENDER,
+                caller: SENDER,
+                value: CallValue::Transfer(U256::ZERO),
+                scheme: CallScheme::Call,
+                is_static: false,
+                charged_new_account_state_gas: false,
+            };
+            let _ = insp.call(&mut ctx, &mut inputs);
+
+            // A child call that writes state, then is rolled back after it returned, the way a
+            // failed account abstraction phase is. The settlement entries below then reuse the
+            // rolled-back journal positions.
+            let checkpoint = ctx.journal_mut().checkpoint();
+            let mut child =
+                CallInputs { target_address: VAULT, bytecode_address: VAULT, ..inputs.clone() };
+            let _ = insp.call(&mut ctx, &mut child);
+            ctx.journal_mut()
+                .load_account_mut(SENDER)
+                .expect("load sender")
+                .data
+                .set_balance(U256::from(7u64));
+            ctx.journal_mut()
+                .load_account_mut(VAULT)
+                .expect("load vault")
+                .data
+                .set_balance(U256::from(8u64));
+            let mut child_outcome = CallOutcome {
+                result: InterpreterResult {
+                    result: InstructionResult::Return,
+                    output: Bytes::new(),
+                    gas: Gas::new(50_000),
+                },
+                memory_offset: 0..0,
+                was_precompile_called: false,
+                precompile_call_logs: Vec::new(),
+                charged_new_account_state_gas: false,
+            };
+            insp.call_end(&mut ctx, &child, &mut child_outcome);
+            ctx.journal_mut().checkpoint_revert(checkpoint);
+
+            // After the calls, still inside the root call: payer refund and vault credit.
+            ctx.journal_mut()
+                .load_account_mut(PAYER)
+                .expect("load payer")
+                .data
+                .set_balance(U256::from(950_000u64));
+            ctx.journal_mut().balance_incr(VAULT, U256::from(40_000u64)).expect("credit vault");
+
+            let mut outcome = CallOutcome {
+                result: InterpreterResult {
+                    result: InstructionResult::Return,
+                    output: Bytes::new(),
+                    gas: Gas::new(100_000),
+                },
+                memory_offset: 0..0,
+                was_precompile_called: false,
+                precompile_call_logs: Vec::new(),
+                charged_new_account_state_gas: false,
+            };
+            insp.call_end(&mut ctx, &inputs, &mut outcome);
+
+            // The generic accounting would refund the sender and tip the coinbase.
+            insp.process_post_tx_balance_changes(
+                SENDER,
+                Address::repeat_byte(0xcb),
+                100_000,
+                21_000,
+                7,
+                1,
+                1,
+                |_| U256::ZERO,
+            );
+
+            let mut receipt = firehose_tracer::types::ReceiptData::new(0, 21_000, 1, 21_000);
+            receipt.add_log(firehose_tracer::types::LogData::new(
+                PRECOMPILE,
+                vec![B256::repeat_byte(0x01)],
+                Bytes::new(),
+                0,
+            ));
+            insp.tracer_mut().on_tx_end(Some(&receipt), None);
+        }
+
+        tracer.on_block_end(None);
+        drop(tracer);
+
+        buffer.get_bytes()
+    }
+
     /// Address of the B-20 activation registry precompile, used here as a stand-in for any
     /// native precompile that writes storage / emits logs directly on the journal.
     const PRECOMPILE: Address =
@@ -2826,6 +3185,7 @@ mod tests {
             blob_gas_fee_cap: None,
             blob_hashes: Vec::new(),
             set_code_authorizations: Vec::new(),
+            account_abstraction_trx_input: None,
         }
     }
 

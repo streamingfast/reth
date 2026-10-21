@@ -113,12 +113,14 @@ where
     E: reth_evm::Evm,
     E::Inspector: FirehoseInspectorApi,
 {
-    /// Mutate `tx_event` in place. `sender` is the recovered signer; `evm` exposes pre-tx state
-    /// for DB reads. Implementations should leave the event untouched for tx types they do not
-    /// care about.
+    /// Mutate `tx_event` in place. `tx_env` is the transaction about to execute, before the EVM
+    /// context holds it; `sender` is the recovered signer; `evm` exposes pre-tx state for DB
+    /// reads. Implementations should leave the event untouched for tx types they do not care
+    /// about.
     fn adjust_tx_event(
         &self,
         evm: &mut E,
+        tx_env: &E::Tx,
         tx_event: &mut firehose_tracer::types::TxEvent,
         sender: Address,
     );
@@ -138,6 +140,7 @@ where
     fn adjust_tx_event(
         &self,
         _evm: &mut E,
+        _tx_env: &E::Tx,
         _tx_event: &mut firehose_tracer::types::TxEvent,
         _sender: Address,
     ) {
@@ -379,7 +382,7 @@ where
         // Chain-specific pre-tx patching of the event (e.g. OP Stack deposit nonce override).
         // Runs after the envelope-derived mapper and before `on_tx_start` so the tracer sees the
         // final, chain-consistent event.
-        self.adjust.adjust_tx_event(self.inner.evm_mut(), &mut tx_event, sender);
+        self.adjust.adjust_tx_event(self.inner.evm_mut(), &tx_env, &mut tx_event, sender);
 
         self.inner.evm_mut().inspector_mut().tracer_mut().on_tx_start(tx_event, None);
 
