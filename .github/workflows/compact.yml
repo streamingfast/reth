@@ -1,6 +1,6 @@
 # Ensures that `Compact` codec changes are backwards compatible.
 #
-# 1) checkout `main`
+# 1) checkout the PR base, or the selected release for maintenance-branch pushes
 # 2) randomly generate and serialize to disk many different type vectors with `Compact` (eg. Header, Transaction, etc)
 # 3) checkout `pr`
 # 4) deserialize previously generated test vectors
@@ -29,27 +29,31 @@ jobs:
           - cargo run --bin reth --features "dev"
     steps:
       - name: Checkout PR
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
       - run: .github/scripts/install_llvm.sh ubuntu
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.0"
       - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
       - name: Checkout base
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.base_ref || 'main' }}
+          # Use v2.5.2's commit: the fork carries its history but does not mirror upstream tags.
+          # The maintenance branch must decode its release's data, not unreleased main formats.
+          ref: ${{ github.base_ref || (github.ref == 'refs/heads/optimism' && '5a6940e351fed80458fe6c9da8581cbe4b8bd036' || 'main') }}
           persist-credentials: false
-      # On `main` branch, generates test vectors and serializes them to disk using `Compact`.
+      # On the comparison base, generate test vectors and serialize them to disk using `Compact`.
       - name: Generate compact vectors
         run: |
           ${{ matrix.bin }} -- test-vectors compact --write
       - name: Checkout PR
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           clean: false
           persist-credentials: false

@@ -84,6 +84,7 @@ exclude_crates=(
   reth-nippy-jar      # zstd-sys (direct dependency)
   reth-node-types     # zstd-sys via reth-codecs -> reth-zstd-compressors
   reth-rpc-server-types # secp256k1-sys via reth-network-api -> enr
+  reth-storage-overlay  # zstd-sys via reth-trie-db
   reth-trie-db        # zstd-sys via reth-codecs -> reth-zstd-compressors
 )
 
@@ -108,7 +109,7 @@ for crate in "${crates[@]}"; do
   fi
 
   outfile="$tmpdir/$crate.log"
-  if cargo +stable build -p "$crate" --target wasm32-wasip1 --no-default-features --color never >"$outfile" 2>&1; then
+  if cargo build -p "$crate" --target wasm32-wasip1 --no-default-features --color never >"$outfile" 2>&1; then
     echo "✅ $crate"
   else
     echo "❌ $crate"
