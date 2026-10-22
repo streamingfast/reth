@@ -7,6 +7,18 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## op-reth-v2.6.1-fh3.1
+
+### Changed
+
+- Merged ethereum-optimism/reth `0fbe4285` (reth v2.5.2 plus two commits), the reth pin of op-reth
+  v2.6.1. The previous pin was op-rs/reth `aef8d3ef`, based on reth v2.4.0.
+- The `alloy-evm` patch moves to `streamingfast/evm` `v0.38.0-sf` (revm 42), so block traces keep
+  their `systemCalls`.
+- Firehose code changes take the previous code hash and code from the `CodeChange` journal entry,
+  which revm 42 now records, instead of assuming empty code. A contract creation starts from empty
+  code, so its code change is reported as before.
+
 ## op-reth-v2.4.2-fh3.1-3
 
 ### Changed
