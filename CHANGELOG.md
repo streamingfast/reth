@@ -7,6 +7,22 @@ This changelog covers Firehose-specific changes only. For upstream changes, see 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## bnb-v0.1.3-fh3.1-2
+
+### Changed
+
+- `reth` no longer installs a Firehose execution extension (ExEx). It only emitted `FIRE INIT`
+  and the genesis block; blocks are traced by the engine. Both are now emitted at startup before
+  the consensus engine exists, so no block can be traced ahead of `FIRE INIT`, and the node
+  stops writing the ExEx write-ahead log (and its `WAL contains too many blocks` warning).
+
+### Removed
+
+- `reth_firehose::run_exex` and `reth_firehose::emit_genesis_block_if_empty`. Call
+  `reth_firehose::init_blockchain(&provider)` from the node builder's `on_component_initialized`
+  hook instead. With `FIREHOSE_DISABLED` set it emits nothing. `reth-firehose` no longer depends
+  on `reth-exex`.
+
 ## bnb-v0.1.3-fh3.1-1
 
 ### Fixed
