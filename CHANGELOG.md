@@ -7,7 +7,7 @@ This changelog covers Firehose-specific changes only. For upstream changes, see 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## Unreleased
+## bnb-v0.1.3-fh3.1-2
 
 ### Changed
 
@@ -86,7 +86,7 @@ unchanged.
   BSC mainnet at block 120653740, where a four-block side branch was published with LIB
   120653741 — one of those blocks naming a height above its own number.
 
-## Unreleased
+## bnb-v0.1.3-fh3.1-2
 
 This fork is consumed as a library by
 [streamingfast/reth-bsc](https://github.com/streamingfast/reth-bsc), which builds the
