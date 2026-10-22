@@ -1,0 +1,209 @@
+version: 2.1
+
+# Runs this fork's validation workflows through pinned act because GitHub Actions is disabled.
+# Pull requests and branch pushes run the PR checks; merge queues add stage.yml. Event metadata is
+# generated once per CircleCI revision and shared by all shards.
+#
+# The read-only GitHub token is exposed to PR code, so its CircleCI context must remain
+# restricted to trusted contributors. Keep CircleCI auto-cancellation enabled.
+#
+# The act binary, checksum, and runner image are pinned. Compiler caches are no-ops because
+# act's local cache is not reusable across these machines; Pages plumbing is skipped after the
+# validation build. Lint and unit jobs are distributed; other workflows run up to four jobs.
+#
+# Excluded: pr-title.yml, label-pr.yml, and the privileged cyclops-audit.yml integration.
+
+jobs:
+  prepare-act-event:
+    machine:
+      image: ubuntu-2404:2025.09.1
+    resource_class: medium
+    steps:
+      - checkout
+      - run:
+          name: Snapshot GitHub event
+          command: |
+            mkdir -p /tmp/act-event
+            if ! .circleci/prepare-act-event.sh; then
+              echo "GitHub event preparation failed; act shards will report the failure" |
+                tee /tmp/act-event/failed
+            fi
+      - persist_to_workspace:
+          root: /tmp/act-event
+          paths:
+            - .
+
+  act:
+    parameters:
+      wf:
+        type: string
+      job:
+        type: string
+        default: ""
+      concurrent_jobs:
+        type: integer
+        default: 4
+    machine:
+      image: ubuntu-2404:2025.09.1
+    resource_class: xlarge
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /tmp/act-event
+      - run:
+          name: Check event snapshot
+          command: |
+            if [ -f /tmp/act-event/failed ]; then
+              cat /tmp/act-event/failed >&2
+              exit 1
+            fi
+      - run:
+          name: Install pinned act
+          command: |
+            set -euo pipefail
+            readonly ACT_VERSION="0.2.89-action-cache-fix.1"
+            readonly ACT_RELEASE="v0.2.89-action-cache-fix.4"
+            readonly ACT_BINARY="act_Linux_x86_64"
+            readonly ACT_SHA256="28bfcf1502f59a834b14f2fb23c39e5b253c2234d875592b5aa0a175f9674dce"
+            curl --fail --silent --show-error --location \
+              "https://github.com/ethereum-optimism/act/releases/download/${ACT_RELEASE}/${ACT_BINARY}" \
+              --output "/tmp/${ACT_BINARY}"
+            echo "${ACT_SHA256}  /tmp/${ACT_BINARY}" | sha256sum --check
+            sudo install -m 0755 "/tmp/${ACT_BINARY}" /usr/local/bin/act
+            test "$(act --version)" = "act version ${ACT_VERSION}"
+      - run:
+          name: Stub unsupported non-check actions
+          command: |
+            mkdir -p /tmp/noop-action
+            printf '%s\n' \
+              'name: noop' \
+              'description: disabled service plumbing under act' \
+              'inputs:' \
+              '  cache-on-failure: {required: false}' \
+              '  cache-targets: {required: false}' \
+              'runs:' \
+              '  using: composite' \
+              '  steps:' \
+              '    - run: echo "Service plumbing disabled under act"' \
+              '      shell: bash' \
+              > /tmp/noop-action/action.yml
+      - run:
+          name: Run << parameters.wf >> via act
+          no_output_timeout: 45m
+          command: |
+            set -euo pipefail
+            event_path=/tmp/act-event/github-event.json
+            event_name="$(jq -er 'if .pull_request then "pull_request" elif .merge_group then "merge_group" elif .ref and .after then "push" else error("unsupported event") end' "$event_path")"
+            base_ref="$(jq -r '(.pull_request.base.ref // .merge_group.base_ref // "") | sub("^refs/heads/"; "")' "$event_path")"
+            target_job="<< parameters.job >>"
+            # Validate documentation without entering Pages deployment on branch pushes.
+            if [ "<< parameters.wf >>" = "book.yml" ]; then
+              target_job=build
+            fi
+            act_job=()
+            if [ -n "$target_job" ]; then
+              case "$target_job" in
+                crate-checks-*)
+                  partition="${target_job#crate-checks-}"
+                  if [[ ! "$partition" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "invalid crate-checks partition: $partition" >&2
+                    exit 1
+                  fi
+                  act_job=(-j crate-checks --matrix "partition:${partition}")
+                  ;;
+                *)
+                  act_job=(-j "$target_job")
+                  ;;
+              esac
+            fi
+
+            act_env=(--env "RUSTC_WRAPPER=" --env "GITHUB_BASE_REF=${base_ref}")
+            if [ "<< parameters.wf >>" = "unit.yml" ] && [ "$target_job" = "state" ]; then
+              # EF tests use Rayon internally, so unrestricted nextest processes multiply
+              # runnable threads and starve valid_blocks past its upstream timeout.
+              act_env+=(--env "NEXTEST_TEST_THREADS=2")
+            fi
+            if [ "$event_name" != "pull_request" ]; then
+              act_env+=(
+                --env "GITHUB_REF=refs/heads/${CIRCLE_BRANCH}"
+                --env "GITHUB_SHA=${CIRCLE_SHA1}"
+              )
+            fi
+
+            act "$event_name" -W ".github/workflows/<< parameters.wf >>" \
+              "${act_job[@]}" \
+              --eventpath "$event_path" \
+              -P "ubuntu-latest=catthehacker/ubuntu@sha256:b839c14c4410998529ec18f951262bdf87a2b23bc1467304d07b491b9455e074" \
+              --concurrent-jobs << parameters.concurrent_jobs >> \
+              "${act_env[@]}" \
+              -s GITHUB_TOKEN="${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
+              --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-action" \
+              --local-repository "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4=/tmp/noop-action" \
+              --local-repository "actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d=/tmp/noop-action" \
+              --local-repository "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9=/tmp/noop-action"
+
+workflows:
+  reth-act:
+    jobs:
+      - prepare-act-event:
+          context:
+            - circleci-repo-readonly-authenticated-github-token
+      - act:
+          context:
+            - circleci-repo-readonly-authenticated-github-token
+          name: "act-<< matrix.wf >>"
+          requires:
+            - prepare-act-event
+          matrix:
+            parameters:
+              wf:
+                - book.yml
+                - compact.yml
+                - e2e.yml
+                - grafana.yml
+                - integration.yml
+                - lint-actions.yml
+                - stage.yml
+      - act:
+          wf: lint.yml
+          concurrent_jobs: 1
+          context:
+            - circleci-repo-readonly-authenticated-github-token
+          name: "act-lint-<< matrix.job >>"
+          requires:
+            - prepare-act-event
+          matrix:
+            parameters:
+              job:
+                - clippy-binaries
+                - clippy
+                - wasm
+                - riscv
+                - crate-checks-1
+                - crate-checks-2
+                - crate-checks-3
+                - msrv
+                - docs
+                - fmt
+                - udeps
+                - book
+                - typos
+                - check-toml
+                - grafana
+                - no-test-deps
+                - feature-propagation
+                - deny
+      - act:
+          wf: unit.yml
+          concurrent_jobs: 1
+          context:
+            - circleci-repo-readonly-authenticated-github-token
+          name: "act-unit-<< matrix.job >>"
+          requires:
+            - prepare-act-event
+          matrix:
+            parameters:
+              job:
+                - test
+                - state
+                - doc
