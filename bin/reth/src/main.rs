@@ -50,9 +50,7 @@ fn main() {
                 EthereumNode::components().executor(FirehoseExecutorBuilder::default()),
             )
             .with_add_ons(EthereumAddOns::default())
-            .install_exex("firehose", |ctx| async move {
-                Ok(async move { reth_firehose::run_exex(ctx).await })
-            })
+            .on_component_initialized(|node| reth_firehose::init_blockchain(&node.provider))
             .launch_with_debug_capabilities()
             .await?;
 
