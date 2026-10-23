@@ -9335,7 +9335,7 @@ dependencies = [
 
 [[package]]
 name = "reth-firehose"
-version = "2.8.0"
+version = "2.8.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eip7928",
@@ -9364,7 +9364,7 @@ dependencies = [
 
 [[package]]
 name = "reth-firehose-tests"
-version = "2.8.0"
+version = "2.8.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
