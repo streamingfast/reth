@@ -7,6 +7,12 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## reth-v2.8.1-fh3.1
+
+## Changed
+
+- Reth v2.8.1 removes the Amsterdam activation from Hoodi, which has been cancelled:
+
 ## reth-v2.8.0-fh3.1
 
 ### Changed
