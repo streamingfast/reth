@@ -70,7 +70,6 @@ aquamarine.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 
 # Firehose
-alloy-evm.workspace = true
 firehose-tracer.workspace = true
 reth-firehose.workspace = true
 reth-ethereum-forks.workspace = true
@@ -136,7 +135,6 @@ asm-keccak = [
     "reth-ethereum-cli/asm-keccak",
     "reth-node-ethereum/asm-keccak",
     "alloy-primitives/asm-keccak",
-    "alloy-evm/asm-keccak",
 ]
 portable = ["reth-node-ethereum/portable"]
 keccak-cache-global = [
