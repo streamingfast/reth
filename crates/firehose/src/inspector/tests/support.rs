@@ -464,6 +464,7 @@ pub(super) fn legacy_tx_event() -> firehose_tracer::types::TxEvent {
         blob_gas_fee_cap: None,
         blob_hashes: Vec::new(),
         set_code_authorizations: Vec::new(),
+        account_abstraction_trx_input: None,
     }
 }
 
