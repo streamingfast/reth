@@ -7,6 +7,19 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Changed
+
+- Amsterdam blocks received through the Engine API are traced on the parallel block access list
+  path instead of falling back to serial execution while Firehose traces. Each worker traces the
+  transactions it executes into a tracer detached from the block's tracer, and the canonical
+  executor attaches the traces to the block in transaction order, rebasing their ordinals and the
+  block-cumulative receipt values. The Firehose block is the one serial tracing produces.
+- Update `firehose-tracer` to the detached transaction tracing API (`Tracer::detached`,
+  `Tracer::on_tx_end_detached`, `Tracer::attach_transaction`), pinned to a git revision until
+  5.8.0 is released.
+
 ## reth-v2.9.0-fh3.1
 
 ### Changed
