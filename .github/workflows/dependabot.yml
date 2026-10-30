@@ -12,6 +12,25 @@ jobs:
       - name: "Checkout Repository"
         uses: actions/checkout@v4
       - name: "Dependency Review"
+        id: review
         uses: actions/dependency-review-action@v4
         with:
-          fail-on-severity: high # Fail on high, critical
+          warn-only: true
+      # The action cannot exclude paths, so the failure is decided here: high and critical
+      # advisories fail the check, except in the upstream helper scripts under `scripts/`.
+      - name: "Fail on high or critical advisories outside scripts/"
+        env:
+          VULNERABLE_CHANGES: ${{ steps.review.outputs.vulnerable-changes }}
+        run: |
+          failing=$(jq -r '
+            .[]
+            | select(.change_type == "added" and (.manifest | startswith("scripts/") | not))
+            | .manifest as $manifest | .name as $name | .version as $version
+            | .vulnerabilities[]
+            | select(.severity == "high" or .severity == "critical")
+            | "\($manifest) » \($name)@\($version): \(.advisory_ghsa_id) (\(.severity))"
+          ' <<< "${VULNERABLE_CHANGES:-[]}")
+          if [ -n "$failing" ]; then
+            echo "$failing"
+            exit 1
+          fi
