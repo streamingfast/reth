@@ -2,8 +2,7 @@
 // FirehoseExecutorBuilder
 // ---------------------------------------------------------------------------
 
-use alloy_evm::eth::spec::EthExecutorSpec;
-use reth_ethereum_forks::EthereumHardforks;
+use reth_ethereum_forks::{EthereumHardforks, Hardforks};
 use reth_ethereum_primitives::EthPrimitives;
 use reth_firehose::{prelude::eyre, FirehoseEvmConfig};
 use reth_node_builder::{
@@ -20,13 +19,7 @@ pub struct FirehoseExecutorBuilder;
 impl<Node> ExecutorBuilder<Node> for FirehoseExecutorBuilder
 where
     Node: FullNodeTypes<
-        Types: NodeTypes<
-            ChainSpec: EthExecutorSpec
-                           + reth_chainspec::EthChainSpec
-                           + EthereumHardforks
-                           + reth_ethereum_forks::Hardforks,
-            Primitives = EthPrimitives,
-        >,
+        Types: NodeTypes<ChainSpec: Hardforks + EthereumHardforks, Primitives = EthPrimitives>,
     >,
 {
     type EVM = FirehoseEvmConfig<EthEvmConfig<<Node::Types as NodeTypes>::ChainSpec>>;
@@ -49,6 +42,10 @@ where
             );
         }
 
-        Ok(FirehoseEvmConfig::new(EthEvmConfig::new(ctx.chain_spec())))
+        let mut evm_config = EthEvmConfig::new(ctx.chain_spec());
+        if let Some(cache) = ctx.sender_recovery_cache() {
+            evm_config = evm_config.with_sender_recovery_cache(cache.clone());
+        }
+        Ok(FirehoseEvmConfig::new(evm_config))
     }
 }

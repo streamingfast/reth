@@ -22,23 +22,24 @@ reth-node-api.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
-reth-revm.workspace = true
 reth-tracing.workspace = true
+reth-trie-common.workspace = true
 
 # alloy
 alloy-consensus.workspace = true
 alloy-eip7928.workspace = true
 alloy-eips.workspace = true
-alloy-evm.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
+
+# evm2
+evm2 = { workspace = true, features = ["std"] }
 
 # std
 eyre.workspace = true
 rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
-revm.workspace = true
 base64 = "0.22"
 prost = "0.14"
