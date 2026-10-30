@@ -104,6 +104,7 @@ alloy-rpc-types-eth.workspace = true
 alloy-provider.workspace = true
 firehose-tracer-test.workspace = true
 secp256k1.workspace = true
+criterion.workspace = true
 tracing-subscriber = { workspace = true, features = ["registry"] }
 
 [features]
@@ -155,3 +156,7 @@ trie-debug = [
 [[test]]
 name = "e2e_testsuite"
 path = "tests/e2e-testsuite/main.rs"
+
+[[bench]]
+name = "firehose_bal_tracing"
+harness = false
