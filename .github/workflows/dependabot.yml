@@ -8,6 +8,9 @@ permissions:
 jobs:
   dependency-review:
     runs-on: ubuntu-latest
+    env:
+      # Optional, owned by each repository: one path prefix per line, `#` starts a comment.
+      EXCLUDE_PATHS_FILE: .github/dependency-review-exclude-paths
     steps:
       - name: "Checkout Repository"
         uses: actions/checkout@v4
@@ -17,15 +20,22 @@ jobs:
         with:
           warn-only: true
       # The action cannot exclude paths, so the failure is decided here: high and critical
-      # advisories fail the check, except in the upstream helper scripts under `scripts/`.
-      - name: "Fail on high or critical advisories outside scripts/"
+      # advisories fail the check unless their manifest is under an excluded path.
+      - name: "Fail on high or critical advisories"
         env:
           VULNERABLE_CHANGES: ${{ steps.review.outputs.vulnerable-changes }}
         run: |
-          failing=$(jq -r '
+          excluded='[]'
+          if [ -f "$EXCLUDE_PATHS_FILE" ]; then
+            excluded=$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$EXCLUDE_PATHS_FILE" \
+              | grep -v '^$' | sed 's|^/||' | jq -R . | jq -s .)
+          fi
+          failing=$(jq -r --argjson excluded "$excluded" '
             .[]
-            | select(.change_type == "added" and (.manifest | startswith("scripts/") | not))
-            | .manifest as $manifest | .name as $name | .version as $version
+            | select(.change_type == "added")
+            | .manifest as $manifest
+            | select(any($excluded[]; . as $prefix | $manifest | startswith($prefix)) | not)
+            | .name as $name | .version as $version
             | .vulnerabilities[]
             | select(.severity == "high" or .severity == "critical")
             | "\($manifest) » \($name)@\($version): \(.advisory_ghsa_id) (\(.severity))"
