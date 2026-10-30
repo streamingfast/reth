@@ -196,7 +196,7 @@ where
     Ok((output, senders, built_bal, received_bal))
 }
 
-fn log_bal_divergence(built_bal: &BlockAccessList, received_bal: &Bal) {
+pub(super) fn log_bal_divergence(built_bal: &BlockAccessList, received_bal: &Bal) {
     if tracing::enabled!(target: "engine::tree::payload_processor::bal", tracing::Level::DEBUG) &&
         built_bal.as_slice() != received_bal.as_slice()
     {
@@ -214,12 +214,12 @@ fn log_bal_divergence(built_bal: &BlockAccessList, received_bal: &Bal) {
 }
 
 /// Closes the abort channel on drop, waking scoped workers before the scope exits.
-struct AbortGuard {
+pub(super) struct AbortGuard {
     _tx: Sender<()>,
 }
 
 impl AbortGuard {
-    fn new() -> (Self, Receiver<()>) {
+    pub(super) fn new() -> (Self, Receiver<()>) {
         let (tx, rx) = crossbeam_channel::bounded(0);
         (Self { _tx: tx }, rx)
     }

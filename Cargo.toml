@@ -675,6 +675,7 @@ ipnet = "2.11"
 
 ## Firehose Additions
 firehose-tracer = "5.7.0"
+firehose-tracer-test = "5.7.0"
 reth-firehose = { path = "crates/firehose" }
 reth-firehose-tests = { path = "crates/firehose-tests" }
 
@@ -688,6 +689,10 @@ reth-firehose-tests = { path = "crates/firehose-tests" }
 [patch.crates-io]
 # LLVM 23 support is not released yet.
 inkwell = { git = "https://github.com/TheDan64/inkwell", rev = "c9d9734ae17dbaf1d9902dab3b8ee9d2041781ff" }
+
+# Detached transaction tracing, until firehose-tracer 5.8.0 is released.
+firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs", rev = "108ca40fec28ef7a24e8248d52347976620ef27b" }
+firehose-tracer-test = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs", rev = "108ca40fec28ef7a24e8248d52347976620ef27b" }
 
 # reth-core
 reth-codecs = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }

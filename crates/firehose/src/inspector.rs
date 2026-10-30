@@ -206,7 +206,8 @@ struct InspectorState<G> {
     /// [`FirehoseInspector::set_root_balance_reason`].
     root_balance_reason_override: Option<Reason>,
 
-    /// Logs emitted by earlier transactions of the block, to derive each log's block index.
+    /// Block-wide index of the first log of the current transaction, to derive each log's block
+    /// index. Set by [`FirehoseInspector::start_transaction`].
     log_block_index: u32,
 
     /// Whether the current transaction opened its root frame. Cleared by
@@ -254,12 +255,22 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> FirehoseInspector<G> {
         self.state.borrow_mut().root_balance_reason_override = Some(reason);
     }
 
-    /// Resets the per-transaction state that must not carry over from whatever ran before in the
-    /// block, a system call included. Call right before a transaction executes.
-    pub fn start_transaction(&self) {
+    /// Resets the per-transaction state that must not carry over from whatever ran before, a
+    /// system call or a transaction that failed included, and sets the block-wide index of the
+    /// transaction's first log. Call right before a transaction executes.
+    pub fn start_transaction(&self, log_index_start: u32) {
         let mut state = self.state.borrow_mut();
-        state.root_frame_entered = false;
+        state.last_step = None;
+        state.journal_processed_up_to = 0;
+        state.window = Window::Transfer;
+        state.pending_self_transfer = None;
+        state.pending_value_transfer = None;
+        state.selfdestruct_candidates.clear();
+        state.pending_selfdestruct_cleanups.clear();
         state.post_exec_balances.clear();
+        state.deferred_creator_nonce = None;
+        state.log_block_index = log_index_start;
+        state.root_frame_entered = false;
     }
 
     /// Whether the current transaction opened its root frame, see
@@ -347,7 +358,6 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> FirehoseInspector<G> {
     /// account the transaction did not touch.
     ///
     /// Must be called after the transaction executed and before it is committed.
-    #[expect(clippy::too_many_arguments)]
     pub fn process_post_tx_gas_accounting(
         &self,
         sender: Address,
@@ -355,7 +365,6 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> FirehoseInspector<G> {
         gas_limit: u64,
         gas_used: u64,
         accounting: PostTxGasAccounting,
-        committed_log_count: u32,
         mut pre_tx_balance: impl FnMut(Address) -> U256,
     ) {
         let mut state = self.state.borrow_mut();
@@ -415,8 +424,6 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> FirehoseInspector<G> {
 
         state.selfdestruct_candidates.clear();
         state.journal_processed_up_to = 0;
-        // Only logs that survived reverts count towards the next transaction's log indexes.
-        state.log_block_index += committed_log_count;
     }
 }
 
