@@ -691,8 +691,8 @@ reth-firehose-tests = { path = "crates/firehose-tests" }
 inkwell = { git = "https://github.com/TheDan64/inkwell", rev = "c9d9734ae17dbaf1d9902dab3b8ee9d2041781ff" }
 
 # Detached transaction tracing, until firehose-tracer 5.8.0 is released.
-firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs", rev = "6a421cdba1d01196a120dfd38d4430e50536b601" }
-firehose-tracer-test = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs", rev = "6a421cdba1d01196a120dfd38d4430e50536b601" }
+firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs", rev = "d35edd15f789c21af71b1e1d5e6c537f8335598e" }
+firehose-tracer-test = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs", rev = "d35edd15f789c21af71b1e1d5e6c537f8335598e" }
 
 # reth-core
 reth-codecs = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
