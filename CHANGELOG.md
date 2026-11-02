@@ -19,6 +19,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Update `firehose-tracer` to the detached transaction tracing API (`Tracer::detached`,
   `Tracer::on_tx_end_detached`, `Tracer::attach_transaction`), pinned to a git revision until
   5.8.0 is released.
+- The inspector no longer hashes every KECCAK256 preimage a second time: it records the memory
+  range before the opcode runs and reads the preimage and the hash the EVM pushed once it has
+  run. It also tells the tracer that a call executed code once per call instead of once per
+  opcode, and checks the journal for new entries inline. With the `firehose-tracer` filter
+  changes, tracing a block of 200 calls hashing 1000 words each costs 1.6x untraced execution
+  instead of 3.2x (`firehose_bal_tracing` benchmark). The output is unchanged.
 
 ## reth-v2.9.0-fh3.1
 

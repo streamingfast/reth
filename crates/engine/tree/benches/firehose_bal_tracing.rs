@@ -199,6 +199,23 @@ fn serial_untraced(
     (output.result.gas_used, bal)
 }
 
+/// The untraced serial path with a no-op inspector installed: the cost of evm2's inspected
+/// dispatch loop alone, which no tracer hook can remove.
+fn serial_noop_inspector(
+    evm_config: &EthEvmConfig,
+    db: CacheDB<EmptyDB>,
+    block: &RecoveredBlock<Block>,
+) -> u64 {
+    let mut executor = evm_config.executor_for_block(db, block.sealed_block()).expect("executor");
+    executor.evm_mut().set_inspector(evm2::NoopInspector::default());
+    executor.enable_block_access_list_builder();
+    executor.apply_pre_execution_changes().expect("pre-execution");
+    for tx in block.transactions_recovered() {
+        executor.execute_transaction(tx.cloned()).expect("transaction");
+    }
+    executor.finish_with_block_access_list().expect("post-execution").0.result.gas_used
+}
+
 fn serial_traced(fixture: &Fixture, mut db: CacheDB<EmptyDB>) -> u64 {
     let mut tracer = block_tracer(fixture.block.sealed_block());
     let (output, _) = run_wrapped_block(
@@ -282,6 +299,13 @@ fn bench(c: &mut Criterion) {
         b.iter_batched(
             || fixture.db.clone(),
             |db| serial_untraced(&fixture.evm_config, db, &fixture.block),
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("serial/noop-inspector", |b| {
+        b.iter_batched(
+            || fixture.db.clone(),
+            |db| serial_noop_inspector(&fixture.evm_config, db, &fixture.block),
             BatchSize::SmallInput,
         )
     });
