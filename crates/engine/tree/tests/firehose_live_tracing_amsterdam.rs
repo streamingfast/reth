@@ -21,11 +21,21 @@
 //! a log, so the traces have ordinals, log indexes and cumulative gas to rebase. They are checked
 //! against the receipts the node serves over RPC and against the block invariants.
 //!
+//! The spans the payload validator opens are recorded, so the test fails if a block is executed
+//! on another path than the traced BAL path. A second node started with
+//! `--engine.disable-bal-parallel-execution`, the switch that sends Amsterdam blocks back to the
+//! serial traced path, produces the same blocks and must trace them all without that path.
+//!
 //! Like `firehose_live_tracing`, it lives in its own integration-test binary because it installs
 //! a process-wide tracer.
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
 use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::{Bytes, TxKind};
+use alloy_primitives::{Bytes, TxKind, B256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use eyre::Result;
@@ -35,10 +45,18 @@ use reth_chainspec::{EthChainSpec, EthereumHardfork};
 use reth_e2e_test_utils::{
     transaction::TransactionTestContext,
     wallet::{test_signer, Wallet},
-    E2ETestSetupExt,
+    E2ETestSetupExt, NodeHelperType,
 };
 use reth_node_ethereum::EthereumNode;
 use reth_provider::BalProvider;
+use tracing::{
+    span::{Attributes, Id},
+    Subscriber,
+};
+use tracing_subscriber::{
+    layer::{Context, SubscriberExt},
+    EnvFilter, Layer,
+};
 
 /// Number of blocks to produce, all of them validated through the traced BAL path.
 const PRODUCED_BLOCKS: u64 = 4;
@@ -75,9 +93,18 @@ const COUNTER_INIT_CODE: &[u8] = &[
     0x01, 0x01, 0x60, 0x00, 0x55, 0x60, 0xaa, 0x60, 0x00, 0x60, 0x00, 0xa1, 0x00,
 ];
 
+/// Tracing target of the payload validator's spans.
+const VALIDATOR_TARGET: &str = "engine::tree::payload_validator";
+
+/// Span of the validator function that executes a block on the traced BAL path.
+const TRACED_BAL_PATH: &str = "execute_and_trace_block_bal";
+
+/// Span of the validator function that executes a block on the untraced BAL path.
+const UNTRACED_BAL_PATH: &str = "execute_block_bal";
+
 #[tokio::test]
 async fn live_payload_validation_traces_amsterdam_blocks() -> Result<()> {
-    reth_tracing::init_test_tracing();
+    let spans = SpanRecorder::install();
 
     let (mut node, wallet) =
         EthereumNode::test_setup_for(EthereumHardfork::Amsterdam).build_single().await?;
@@ -90,6 +117,41 @@ async fn live_payload_validation_traces_amsterdam_blocks() -> Result<()> {
         Some(0), // prague
     );
 
+    let hashes = produce_blocks(&mut node, &wallet).await?;
+    let output = buffer.get_bytes();
+    assert_traced_blocks(&node, &output, &hashes).await?;
+    assert_eq!(
+        spans.take(TRACED_BAL_PATH),
+        PRODUCED_BLOCKS as usize,
+        "every live Amsterdam block is executed on the traced BAL path"
+    );
+    assert_eq!(spans.take(UNTRACED_BAL_PATH), 0, "no live block skips the tracer");
+    drop(node);
+
+    // The escape hatch: `--engine.disable-bal-parallel-execution` sends Amsterdam blocks back to
+    // the serial traced path, which must still trace them all.
+    let (mut node, wallet) = EthereumNode::test_setup_for(EthereumHardfork::Amsterdam)
+        .with_tree_config_modifier(|config| config.without_bal_parallel_execution(true))
+        .build_single()
+        .await?;
+    let hashes = produce_blocks(&mut node, &wallet).await?;
+    let serial_output = &buffer.get_bytes()[output.len()..];
+    assert_traced_blocks(&node, serial_output, &hashes).await?;
+    assert_eq!(
+        spans.take(TRACED_BAL_PATH),
+        0,
+        "with parallel BAL execution disabled, no block is executed on the traced BAL path"
+    );
+    assert_eq!(spans.take(UNTRACED_BAL_PATH), 0, "no live block skips the tracer");
+
+    Ok(())
+}
+
+/// Produces the blocks described in the module documentation and returns their hashes.
+async fn produce_blocks(
+    node: &mut NodeHelperType<EthereumNode>,
+    wallet: &Wallet,
+) -> Result<Vec<B256>> {
     let chain_id = node.inner.chain_spec().chain().id();
     let mut deployer = wallet.account(DEPLOYER);
     let counter = deployer.next_contract_address();
@@ -139,9 +201,16 @@ async fn live_payload_validation_traces_amsterdam_blocks() -> Result<()> {
         let payload = node.advance_block().await?;
         hashes.push(payload.block().hash());
     }
+    Ok(hashes)
+}
 
-    let raw = buffer.get_bytes();
-    let text = String::from_utf8(raw).expect("captured tracer output is UTF-8");
+/// Checks the `FIRE BLOCK` lines in `output` against the blocks `node` produced.
+async fn assert_traced_blocks(
+    node: &NodeHelperType<EthereumNode>,
+    output: &[u8],
+    hashes: &[B256],
+) -> Result<()> {
+    let text = std::str::from_utf8(output).expect("captured tracer output is UTF-8");
     let traced: Vec<u64> = text
         .lines()
         .filter_map(|line| {
@@ -159,11 +228,11 @@ async fn live_payload_validation_traces_amsterdam_blocks() -> Result<()> {
             "expected a FIRE BLOCK line for live Amsterdam block #{number}, got traced blocks \
              {traced:?}"
         );
-        let block = reth_firehose_tests::parse_fire_block_for(&buffer.get_bytes(), number)?;
+        let block = reth_firehose_tests::parse_fire_block_for(output, number)?;
         BlockInvariants::assert(&block)?;
     }
 
-    let block = reth_firehose_tests::parse_fire_block_for(&buffer.get_bytes(), FRAMELESS_BLOCK)?;
+    let block = reth_firehose_tests::parse_fire_block_for(output, FRAMELESS_BLOCK)?;
     let trx = block.transaction_traces.first().expect("the starved creation is included");
     assert_eq!(trx.status, TransactionTraceStatus::Failed as i32);
     assert_eq!(trx.gas_used, FRAMELESS_GAS_LIMIT, "an out-of-gas halt charges the whole gas limit");
@@ -172,12 +241,12 @@ async fn live_payload_validation_traces_amsterdam_blocks() -> Result<()> {
     assert_eq!(root.call_type, CallType::Create as i32);
     assert!(root.status_failed);
 
-    let block = reth_firehose_tests::parse_fire_block_for(&buffer.get_bytes(), BATCH_BLOCK)?;
+    let block = reth_firehose_tests::parse_fire_block_for(output, BATCH_BLOCK)?;
     let nonces = block.transaction_traces.iter().map(|trx| trx.nonce).collect::<Vec<_>>();
     assert_eq!(nonces, (0..BATCH_TX_COUNT).collect::<Vec<_>>());
 
     // The traced receipts of the calls carry the block-wide values the node serves over RPC.
-    let block = reth_firehose_tests::parse_fire_block_for(&buffer.get_bytes(), LOGS_BLOCK)?;
+    let block = reth_firehose_tests::parse_fire_block_for(output, LOGS_BLOCK)?;
     let receipts = node
         .rpc_provider()
         .get_block_receipts(BlockNumberOrTag::Number(LOGS_BLOCK).into())
@@ -207,9 +276,45 @@ async fn live_payload_validation_traces_amsterdam_blocks() -> Result<()> {
 
     // The BAL built by the traced execution is what the node stores for the block.
     for hash in hashes {
-        let bal = node.inner.provider.get_bal_by_hash(hash)?;
+        let bal = node.inner.provider.get_bal_by_hash(*hash)?;
         assert!(bal.is_some(), "no BAL stored for live Amsterdam block {hash}");
     }
 
     Ok(())
+}
+
+/// Counts the spans the payload validator opens, by function name.
+#[derive(Clone, Default)]
+struct SpanRecorder(Arc<Mutex<HashMap<&'static str, usize>>>);
+
+impl SpanRecorder {
+    /// Installs the recorder as the process-wide subscriber, next to the usual test log output
+    /// filtered by `RUST_LOG`.
+    fn install() -> Self {
+        let recorder = Self::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_filter(EnvFilter::from_default_env()),
+            )
+            .with(recorder.clone());
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("the test installs the only subscriber");
+        recorder
+    }
+
+    /// Returns how many times the validator opened `name` since the last call and forgets them.
+    fn take(&self, name: &'static str) -> usize {
+        self.0.lock().expect("recorder lock").remove(name).unwrap_or(0)
+    }
+}
+
+impl<S: Subscriber> Layer<S> for SpanRecorder {
+    fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+        let metadata = attrs.metadata();
+        if metadata.target() == VALIDATOR_TARGET {
+            *self.0.lock().expect("recorder lock").entry(metadata.name()).or_default() += 1;
+        }
+    }
 }

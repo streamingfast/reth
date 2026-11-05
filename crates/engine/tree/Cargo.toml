@@ -105,7 +105,7 @@ alloy-provider.workspace = true
 firehose-tracer-test.workspace = true
 secp256k1.workspace = true
 criterion.workspace = true
-tracing-subscriber = { workspace = true, features = ["registry"] }
+tracing-subscriber = { workspace = true, features = ["registry", "fmt", "env-filter"] }
 
 [features]
 asm-keccak = [

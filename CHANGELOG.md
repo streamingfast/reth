@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   transactions it executes into a tracer detached from the block's tracer, and the canonical
   executor attaches the traces to the block in transaction order, rebasing their ordinals and the
   block-cumulative receipt values. The Firehose block is the one serial tracing produces.
+  `--engine.disable-bal-parallel-execution` sends Amsterdam blocks back to the serial traced path.
 - Update `firehose-tracer` to the detached transaction tracing API (`Tracer::detached`,
   `Tracer::on_tx_end_detached`, `Tracer::attach_transaction`), pinned to a git revision until
   5.8.0 is released.
