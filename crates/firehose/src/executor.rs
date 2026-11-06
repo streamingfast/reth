@@ -520,11 +520,15 @@ where
     fn execute_transaction_with_commit_condition(
         &mut self,
         transaction: impl ExecutorTx<Self>,
-        f: impl FnOnce(&evm2::TxResult<<Self::Evm as reth_evm::Evm>::EvmTypes>) -> CommitChanges,
+        f: impl FnOnce(
+            &evm2::TxResult<<Self::Evm as reth_evm::Evm>::EvmTypes>,
+            evm2::TxStateChanges<'_>,
+        ) -> CommitChanges,
     ) -> Result<Option<GasOutput>, BlockExecutionError> {
         let executed = self.execute_and_trace_transaction(transaction)?;
 
-        if !f(&executed.result.result().result).should_commit() {
+        let result = executed.result.result();
+        if !f(&result.result, result.pending_state.changes()).should_commit() {
             // Preserve the invariant that every on_tx_start is paired with on_tx_end.
             let err = std::io::Error::other("transaction not committed");
             self.inspector.tracer_mut().on_tx_end(None, Some(&err));
