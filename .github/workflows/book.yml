@@ -1,4 +1,4 @@
-# Documentation and mdbook related jobs.
+# Documentation jobs.
 
 name: book
 
@@ -18,6 +18,9 @@ jobs:
     permissions:
       contents: read
     timeout-minutes: 90
+    env:
+      # Read by build-cargo-docs.sh, which `bun run build` also invokes.
+      RUST_NIGHTLY: nightly-2026-07-14
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,7 +44,7 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2026-07-14
+          toolchain: ${{ env.RUST_NIGHTLY }}
 
       - name: Build docs
         run: cd docs/vocs && bash scripts/build-cargo-docs.sh
@@ -88,4 +91,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -6,6 +6,12 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 filter = "test(general_state_tests)"
 slow-timeout = { period = "1m", terminate-after = 10 }
 
+# valid_blocks covers a full fixture directory, like the grouped state tests.
+# Keep its CircleCI runtime bounded by the same ten-minute budget.
+[[profile.default.overrides]]
+filter = "package(=ef-tests) and test(=valid_blocks)"
+slow-timeout = { period = "1m", terminate-after = 10 }
+
 [[profile.default.overrides]]
 filter = "test(eest_fixtures)"
 slow-timeout = { period = "2m", terminate-after = 10 }
