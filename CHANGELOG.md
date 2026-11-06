@@ -7,6 +7,13 @@ This changelog covers Firehose-specific changes only. For upstream changes, see 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## bnb-v0.1.4-fh3.1
+
+Merged bnb-chain/reth `v0.1.4` (`3b2bd020`), the reth release that bnb-chain/reth-bsc
+`v0.1.4-hotfix` depends on. It fixes the legacy state-root calculation, which could compute a
+wrong root when a new leaf sorts before a deeper stored branch node and make the node reject a
+valid block. It touches no Firehose file, so the instrumentation is carried across unchanged.
+
 ## bnb-v0.1.3-fh3.1-2
 
 ### Changed
