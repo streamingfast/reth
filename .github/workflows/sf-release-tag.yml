@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SFRELEASER_VERSION: "v0.17.1-rc.7"
+  SFRELEASER_VERSION: "v0.17.1-rc.8"
 
 jobs:
   tag:
