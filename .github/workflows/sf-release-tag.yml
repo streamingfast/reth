@@ -10,7 +10,8 @@ on:
       - "CHANGELOG.md"
 
 permissions:
-  contents: read
+  actions: write
+  contents: write
 
 concurrency:
   group: sf-release-tag-${{ github.event.pull_request.number }}
@@ -27,13 +28,11 @@ jobs:
       run:
         shell: bash
     steps:
-      # Pushed with dfuse-bot's token, the tag triggers the branch's workflows like a manual tag does.
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
-          token: ${{ secrets.DFUSE_BOT_TOKEN }}
 
       - name: Install sfreleaser
         run: |
@@ -50,3 +49,11 @@ jobs:
           VERSION: ${{ steps.detect.outputs.version }}
           COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
         run: git push origin "$COMMIT:refs/tags/$VERSION"
+
+      # A tag pushed with GITHUB_TOKEN triggers no workflow, so the release branch (the default one) starts sf-release.yml on it.
+      - name: Start sf-release.yml on the tag
+        if: steps.detect.outputs.is_release_pr && github.base_ref == github.event.repository.default_branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.detect.outputs.version }}
+        run: gh workflow run sf-release.yml --repo "$GITHUB_REPOSITORY" --ref "$VERSION"
