@@ -14,6 +14,37 @@ version: 2.1
 # Excluded: pr-title.yml, label-pr.yml, and the privileged cyclops-audit.yml integration.
 
 jobs:
+  # Replaces lint.yml's `deny` job, which calls tempoxyz/ci's reusable deny.yml. That workflow starts
+  # with tempoxyz's secure-runner, which needs a GitHub OIDC token that act never receives, so the
+  # check itself runs natively here. Its policy comes from deny.toml in this repo.
+  #
+  # When re-applying this CI patch onto a new reth release, diff lint.yml's `deny:` job and the
+  # tempoxyz/ci deny.yml it calls against this job (toolchain, cargo-deny version, `check`
+  # arguments, deny flags), and update both pins here.
+  cargo-deny:
+    docker:
+      - image: rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+    resource_class: medium
+    steps:
+      - checkout
+      - run:
+          name: Install pinned cargo-deny
+          command: |
+            set -euo pipefail
+            readonly DENY_VERSION="0.20.2"
+            readonly DENY_SHA256="9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+            readonly DENY_ARCHIVE="cargo-deny-${DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+            curl --fail --silent --show-error --location \
+              "https://github.com/EmbarkStudios/cargo-deny/releases/download/${DENY_VERSION}/${DENY_ARCHIVE}" \
+              --output "/tmp/${DENY_ARCHIVE}"
+            echo "${DENY_SHA256}  /tmp/${DENY_ARCHIVE}" | sha256sum --check
+            tar -xzf "/tmp/${DENY_ARCHIVE}" -C /usr/local/bin --strip-components=1 \
+              "cargo-deny-${DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny"
+            test "$(cargo-deny --version)" = "cargo-deny ${DENY_VERSION}"
+      - run:
+          name: cargo deny check
+          command: cargo deny --log-level warn --all-features check all
+
   prepare-act-event:
     machine:
       image: ubuntu-2404:2025.09.1
@@ -79,8 +110,10 @@ jobs:
               'name: noop' \
               'description: disabled service plumbing under act' \
               'inputs:' \
+              '  cache-bin: {required: false}' \
               '  cache-on-failure: {required: false}' \
               '  cache-targets: {required: false}' \
+              '  prefix-key: {required: false}' \
               'runs:' \
               '  using: composite' \
               '  steps:' \
@@ -137,8 +170,8 @@ jobs:
               --concurrent-jobs << parameters.concurrent_jobs >> \
               "${act_env[@]}" \
               -s GITHUB_TOKEN="${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
-              --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-action" \
-              --local-repository "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4=/tmp/noop-action" \
+              --local-repository "mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba=/tmp/noop-action" \
+              --local-repository "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6=/tmp/noop-action" \
               --local-repository "actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d=/tmp/noop-action" \
               --local-repository "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9=/tmp/noop-action"
 
@@ -192,7 +225,8 @@ workflows:
                 - grafana
                 - no-test-deps
                 - feature-propagation
-                - deny
+      - cargo-deny:
+          name: lint-deny
       - act:
           wf: unit.yml
           concurrent_jobs: 1
