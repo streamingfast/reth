@@ -7,6 +7,14 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## reth-v2.10.0-fh3.1
+
+### Changed
+
+- Update to upstream reth [v2.10.0](https://github.com/paradigmxyz/reth/releases/tag/v2.10.0).
+  evm2 comes from the `streamingfast/evm2` fork tag `reth-v2.10.0-sf`. No hardfork is scheduled
+  or changed, and the Firehose block output does not change.
+
 ## reth-v2.9.0-fh3.1-1
 
 ### Changed
