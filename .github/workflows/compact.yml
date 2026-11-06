@@ -1,6 +1,6 @@
 # Ensures that `Compact` codec changes are backwards compatible.
 #
-# 1) checkout the PR base, or the selected release for maintenance-branch pushes
+# 1) checkout the PR base, or the upstream base of an `op-*` branch for pushes to it
 # 2) randomly generate and serialize to disk many different type vectors with `Compact` (eg. Header, Transaction, etc)
 # 3) checkout `pr`
 # 4) deserialize previously generated test vectors
@@ -32,21 +32,41 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+      - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # v1
       - run: .github/scripts/install_llvm.sh ubuntu
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.97.0"
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
+      # An `op-v<version>` branch builds on upstream tag `v<version>`. Pushes to it must decode
+      # that release's data, not unreleased main formats.
+      - name: Select base
+        id: base
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$BASE_REF" ]; then
+            base="$BASE_REF"
+          else
+            case "$REF" in
+              refs/heads/op-v*) base="${REF#refs/heads/op-}" ;;
+              refs/heads/op-*)
+                echo "no compact base for ${REF}: only op-v<version> branches map to an upstream tag" >&2
+                exit 1
+                ;;
+              *) base=main ;;
+            esac
+          fi
+          echo "ref=$base" >> "$GITHUB_OUTPUT"
       - name: Checkout base
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Use v2.5.2's commit: the fork carries its history but does not mirror upstream tags.
-          # The maintenance branch must decode its release's data, not unreleased main formats.
-          ref: ${{ github.base_ref || (github.ref == 'refs/heads/optimism' && '5a6940e351fed80458fe6c9da8581cbe4b8bd036' || 'main') }}
+          ref: ${{ steps.base.outputs.ref }}
           persist-credentials: false
       # On the comparison base, generate test vectors and serialize them to disk using `Compact`.
       - name: Generate compact vectors
@@ -59,4 +79,8 @@ jobs:
           persist-credentials: false
       # On incoming merge try to read and decode previously generated vectors with `Compact`
       - name: Read vectors
+        env:
+          # act restores the head with source mtimes older than the base build's artifacts.
+          # Keep the builds separate so Cargo cannot reuse libraries from the comparison base.
+          CARGO_TARGET_DIR: target/compact-head
         run: ${{ matrix.bin }} -- test-vectors compact --read
