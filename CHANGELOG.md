@@ -7,6 +7,15 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## base-v2.5.2.11-fh3.1
+
+### Changed
+
+- Rebase on Base's reth fork at `base-v2.5.2.11`, the reth version pinned by Base `v1.5.4`. It
+  backports the `eth_getLogs` range scan fixes (blocking IO permits, window by window scans), a
+  trie iterator seek fix, and RocksDB indices for the full snapshot download preset. Firehose code
+  and the block model are unchanged.
+
 ## base-v2.5.2.8-fh3.1-2
 
 ### Fixed
