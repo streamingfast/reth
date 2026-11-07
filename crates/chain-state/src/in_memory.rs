@@ -876,12 +876,42 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
         self.trie_data().sorted.hashed_state
     }
 
+    /// Returns a reference to the hashed state result of the execution outcome.
+    ///
+    /// May wait for trie data if the deferred task hasn't completed.
+    #[inline]
+    pub fn hashed_state_ref(&self) -> &HashedPostStateSorted {
+        &self.trie_data.get().sorted.hashed_state
+    }
+
+    /// Returns references to the hashed state results of the executed blocks.
+    ///
+    /// May wait for trie data if any deferred task hasn't completed.
+    pub fn hashed_state_refs(blocks: &[Self]) -> Vec<&HashedPostStateSorted> {
+        blocks.iter().map(Self::hashed_state_ref).collect()
+    }
+
     /// Returns the trie updates resulting from the execution outcome.
     ///
     /// May wait for trie data if the deferred task hasn't completed.
     #[inline]
     pub fn trie_updates(&self) -> Arc<TrieUpdatesSorted> {
         self.trie_data().sorted.trie_updates
+    }
+
+    /// Returns a reference to the trie updates resulting from the execution outcome.
+    ///
+    /// May wait for trie data if the deferred task hasn't completed.
+    #[inline]
+    pub fn trie_updates_ref(&self) -> &TrieUpdatesSorted {
+        &self.trie_data.get().sorted.trie_updates
+    }
+
+    /// Returns references to the trie updates of the executed blocks.
+    ///
+    /// May wait for trie data if any deferred task hasn't completed.
+    pub fn trie_updates_refs(blocks: &[Self]) -> Vec<&TrieUpdatesSorted> {
+        blocks.iter().map(Self::trie_updates_ref).collect()
     }
 
     /// Returns a [`BlockNumber`] of the block.
@@ -971,11 +1001,21 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
     /// Returns the new tip for [`Self::Reorg`] and [`Self::Commit`] variants which commit at least
     /// 1 new block.
     pub fn tip(&self) -> &RecoveredBlock<N::Block> {
+        self.new_blocks().last().expect("non empty blocks").recovered_block()
+    }
+
+    /// Returns the blocks added to the canonical chain by this update.
+    pub fn new_blocks(&self) -> &[ExecutedBlock<N>] {
         match self {
-            Self::Commit { new } | Self::Reorg { new, .. } => {
-                new.last().expect("non empty blocks").recovered_block()
-            }
+            Self::Commit { new } | Self::Reorg { new, .. } => new,
         }
+    }
+
+    /// Returns whether the newly canonicalized blocks contain the given hash.
+    ///
+    /// This does not include the unchanged canonical prefix before the first new block.
+    pub fn contains(&self, hash: B256) -> bool {
+        self.new_blocks().iter().any(|block| block.recovered_block().hash() == hash)
     }
 }
 
@@ -1144,6 +1184,14 @@ mod tests {
             _targets: MultiProofTargets,
         ) -> ProviderResult<MultiProof> {
             Ok(MultiProof::default())
+        }
+
+        fn multiproof_v2(
+            &self,
+            _input: TrieInput,
+            _targets: reth_trie::MultiProofTargetsV2,
+        ) -> ProviderResult<reth_trie::DecodedMultiProofV2> {
+            Ok(reth_trie::DecodedMultiProofV2::default())
         }
 
         fn witness(
