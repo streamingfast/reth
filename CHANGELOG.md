@@ -11,9 +11,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 Tests the automated release tag, no Firehose changes.
 
-## reth-v2.9.0-fh3.1-2-rc.1
+## reth-v2.10.0-fh3.1
 
-Tests the automated release tag, no Firehose changes.
+### Changed
+
+- Update to upstream reth [v2.10.0](https://github.com/paradigmxyz/reth/releases/tag/v2.10.0).
+  evm2 comes from the `streamingfast/evm2` fork tag `reth-v2.10.0-sf`. No hardfork is scheduled
+  or changed, and the Firehose block output does not change.
 
 ## reth-v2.9.0-fh3.1-1
 
