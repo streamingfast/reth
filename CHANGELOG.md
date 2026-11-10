@@ -7,6 +7,10 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## reth-v2.9.0-fh3.1-not-a-real-version-alpha.2
+
+Tests the release made by sfreleaser, no Firehose changes.
+
 ## reth-v2.9.0-fh3.1-not-a-real-version-alpha
 
 Tests the automated release tag, no Firehose changes.
