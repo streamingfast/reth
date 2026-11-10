@@ -1,3 +1,6 @@
 global:
   language: rust
-  variant: library
+  variant: application
+
+release:
+  no-binaries: true

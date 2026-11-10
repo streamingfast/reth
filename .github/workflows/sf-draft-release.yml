@@ -37,4 +37,3 @@ jobs:
         uses: streamingfast/actions/sfreleaser/prepare@v1
         with:
           version: ${{ steps.detect.outputs.version }}
-          args: --allow-dirty
