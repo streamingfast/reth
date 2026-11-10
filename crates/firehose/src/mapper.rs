@@ -383,3 +383,101 @@ fn map_signed_authorization(
         s: B256::new(auth.s().to_be_bytes::<32>()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::{transaction::TxHashRef, Transaction, Typed2718};
+    use alloy_eips::{eip2930::AccessList, eip7702::SignedAuthorization};
+    use alloy_primitives::{ChainId, TxKind};
+    use firehose_tracer::types::TxType;
+
+    /// An unsigned transaction with the OP Stack post-exec type byte (0x7d), shaped like
+    /// `op_alloy_consensus::TxPostExec`: no gas, no value, the payload as input.
+    #[derive(Debug)]
+    struct PostExecTx {
+        hash: B256,
+        input: Bytes,
+    }
+
+    impl Typed2718 for PostExecTx {
+        fn ty(&self) -> u8 {
+            0x7d
+        }
+    }
+
+    impl TxHashRef for PostExecTx {
+        fn tx_hash(&self) -> &B256 {
+            &self.hash
+        }
+    }
+
+    impl Transaction for PostExecTx {
+        fn chain_id(&self) -> Option<ChainId> {
+            None
+        }
+        fn nonce(&self) -> u64 {
+            0
+        }
+        fn gas_limit(&self) -> u64 {
+            0
+        }
+        fn gas_price(&self) -> Option<u128> {
+            None
+        }
+        fn max_fee_per_gas(&self) -> u128 {
+            0
+        }
+        fn max_priority_fee_per_gas(&self) -> Option<u128> {
+            None
+        }
+        fn max_fee_per_blob_gas(&self) -> Option<u128> {
+            None
+        }
+        fn priority_fee_or_price(&self) -> u128 {
+            0
+        }
+        fn effective_gas_price(&self, _: Option<u64>) -> u128 {
+            0
+        }
+        fn is_dynamic_fee(&self) -> bool {
+            false
+        }
+        fn kind(&self) -> TxKind {
+            TxKind::Call(Address::ZERO)
+        }
+        fn is_create(&self) -> bool {
+            false
+        }
+        fn value(&self) -> U256 {
+            U256::ZERO
+        }
+        fn input(&self) -> &Bytes {
+            &self.input
+        }
+        fn access_list(&self) -> Option<&AccessList> {
+            None
+        }
+        fn blob_versioned_hashes(&self) -> Option<&[B256]> {
+            None
+        }
+        fn authorization_list(&self) -> Option<&[SignedAuthorization]> {
+            None
+        }
+    }
+
+    #[test]
+    fn maps_optimism_post_exec_transaction() {
+        let tx = PostExecTx { hash: B256::repeat_byte(0x7d), input: Bytes::from_static(&[0xc0]) };
+
+        let event =
+            signed_tx_to_tx_event(&tx, Address::ZERO, 3, B256::ZERO, B256::ZERO, Bytes::new());
+
+        assert_eq!(event.tx_type, TxType::OptimismPostExec);
+        assert_eq!(event.hash, tx.hash);
+        assert_eq!(event.from, Address::ZERO);
+        assert_eq!(event.input, tx.input);
+        assert_eq!(event.gas, 0);
+        assert_eq!(event.index, 3);
+    }
+}
