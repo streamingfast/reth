@@ -7,6 +7,14 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## op-reth-v2.8.1-fh3.1-1
+
+### Fixed
+
+- Optimism post-exec transactions (type `0x7d`, activated by the OP Stack Lagoon upgrade) are
+  traced as `TRX_TYPE_OPTIMISM_POST_EXEC` instead of stopping the node. `firehose-tracer` moves
+  to 5.5.1.
+
 ## op-reth-v2.8.1-fh3.1
 
 ### Changed
