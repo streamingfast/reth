@@ -26,11 +26,9 @@ jobs:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
 
-      - name: Detect version
+      - name: Detect release PR
         id: detect
         uses: streamingfast/actions/sfreleaser/detect@v1
-        with:
-          version: v0.17.1-rc.9
 
       - name: Prepare release
         if: steps.detect.outputs.is_release_pr

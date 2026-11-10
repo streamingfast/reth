@@ -28,11 +28,10 @@ jobs:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
 
-      - name: Detect version
+      - name: Detect release PR
         id: detect
         uses: streamingfast/actions/sfreleaser/detect@v1
         with:
-          version: v0.17.1-rc.9
           before: ${{ github.event.pull_request.merge_commit_sha }}^1
 
       - name: Publish release
@@ -40,5 +39,4 @@ jobs:
         uses: streamingfast/actions/sfreleaser/publish@v1
         with:
           version: ${{ steps.detect.outputs.version }}
-          variant: ${{ steps.detect.outputs.variant }}
           build-workflow: sf-release.yml
