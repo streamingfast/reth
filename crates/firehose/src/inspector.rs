@@ -725,9 +725,9 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> InspectorState<G> {
         }
 
         let failed = !result.stop.is_success();
-        let is_revert = result.stop.is_revert();
+        let is_frame_revert = result.stop.is_frame_revert();
         let err = failed.then(|| failure_reason(result.stop, is_create));
-        let gas_used = frame_gas_consumed(message.gas_limit, &result.gas, failed, is_revert);
+        let gas_used = frame_gas_consumed(message.gas_limit, &result.gas, failed, is_frame_revert);
 
         if depth == 0 {
             self.capture_root_exit(host, message.caller);
@@ -1024,9 +1024,9 @@ fn frame_gas_consumed(
     gas_limit: u64,
     gas: &evm2::interpreter::GasTracker,
     failed: bool,
-    is_revert: bool,
+    is_frame_revert: bool,
 ) -> u64 {
-    if failed && !is_revert {
+    if failed && !is_frame_revert {
         return gas_limit;
     }
     if failed {
