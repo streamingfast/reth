@@ -1,9 +1,10 @@
 use alloy_primitives::{Address, Bytes, Log as AlloyLog, B256, KECCAK256_EMPTY, U256};
 use evm2::{
+    bytecode::Bytecode,
     evm::{AccountInfo, DynDatabase as _, JournalEntry, SYSTEM_MAX_SSTORES_PER_CALL},
     interpreter::{InstrStop, Interpreter, Message, MessageKind, MessageResult, Word},
     version::GasId,
-    Evm, EvmTypes, Inspector,
+    Evm, EvmFeatures, EvmTypes, Inspector,
 };
 use firehose_tracer::{
     pb::sf::ethereum::r#type::v2::balance_change::Reason,
@@ -184,7 +185,9 @@ struct InspectorState<G> {
     /// Value transfer `(from, to, value)` of the current non-self call, captured at call enter
     /// and cleared once the scan emitted it. If it survives to `call_end`, the call failed and
     /// evm2 rolled the transfer back before any hook saw it (a precompile that failed); Geth
-    /// records the transfer that happened before the revert, so `call_end` re-emits it.
+    /// records the transfer that happened before the revert, so `call_end` re-emits it. A root
+    /// call halted by the runtime gas phase never transferred, see
+    /// [`halted_in_runtime_gas_phase`].
     pending_value_transfer: Option<(Address, Address, U256)>,
 
     /// Contracts that executed SELFDESTRUCT this transaction. A candidate whose frame reverted
@@ -704,9 +707,11 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> InspectorState<G> {
         }
 
         // A transfer still pending was rolled back before any hook could see it. It happened
-        // unless the call aborted before transferring.
+        // unless the call aborted before transferring, or the transaction's runtime gas phase
+        // halted its root call.
         if let Some((from, to, value)) = self.pending_value_transfer.take() &&
-            !matches!(result.stop, InstrStop::OutOfFunds | InstrStop::CallTooDeep)
+            !matches!(result.stop, InstrStop::OutOfFunds | InstrStop::CallTooDeep) &&
+            !(depth == 0 && halted_in_runtime_gas_phase(host, message, result.stop))
         {
             let from_balance = account_info(host, &from).balance;
             let to_balance = account_info(host, &to).balance;
@@ -1000,6 +1005,36 @@ fn load_code<T: EvmTypes>(host: &mut Evm<'_, T>, info: &AccountInfo) -> Bytes {
 /// Call depth of a message as Firehose counts it, 0 for the root call.
 fn frame_depth<T: EvmTypes>(host: &Evm<'_, T>, message: &Message<T>) -> i32 {
     i32::from(message.depth) - i32::from(host.initial_call_depth())
+}
+
+/// Whether the EIP-2780 runtime gas phase halted `message`, a transaction's root call that sends
+/// value and stopped with `stop`. The phase runs out of gas before the value moves, and evm2 still
+/// runs the root frame's hooks without saying it never ran.
+///
+/// Must stay in sync with the out-of-gas halts of evm2's `ethereum::prepare_initial_frame`: the
+/// new-account state gas of value sent to an empty recipient, and the delegation access gas of an
+/// EIP-7702 delegated recipient.
+fn halted_in_runtime_gas_phase<T: EvmTypes>(
+    host: &mut Evm<'_, T>,
+    message: &Message<T>,
+    stop: InstrStop,
+) -> bool {
+    if !matches!(stop, InstrStop::OutOfGas) || !host.feature(EvmFeatures::EIP2780) {
+        return false;
+    }
+    // The recipient reads as the runtime gas phase saw it: a halt never touched it, and a call that
+    // ran out of gas later rolled its transfer back.
+    let recipient = account_info(host, &message.call_target);
+    // A call to an empty account runs no code, and a precompile that runs out of gas stops with
+    // `PrecompileOOG`, so only the new-account charge stops it with `OutOfGas`.
+    if recipient.is_empty() {
+        return true;
+    }
+    // A resolved delegation runs the delegate's code, the halted frame keeps the recipient as its
+    // code address.
+    message.code_address == message.call_target &&
+        Bytecode::new_raw_checked(load_code(host, &recipient))
+            .is_ok_and(|code| code.is_eip7702())
 }
 
 /// The memory range the KECCAK256 about to run hashes, when its preimage is small enough to
