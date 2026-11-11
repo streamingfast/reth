@@ -206,6 +206,11 @@ struct SettlingEvmConfig {
     executor_factory: SettlingExecutorFactory,
 }
 
+impl reth_firehose::FirehoseLiveHooks for SettlingEvmConfig {
+    type PreTxAdjust = reth_firehose::NoPreTxAdjust;
+    type PostTxExtras = reth_firehose::NoPostTxExtras;
+}
+
 impl ConfigureEvm for SettlingEvmConfig {
     type Primitives = EthPrimitives;
     type Error = <EthEvmConfig as ConfigureEvm>::Error;
