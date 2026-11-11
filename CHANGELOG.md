@@ -7,6 +7,17 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## reth-v2.11.0-fh3.1-1
+
+### Fixed
+
+- On Amsterdam, a transaction whose root call sends value and runs out of gas in its runtime gas
+  phase no longer reports a `REASON_TRANSFER` debit of the sender and credit of the recipient.
+  The value never moves, and go-ethereum reports no transfer. This happens when the recipient is
+  empty and the transaction cannot pay its new-account state gas, or when the recipient is an
+  EIP-7702 delegated account and the transaction cannot pay to access the delegate.
+  `reth-v2.11.0-fh3.1` reported the transfer.
+
 ## reth-v2.9.0-fh3.1-not-a-real-version-alpha.2
 
 Tests the release made by sfreleaser, no Firehose changes.
