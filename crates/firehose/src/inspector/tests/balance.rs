@@ -45,7 +45,7 @@ fn self_authorizations(count: usize) -> Vec<SignedAuthorization> {
             let authorization =
                 SignedAuthorization::decode(&mut rlp.as_slice()).expect("authorization is RLP");
             assert_eq!(
-                LazyAuthorization::from(authorization.clone()).authority(),
+                LazyAuthorization::Signed(&authorization).authority(),
                 Some(AUTHORITY),
                 "fixture signed by the wrong key"
             );
