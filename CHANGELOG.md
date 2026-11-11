@@ -11,6 +11,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 Tests the release made by sfreleaser, no Firehose changes.
 
+## reth-v2.11.0-fh3.1
+
+### Changed
+
+- Update to upstream reth [v2.11.0](https://github.com/paradigmxyz/reth/releases/tag/v2.11.0).
+  evm2 now comes from the upstream revision reth pins instead of the `streamingfast/evm2` fork,
+  because its only patch is upstream. No hardfork is scheduled or changed.
+- From Prague on, the EIP-4788 beacon root system call is traced before the EIP-2935 block hash
+  system call, the order evm2's block executor runs them in. Their content does not change.
+- On Amsterdam, a transaction that runs out of gas in its runtime gas phase opens its root call
+  before the sender's nonce change, as on go-ethereum. The block content does not change, only
+  the order of those two ordinals.
+
 ## reth-v2.9.0-fh3.1-not-a-real-version-alpha
 
 Tests the automated release tag, no Firehose changes.
