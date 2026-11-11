@@ -655,7 +655,7 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> InspectorState<G> {
             call_type as u8,
             from,
             to,
-            &message.input,
+            message.input.as_bytes(interp.memory()),
             gas_limit,
             message.value,
         );
@@ -999,7 +999,7 @@ fn load_code<T: EvmTypes>(host: &mut Evm<'_, T>, info: &AccountInfo) -> Bytes {
 
 /// Call depth of a message as Firehose counts it, 0 for the root call.
 fn frame_depth<T: EvmTypes>(host: &Evm<'_, T>, message: &Message<T>) -> i32 {
-    i32::from(message.depth) - i32::from(host.version().initial_call_depth)
+    i32::from(message.depth) - i32::from(host.initial_call_depth())
 }
 
 /// The memory range the KECCAK256 about to run hashes, when its preimage is small enough to
