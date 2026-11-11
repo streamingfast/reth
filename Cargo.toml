@@ -680,12 +680,10 @@ reth-firehose-tests = { path = "crates/firehose-tests" }
 
 # evm2 is patched through its pre-transfer URL, which redirects to alloy-rs/evm2, because Cargo
 # rejects a patch from the same source.
-## Firehose additions
-# SF fork of evm2 (`sf/reth` branch) at the upstream revision this release pins.
 [patch."https://github.com/alloy-rs/evm2"]
-evm2 = { git = "https://github.com/streamingfast/evm2", rev = "ed6a07c214c47df13d82f568d9f255ef4b3f5d22" } # reth-v2.11.0-sf
-evm2-inspectors = { git = "https://github.com/streamingfast/evm2", rev = "ed6a07c214c47df13d82f568d9f255ef4b3f5d22" } # reth-v2.11.0-sf
-evm2-jit = { git = "https://github.com/streamingfast/evm2", rev = "ed6a07c214c47df13d82f568d9f255ef4b3f5d22" } # reth-v2.11.0-sf
+evm2 = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+evm2-inspectors = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+evm2-jit = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
 
 [patch.crates-io]
 # Detached transaction tracing, until firehose-tracer 5.8.0 is released.
