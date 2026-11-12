@@ -9535,10 +9535,13 @@ name = "reth-firehose-tests"
 version = "2.11.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eip7928",
  "alloy-eips",
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-signer",
+ "alloy-signer-local",
  "base64 0.22.1",
  "evm2",
  "eyre",
