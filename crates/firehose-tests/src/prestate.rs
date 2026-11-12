@@ -334,7 +334,7 @@ pub fn parse_fire_block_for(raw: &[u8], block_number: u64) -> eyre::Result<Fireh
         // Skip flash_idx, hash, prev_num, prev_hash, lib_num, ts_ns to reach payload (8th token,
         // 0-indexed token #8 from the start of the line — i.e. the last token).
         let payload =
-            parts.last().context("FIRE BLOCK line missing base64 payload (last token)")?;
+            parts.next_back().context("FIRE BLOCK line missing base64 payload (last token)")?;
         let bytes = general_purpose::STANDARD
             .decode(payload)
             .context("base64-decoding FIRE BLOCK payload")?;
