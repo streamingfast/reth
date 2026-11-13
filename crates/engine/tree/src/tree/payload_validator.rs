@@ -846,6 +846,18 @@ where
                 .ok()
         };
 
+        // Firehose live path: the EIP-7928 block access list RLP for the emitted header, taken
+        // before `validate_post_execution` consumes the built list.
+        let fh_bal_rlp = fh_tracer
+            .is_some()
+            .then(|| {
+                firehose_bal_rlp(
+                    decoded_bal.as_ref().map(|bal| bal.as_raw_bal().as_raw().as_ref()),
+                    built_bal.as_ref(),
+                )
+            })
+            .flatten();
+
         ensure_ok_post_block!(
             self.validate_post_execution(
                 &block,
@@ -968,12 +980,10 @@ where
         // fallible step so any earlier failure instead drops the guard (emitting
         // `on_block_end(Some(err))`) and discards the block.
         if let Some(mut guard) = fh_tracer.take() {
-            // EIP-7928: patch in the block access list RLP bytes carried by the payload sidecar
-            // (already hash-verified above via `bal_path_eligible`/execution). Unlike the rest of
-            // the header, this isn't known at `FirehoseBlockTracer::start` time, so it has to be
-            // patched into the already-buffered block via `Tracer::block_mut` before flush.
-            if let Some(bal_bytes) =
-                decoded_bal.as_ref().map(|bal| bal.as_raw_bal().as_raw().to_vec()) &&
+            // EIP-7928: patch in the block access list RLP (see `firehose_bal_rlp`). Unlike the
+            // rest of the header, this isn't known at `FirehoseBlockTracer::start` time, so it has
+            // to be patched into the already-buffered block via `Tracer::block_mut` before flush.
+            if let Some(bal_bytes) = fh_bal_rlp &&
                 let Some(header) =
                     guard.tracer_mut().block_mut().and_then(|block| block.header.as_mut())
             {
@@ -2460,4 +2470,42 @@ struct ExecutedBal {
     alloy: BlockAccessList,
     /// evm2 form, shared with the executed block so consumers can reuse it.
     evm: Arc<EvmBal>,
+}
+
+/// Picks the EIP-7928 block access list RLP for the Firehose header: the payload's sidecar when
+/// there is one, else the list this execution built.
+///
+/// A block the engine downloads can carry a `block_access_list_hash` and no sidecar. The built
+/// list is checked against the header hash in `validate_post_execution` before the Firehose
+/// flush, so the emitted bytes match the header either way.
+fn firehose_bal_rlp(sidecar: Option<&[u8]>, built: Option<&BlockAccessList>) -> Option<Vec<u8>> {
+    sidecar.map(<[u8]>::to_vec).or_else(|| built.map(alloy_rlp::encode))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_eip7928::AccountChanges;
+
+    fn built() -> BlockAccessList {
+        vec![AccountChanges::new(Address::repeat_byte(1))]
+    }
+
+    #[test]
+    fn firehose_bal_rlp_prefers_the_sidecar() {
+        // The empty-list RLP: different bytes from the built list, so the sidecar must win.
+        let sidecar = alloy_rlp::encode(Vec::<AccountChanges>::new());
+        assert_eq!(firehose_bal_rlp(Some(&sidecar), Some(&built())), Some(sidecar));
+    }
+
+    #[test]
+    fn firehose_bal_rlp_uses_the_built_list_without_a_sidecar() {
+        let built = built();
+        assert_eq!(firehose_bal_rlp(None, Some(&built)), Some(alloy_rlp::encode(&built)));
+    }
+
+    #[test]
+    fn firehose_bal_rlp_is_none_without_a_list() {
+        assert_eq!(firehose_bal_rlp(None, None), None);
+    }
 }

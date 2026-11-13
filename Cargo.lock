@@ -8933,6 +8933,7 @@ dependencies = [
  "reth-firehose-tests",
  "reth-lru",
  "reth-metrics",
+ "reth-network",
  "reth-network-p2p",
  "reth-node-ethereum",
  "reth-payload-builder",
