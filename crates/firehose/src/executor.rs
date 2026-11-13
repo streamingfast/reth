@@ -203,9 +203,10 @@ impl BlockFees {
 /// | post-tx gas accounting             | After `execute_transaction_without_commit`,        |
 /// |                                    | before `commit_transaction`.                       |
 /// | `on_tx_end(Some(receipt_data))`    | After `commit_transaction`.                        |
-/// | withdrawal balance changes         | After the inner finish, so they land in            |
+/// | pre-Merge block and uncle rewards  | After the inner finish, so they land in            |
 /// |                                    | `block.balance_changes`.                           |
-/// | pre-Merge block and uncle rewards  | After the withdrawal balance changes.              |
+/// | withdrawal balance changes         | After the block rewards. A block has one or the    |
+/// |                                    | other, never both.                                 |
 ///
 /// The wrapper does **not** emit `on_block_start` / `on_block_end`; those are owned by the caller
 /// via [`FirehoseBlockTracer::start`] / [`FirehoseBlockTracer::mark_verified`] /
@@ -490,11 +491,9 @@ where
     }
 
     /// Reads, before the inner finish, the balance of each pre-Merge block and uncle reward
-    /// recipient. Returns `None` for a block with withdrawals, which has no static reward.
+    /// recipient. Returns `None` from the Merge on, which has no static reward.
     fn capture_block_reward_pre_state(&mut self) -> Option<BlockRewardPreState> {
-        // The static block reward exists only before the Merge, and every post-Shanghai block
-        // carries withdrawals, so a block with withdrawals has no reward to sample.
-        if self.withdrawals.is_some() {
+        if self.fees.spec.enables(evm2::SpecId::MERGE) {
             return None;
         }
         let credits = reward_credits(
@@ -504,13 +503,13 @@ where
             &self.ommers,
         );
         let evm = self.inner.evm_mut();
-        let mut pre = Vec::<(Address, U256)>::new();
+        let mut balances_before = Vec::<(Address, U256)>::new();
         for credit in &credits {
-            if !pre.iter().any(|(address, _)| *address == credit.address) {
-                pre.push((credit.address, account_balance(evm, credit.address)));
+            if !balances_before.iter().any(|(address, _)| *address == credit.address) {
+                balances_before.push((credit.address, account_balance(evm, credit.address)));
             }
         }
-        Some(BlockRewardPreState { credits, pre })
+        Some(BlockRewardPreState { credits, balances_before })
     }
 }
 
@@ -637,10 +636,10 @@ where
         let finished = inner.finish_with_block_access_list();
         inspector.tracer_mut().on_system_call_end();
         let (output, bal) = finished?;
-        emit_withdrawal_balance_changes(&inspector, withdrawals.as_ref(), &output.state);
         if let Some(reward) = &reward {
             emit_block_reward_balance_changes(&inspector, reward, &output.state);
         }
+        emit_withdrawal_balance_changes(&inspector, withdrawals.as_ref(), &output.state);
         Ok((output, bal))
     }
 
@@ -654,10 +653,10 @@ where
         let finished = inner.finish_with_prepared_block_access_list();
         inspector.tracer_mut().on_system_call_end();
         let (output, bal) = finished?;
-        emit_withdrawal_balance_changes(&inspector, withdrawals.as_ref(), &output.state);
         if let Some(reward) = &reward {
             emit_block_reward_balance_changes(&inspector, reward, &output.state);
         }
+        emit_withdrawal_balance_changes(&inspector, withdrawals.as_ref(), &output.state);
         Ok((output, bal))
     }
 }
@@ -697,7 +696,7 @@ struct BlockRewardPreState {
     /// In the order Geth applies them. See [`reward_credits`].
     credits: Vec<RewardCredit>,
     /// Each credited account once, in first-credit order.
-    pre: Vec<(Address, U256)>,
+    balances_before: Vec<(Address, U256)>,
 }
 
 /// One balance credit of the pre-Merge block reward.
@@ -782,13 +781,20 @@ fn reward_balance_changes(
         pre.credits.iter().filter(|c| c.address == address).map(|c| c.amount).sum::<U256>()
     };
 
-    if pre.pre.iter().all(|&(address, before)| increase(address, before) == Some(U256::ZERO)) {
+    if pre
+        .balances_before
+        .iter()
+        .all(|&(address, before)| increase(address, before) == Some(U256::ZERO))
+    {
         return Vec::new();
     }
 
-    if pre.pre.iter().all(|&(address, before)| increase(address, before) == Some(expected(address)))
+    if pre
+        .balances_before
+        .iter()
+        .all(|&(address, before)| increase(address, before) == Some(expected(address)))
     {
-        let mut balances = pre.pre.clone();
+        let mut balances = pre.balances_before.clone();
         return pre
             .credits
             .iter()
@@ -815,8 +821,12 @@ fn reward_balance_changes(
         if changes.iter().any(|(address, ..)| *address == credit.address) {
             continue;
         }
-        let before =
-            pre.pre.iter().find(|(a, _)| *a == credit.address).map(|p| p.1).unwrap_or_default();
+        let before = pre
+            .balances_before
+            .iter()
+            .find(|(a, _)| *a == credit.address)
+            .map(|p| p.1)
+            .unwrap_or_default();
         changes.push((credit.address, before, final_of(credit.address, before), credit.reason));
     }
     changes
@@ -1580,13 +1590,13 @@ mod tests {
         /// Pre-state built the way `capture_block_reward_pre_state` builds it.
         fn pre_state(base: u128, ommers: &[(Address, u64)], balance: U256) -> BlockRewardPreState {
             let credits = reward_credits(base, 100, MINER, ommers);
-            let mut pre = Vec::<(Address, U256)>::new();
+            let mut balances_before = Vec::<(Address, U256)>::new();
             for credit in &credits {
-                if !pre.iter().any(|(a, _)| *a == credit.address) {
-                    pre.push((credit.address, balance));
+                if !balances_before.iter().any(|(a, _)| *a == credit.address) {
+                    balances_before.push((credit.address, balance));
                 }
             }
-            BlockRewardPreState { credits, pre }
+            BlockRewardPreState { credits, balances_before }
         }
 
         /// Final balances as the inner executor leaves them: each credit added to its account.
