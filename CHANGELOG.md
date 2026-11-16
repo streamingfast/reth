@@ -7,7 +7,18 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## op-reth-v2.8.1-fh3.1-1
+## op-reth-v2.9.0-fh3.1
+
+### Changed
+
+- Merged ethereum-optimism/reth `op-v2.7.0-0` (reth v2.7.0 plus OP commits), the reth pin of
+  op-reth v2.9.0. The previous pin was `op-v2.6.0-2` (reth v2.6.0). revm moves to 43.0.3;
+  alloy-evm stays at 0.39 and the `alloy-evm` patch stays on `streamingfast/evm` `v0.39.0-sf`,
+  now pinned by commit. The Firehose engine path follows upstream's new `EvmStateProvider`
+  bound; the traced block is still printed only after post-execution validation passes.
+- RPC replays (`debug_trace*`, `trace_*`) now run through the chain's block executor upstream.
+  They build it with `executor_for_block`, which the Firehose tracer does not hook, so they never
+  print Firehose blocks.
 
 ### Fixed
 
