@@ -100,6 +100,8 @@ eyre.workspace = true
 proptest.workspace = true
 rand.workspace = true
 rand_08.workspace = true
+# Firehose tests parse their prestate fixtures as JSON.
+serde_json.workspace = true
 
 [features]
 test-utils = [

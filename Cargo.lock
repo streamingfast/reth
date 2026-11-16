@@ -8688,6 +8688,7 @@ dependencies = [
  "reth-trie-sparse",
  "revm",
  "schnellru",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
