@@ -7,7 +7,7 @@ use super::{LoadBlock, LoadPendingBlock, LoadState, LoadTransaction, SpawnBlocki
 use crate::{
     helpers::estimate::EstimateCall, FromEvmError, FullEthApiTypes, RpcBlock, RpcNodeCore,
 };
-use alloy_consensus::{transaction::TxHashRef, BlockHeader};
+use alloy_consensus::BlockHeader;
 use alloy_eips::eip2930::AccessListResult;
 use alloy_evm::overrides::{apply_block_overrides, apply_state_overrides, OverrideBlockHashes};
 use alloy_network::TransactionBuilder;
@@ -21,13 +21,15 @@ use futures::Future;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_errors::{ProviderError, RethError};
 use reth_evm::{
-    block::BlockExecutor, env::BlockEnvironment, execute::BlockBuilder, ConfigureEvm, Evm,
-    EvmEnvFor, EvmFor, HaltReasonFor, InspectorFor, TransactionEnvMut, TxEnvFor,
+    block::{BlockExecutor, TxResult},
+    env::BlockEnvironment,
+    execute::BlockBuilder,
+    BlockExecutorForEvm, ConfigureEvm, Evm, EvmEnvFor, HaltReasonFor, InspectorFor,
+    TransactionEnvMut, TxEnvFor,
 };
 use reth_node_api::BlockBody;
-use reth_primitives_traits::Recovered;
+use reth_primitives_traits::{BlockTy, Recovered, RecoveredBlock};
 use reth_revm::{
-    cancelled::CancelOnDrop,
     database::StateProviderDatabase,
     db::{
         bal::{BalState, EvmDatabaseError},
@@ -41,7 +43,10 @@ use reth_rpc_eth_types::{
     simulate::{self, EthSimulateError},
     EthApiError, StateCacheDb,
 };
-use reth_storage_api::{BlockIdReader, ProviderTx};
+use reth_storage_api::{
+    BlockIdReader, EvmStateProviderAdapter, ProviderTx, StateProvider, StateProviderBox,
+};
+use reth_tasks::CancelOnDrop;
 use revm::{
     context::Block,
     context_interface::{result::ResultAndState, Cfg, Transaction},
@@ -49,10 +54,13 @@ use revm::{
 };
 use revm_inspectors::{access_list::AccessListInspector, transfer::TransferInspector};
 use std::collections::BTreeMap;
-use tracing::{trace, warn};
+use tracing::{debug, trace};
 
 /// Result type for `eth_simulateV1` RPC method.
 pub type SimulatedBlocksResult<N, E> = Result<Vec<SimulatedBlock<RpcBlock<N>>>, E>;
+
+/// The database a [`StateCacheDb`] reads through, which [`Call::block_executor`] executes on.
+type StateCacheProviderDb = StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>;
 
 /// Execution related functions for the [`EthApiServer`](crate::EthApiServer) trait in
 /// the `eth_` namespace.
@@ -108,7 +116,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
             self.spawn_with_state_at_block(block, move |this, db| {
                 let _permit = permit;
-                let state_provider = db.database.0;
+                let state_provider = db.database.into_inner();
                 let mut db = State::builder()
                     .with_database(StateProviderDatabase::new(&state_provider))
                     .with_bundle_update()
@@ -241,7 +249,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
                         simulate::execute_transactions(
                             builder,
-                            &state_provider,
+                            &*state_provider,
                             calls,
                             &mut remaining_call_gas_limit,
                             chain_id,
@@ -263,7 +271,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
                         simulate::execute_transactions(
                             builder,
-                            &state_provider,
+                            &*state_provider,
                             calls,
                             &mut remaining_call_gas_limit,
                             chain_id,
@@ -464,10 +472,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             let block_id = block_number.unwrap_or_default();
             let (evm_env, at) = self.evm_env_at(block_id).await?;
 
-            self.spawn_blocking_io_fut(async move |this| {
-                this.create_access_list_with(evm_env, at, request, state_override).await
-            })
-            .await
+            self.create_access_list_with(evm_env, at, request, state_override).await
         }
     }
 
@@ -647,10 +652,10 @@ pub trait Call:
         F: FnOnce(Self, StateCacheDb) -> Result<R, Self::Error> + Send + 'static,
         R: Send + 'static,
     {
-        let at = at.into();
-        self.spawn_blocking_io_fut(async move |this| {
-            let state = this.state_at_block_id(at).await?;
-            let db = State::builder().with_database(StateProviderDatabase::new(state)).build();
+        self.spawn_blocking_io_with_state(at.into(), move |this, state| {
+            let db = State::builder()
+                .with_database(StateProviderDatabase::new(state.into_evm_state_provider()))
+                .build();
             f(this, db)
         })
     }
@@ -704,7 +709,7 @@ pub trait Call:
     ///
     /// Before the transaction is executed, the state is positioned right before the transaction,
     /// either by attaching the block's cached BAL or by executing all previous transactions in the
-    /// block.
+    /// block through the block executor, which then also executes the transaction.
     /// The callback `f` is invoked with the [`ResultAndState`] after the transaction was executed
     /// and the database that points to the beginning of the transaction. The database may have
     /// the block's BAL attached and must only be used for reads, because an attached BAL takes
@@ -750,25 +755,16 @@ pub trait Call:
                     return f(tx_info, res, db)
                 }
 
-                let block_txs = block.transactions_recovered();
-
-                let mut executor = RpcNodeCore::evm_config(&this)
-                    .executor_for_block(&mut db, block.sealed_block())
-                    .map_err(RethError::other)
-                    .map_err(Self::Error::from_eth_err)?;
-                executor.apply_pre_execution_changes().map_err(Self::Error::from_eth_err)?;
-
-                // replay all transactions prior to the targeted transaction
-                for block_tx in block_txs {
-                    if block_tx.tx_hash() == tx.tx_hash() {
-                        break;
-                    }
-                    executor.execute_transaction(block_tx).map_err(Self::Error::from_eth_err)?;
-                }
-
-                let tx_env = RpcNodeCore::evm_config(&this).tx_env(tx);
-
-                let res = executor.evm_mut().transact(tx_env).map_err(Self::Error::from_evm_err)?;
+                let mut executor = this.block_executor(&block, &mut db)?;
+                this.replay_transactions_until_with_executor(
+                    &mut executor,
+                    block.transactions_recovered(),
+                    tx_info.index.expect("included transaction has an index") as usize,
+                )?;
+                let res = executor
+                    .execute_transaction_without_commit(tx)
+                    .map_err(Self::Error::from_eth_err)?
+                    .into_result();
                 drop(executor);
                 f(tx_info, res, db)
             })
@@ -777,34 +773,42 @@ pub trait Call:
         }
     }
 
-    /// Replays all transactions before the target transaction index on the given EVM.
+    /// Creates a block executor for `block` on `db` and applies the block's pre-execution
+    /// changes.
     ///
-    /// This executes on a caller provided EVM, so the target transaction can then be run on the
-    /// same EVM, keeping any block-scoped EVM state intact. The EVM's inspector configuration is
-    /// left untouched; see
-    /// [`Trace::inspect_transaction_in_block`] to replay without inspection and trace the target.
+    /// Replaying a block's own transactions through the executor rather than a bare EVM includes
+    /// the changes the executor applies on top of each EVM result, so replayed results agree with
+    /// the block's receipts and state.
+    fn block_executor<'a>(
+        &'a self,
+        block: &'a RecoveredBlock<BlockTy<Self::Primitives>>,
+        db: &'a mut StateCacheDb,
+    ) -> Result<BlockExecutorForEvm<'a, Self::Evm, StateCacheProviderDb>, Self::Error> {
+        let mut executor = self
+            .evm_config()
+            .executor_for_block(db, block.sealed_block())
+            .map_err(RethError::other)
+            .map_err(Self::Error::from_eth_err)?;
+        executor.apply_pre_execution_changes().map_err(Self::Error::from_eth_err)?;
+        Ok(executor)
+    }
+
+    /// Replays all transactions before the target transaction index through the given executor.
     ///
     /// If the target index is greater than or equal to the iterator length, all transactions are
     /// replayed.
-    fn replay_transactions_until_with_evm<'a, DB, I, Txs>(
+    fn replay_transactions_until_with_executor<'a, E, Txs>(
         &self,
-        evm: &mut EvmFor<Self::Evm, DB, I>,
+        executor: &mut E,
         transactions: Txs,
         target_tx_index: usize,
     ) -> Result<(), Self::Error>
     where
-        DB: Database<Error = EvmDatabaseError<ProviderError>> + DatabaseCommit + core::fmt::Debug,
-        I: InspectorFor<Self::Evm, DB>,
+        E: BlockExecutor<Transaction = ProviderTx<Self::Provider>>,
         Txs: IntoIterator<Item = Recovered<&'a ProviderTx<Self::Provider>>>,
     {
-        for (index, tx) in transactions.into_iter().enumerate() {
-            if index == target_tx_index {
-                // reached the target transaction
-                break
-            }
-
-            let tx_env = self.evm_config().tx_env(tx);
-            evm.transact_commit(tx_env).map_err(Self::Error::from_evm_err)?;
+        for tx in transactions.into_iter().take(target_tx_index) {
+            executor.execute_transaction(tx).map_err(Self::Error::from_eth_err)?;
         }
         Ok(())
     }
@@ -861,7 +865,9 @@ pub trait Call:
         if let Some(requested_gas) = request.as_ref().gas_limit() {
             let global_gas_cap = self.call_gas_limit();
             if global_gas_cap != 0 && global_gas_cap < requested_gas {
-                warn!(target: "rpc::eth::call", ?request, ?global_gas_cap, "Capping gas limit to global gas cap");
+                // Callers routinely send gas limits above the cap, so this is not worth a warning.
+                // Log only the limits: the request carries caller calldata and addresses.
+                debug!(target: "rpc::eth::call", requested_gas, global_gas_cap, "Capping gas limit to global gas cap");
                 request.as_mut().set_gas_limit(global_gas_cap);
             }
         } else {
