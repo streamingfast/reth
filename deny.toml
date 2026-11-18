@@ -19,6 +19,9 @@ ignore = [
     # zstd-safe 7 comes from reth-zstd-compressors 0.7; the patched zstd-safe 8.2.0 needs reth-core 0.8 and Rust 1.96.
     "RUSTSEC-2026-0398",
     "RUSTSEC-2026-0403",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0441 pin-utils is unmaintained, no safe upgrade;
+    # only reachable on wasm targets through alloy-provider's wasmtimer
+    "RUSTSEC-2026-0441",
 ]
 
 # This section is considered when running `cargo deny check bans`.
