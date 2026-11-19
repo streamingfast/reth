@@ -2,4 +2,4 @@ global:
   language: rust
   variant: chain
 release:
-  changelog-path: CHANGELOG.md
+  changelog-path: CHANGELOG.sf.md
