@@ -1,0 +1,5 @@
+global:
+  language: rust
+  variant: chain
+release:
+  changelog-path: CHANGELOG.sf.md
