@@ -41,6 +41,11 @@ prost = "0.14"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
+[dev-dependencies]
+alloy-eip7928.workspace = true
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
+
 [[test]]
 name = "prestate"
 path = "tests/prestate.rs"
@@ -52,3 +57,15 @@ path = "tests/batch_executor.rs"
 [[test]]
 name = "staged_sync_bal"
 path = "tests/staged_sync_bal.rs"
+
+[[test]]
+name = "setup_guards"
+path = "tests/setup_guards.rs"
+
+[[test]]
+name = "pipeline_trace"
+path = "tests/pipeline_trace.rs"
+
+[[test]]
+name = "bal_pipeline"
+path = "tests/bal_pipeline.rs"
