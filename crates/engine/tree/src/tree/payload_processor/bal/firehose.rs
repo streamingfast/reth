@@ -554,7 +554,9 @@ mod tests {
             Address::from_raw_public_key(&coinbase_key.public_key().serialize_uncompressed()[1..]);
         let mut senders = keys
             .iter()
-            .map(|key| Address::from_raw_public_key(&key.public_key().serialize_uncompressed()[1..]))
+            .map(|key| {
+                Address::from_raw_public_key(&key.public_key().serialize_uncompressed()[1..])
+            })
             .collect::<Vec<_>>();
         senders.push(coinbase);
 

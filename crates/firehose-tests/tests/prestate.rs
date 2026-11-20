@@ -1,6 +1,6 @@
 //! End-to-end Firehose integration tests driven by `prestate.json` fixtures.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use firehose_tracer::pb::sf::ethereum::r#type::v2::{CallType, TransactionTraceStatus};
 use reth_firehose_tests::{assert_block_equals_golden, run_prestate};
@@ -77,10 +77,10 @@ fn amsterdam_block_access_list_hash_mismatch() {
 /// the `EXCESS_INHIBITOR` sentinel to 0 — a storage change that belongs to no transaction.
 ///
 /// Nothing in the Firehose code reaches for these calls specifically: they go through
-/// `Evm::transact_system_call`, which the StreamingFast `alloy-evm` fork routes to the inspector,
-/// inside the window `run_wrapped_block` already opens around `apply_post_execution_changes`. That
-/// is exactly why the case is worth having — the coverage is incidental, so nothing would catch it
-/// being lost.
+/// `Evm::transact_system_call`, which evm2 routes to the inspector once system-call inspection is
+/// on, inside the window `run_wrapped_block` already opens around `apply_post_execution_changes`.
+/// That is exactly why the case is worth having — the coverage is incidental, so nothing would
+/// catch it being lost.
 ///
 /// The fixture stands the predeploys up with the EIP-7002 withdrawal-request runtime code. EIP-8282
 /// does not publish its own bytecode in anything we depend on, and it specifies the same design:
@@ -137,6 +137,6 @@ fn case_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("cases").join(name)
 }
 
-fn golden_dir(case_dir: &PathBuf, name: &str) -> PathBuf {
+fn golden_dir(case_dir: &Path, name: &str) -> PathBuf {
     case_dir.join(name)
 }

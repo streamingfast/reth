@@ -74,7 +74,7 @@ pub struct SynchronizedStdout {
 
 impl SynchronizedStdout {
     /// Creates a new `SynchronizedStdout` backed by the given lock.
-    pub fn new(lock: Arc<Mutex<()>>) -> Self {
+    pub const fn new(lock: Arc<Mutex<()>>) -> Self {
         Self { lock }
     }
 }
