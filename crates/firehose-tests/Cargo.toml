@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 firehose-tracer.workspace = true
+firehose-tracer-test.workspace = true
 reth-firehose.workspace = true
 
 # reth
@@ -69,3 +70,7 @@ path = "tests/pipeline_trace.rs"
 [[test]]
 name = "bal_pipeline"
 path = "tests/bal_pipeline.rs"
+
+[[test]]
+name = "post_block_hook"
+path = "tests/post_block_hook.rs"
