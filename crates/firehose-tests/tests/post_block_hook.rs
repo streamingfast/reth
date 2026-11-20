@@ -2,23 +2,32 @@
 //! EVM configuration that [`FirehoseEvmConfig`] wraps.
 //!
 //! A chain whose block executor changes state in `finish`, outside the EVM, reports those changes
-//! with [`PostTxExtras::capture_post_block`]. The pipeline must install the wrapped
-//! configuration's hooks, capture before the inner finish, and emit after the withdrawal balance
-//! changes.
+//! with [`PostTxExtras::capture_post_block`]. Both finish variants must capture before the inner
+//! finish and emit after the withdrawal balance changes: the pipeline must install the wrapped
+//! configuration's hooks and finish with `finish_with_block_access_list`, the live engine path
+//! finishes with `finish_with_prepared_block_access_list`.
 //!
 //! It lives in its own integration-test binary because it installs the process-wide tracer.
 
-use std::{any::TypeId, ops::DerefMut, path::PathBuf};
+use std::{any::TypeId, cell::Cell, ops::DerefMut, path::PathBuf};
 
 use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::{Address, U256};
-use firehose_tracer::pb::sf::ethereum::r#type::v2::{balance_change::Reason, BigInt};
-use reth_ethereum_primitives::EthPrimitives;
-use reth_evm::{execute::Executor, ConfigureEvm, EvmEnvFor, ExecutionCtxFor};
+use firehose_tracer::{
+    config::{ChainConfig, Config},
+    pb::sf::ethereum::r#type::v2::{balance_change::Reason, BigInt, Block as FirehoseBlock},
+    Tracer,
+};
+use firehose_tracer_test::BlockInvariants;
+use reth_ethereum_primitives::{Block, EthPrimitives};
+use reth_evm::{
+    execute::{BlockExecutor, Executor},
+    ConfigureEvm, EvmEnv, EvmEnvFor, ExecutionCtxFor,
+};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_firehose::{
-    FirehoseEvmConfig, FirehoseInspector, FirehoseLiveHooks, NoPreTxAdjust, PostBlockChanges,
-    PostTxExtras,
+    BlockFees, FirehoseBlockTracer, FirehoseEvmConfig, FirehoseInspector, FirehoseLiveHooks,
+    FirehoseWrappedExecutor, NoPreTxAdjust, PostBlockChanges, PostTxExtras,
 };
 use reth_firehose_tests::{load_prestate, parse_fire_block_for, LoadedPrestate};
 use reth_primitives_traits::{HeaderTy, RecoveredBlock, SealedBlock, SealedHeader};
@@ -28,41 +37,122 @@ use reth_trie_common::bundle_state::BundleState;
 const RECIPIENT: Address = Address::with_last_byte(0x77);
 /// Gets a change from [`TestHooks::emit_post_tx_extras`] after each transaction.
 const POST_TX_MARKER: Address = Address::with_last_byte(0x88);
+/// Gets the post-block change, which spans [`RECIPIENT`]'s balance across the inner finish.
+const POST_BLOCK_MARKER: Address = Address::with_last_byte(0x99);
 /// A reason the block produces nowhere else.
 const POST_BLOCK_REASON: Reason = Reason::DaoRefundContract;
 
+thread_local! {
+    /// The `(block number, coinbase, chain id, spec)` [`TestHooks::capture_post_block`] received
+    /// on this test's thread.
+    static CAPTURED_BLOCK: Cell<Option<(u64, Address, u64, evm2::SpecId)>> =
+        const { Cell::new(None) };
+}
+
 #[test]
-fn post_block_changes_follow_the_withdrawals() {
+fn post_block_changes_follow_the_withdrawals_on_the_pipeline() {
     // `FirehoseEvmConfig` selects the wrapped configuration's hooks for the engine path.
     assert_eq!(
         TypeId::of::<<FirehoseEvmConfig<TestEvmConfig> as FirehoseLiveHooks>::PostTxExtras>(),
         TypeId::of::<TestHooks>()
     );
 
-    let case = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cases/nop_transfer");
-    let LoadedPrestate { prestate, chain_spec, block, db } =
-        load_prestate(&case).expect("loading the nop_transfer prestate");
-    let (mut block, senders) = block.split();
-    let withdrawal = Withdrawal { index: 0, validator_index: 0, address: RECIPIENT, amount: 1 };
-    block.body.withdrawals = Some(vec![withdrawal].into());
-    let block = RecoveredBlock::new_unhashed(block, senders);
-
-    let config = &prestate.genesis.config;
+    let case = load_case();
+    let config = &case.prestate.genesis.config;
     let buffer = reth_firehose::init_tracer_with_buffer(
         config.chain_id,
         config.shanghai_time,
         config.cancun_time,
         config.prague_time,
     );
-    let evm_config = FirehoseEvmConfig::new(TestEvmConfig(EthEvmConfig::new(chain_spec)));
-    let mut executor = evm_config.batch_executor(db);
-    executor.execute_and_trace_one(&block).expect("execute_and_trace_one succeeds");
+    let evm_config = FirehoseEvmConfig::new(TestEvmConfig(EthEvmConfig::new(case.chain_spec)));
+    let mut executor = evm_config.batch_executor(case.db);
+    executor.execute_and_trace_one(&case.block).expect("execute_and_trace_one succeeds");
     // Reaching `into_state` confirms the last block passed validation, which flushes it.
     let _ = executor.into_state();
+    let fire_block = parse_fire_block_for(&buffer.get_bytes(), case.block.header().number)
+        .expect("block emitted");
+
+    assert_post_block_changes(&evm_config.inner, &case.block, config.chain_id, &fire_block);
+}
+
+#[test]
+fn post_block_changes_follow_the_withdrawals_on_the_live_path() {
+    let case = load_case();
+    let config = &case.prestate.genesis.config;
+    let (tracer, buffer) = Tracer::with_buffer(
+        Config::default(),
+        ChainConfig {
+            chain_id: config.chain_id,
+            shanghai_time: config.shanghai_time,
+            cancun_time: config.cancun_time,
+            prague_time: config.prague_time,
+            verkle_time: None,
+        },
+        "reth-firehose-tests",
+        env!("CARGO_PKG_VERSION"),
+    );
+    let evm_config = TestEvmConfig(EthEvmConfig::new(case.chain_spec));
+    let block = &case.block;
+    let tracer = FirehoseBlockTracer::start_local::<EthPrimitives>(
+        Box::new(tracer),
+        block.sealed_block(),
+        None,
+    );
+
+    let evm_env = evm_config.evm_env(block.header()).expect("evm env of the block");
+    let fees = BlockFees::new(&evm_env);
+    let inner =
+        evm_config.executor_for_block(case.db, block.sealed_block()).expect("block executor");
+    let mut executor = FirehoseWrappedExecutor::with_hooks(
+        inner,
+        tracer.inspector(),
+        fees,
+        block.body().withdrawals.clone(),
+        NoPreTxAdjust,
+        TestHooks,
+    );
+    executor.apply_pre_execution_changes().expect("pre-execution changes apply");
+    for transaction in block.transactions_recovered() {
+        executor.execute_transaction(transaction).expect("transaction executes");
+    }
+    executor.finish_with_prepared_block_access_list().expect("block finishes");
+    tracer.mark_verified();
     let fire_block =
         parse_fire_block_for(&buffer.get_bytes(), block.header().number).expect("block emitted");
 
-    // The pipeline installs the wrapped configuration's post-transaction hook.
+    assert_post_block_changes(&evm_config, block, config.chain_id, &fire_block);
+}
+
+/// The `nop_transfer` case, with one withdrawal to [`RECIPIENT`] added to its block.
+fn load_case() -> LoadedPrestate {
+    let case = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cases/nop_transfer");
+    let mut loaded = load_prestate(&case).expect("loading the nop_transfer prestate");
+    let (mut block, senders) = loaded.block.split();
+    let withdrawal = Withdrawal { index: 0, validator_index: 0, address: RECIPIENT, amount: 1 };
+    block.body.withdrawals = Some(vec![withdrawal].into());
+    loaded.block = RecoveredBlock::new_unhashed(block, senders);
+    loaded
+}
+
+/// Checks that [`TestHooks`] ran on `fire_block`, traced from `block`, and that its post-block
+/// change comes after the withdrawal's.
+fn assert_post_block_changes(
+    evm_config: &TestEvmConfig,
+    block: &RecoveredBlock<Block>,
+    chain_id: u64,
+    fire_block: &FirehoseBlock,
+) {
+    BlockInvariants::assert(fire_block).expect("the block holds the invariants");
+
+    // The hook got the block it runs for.
+    let evm_env = evm_config.evm_env(block.header()).expect("evm env of the block");
+    assert_eq!(
+        CAPTURED_BLOCK.get(),
+        Some((block.header().number, block.header().beneficiary, chain_id, evm_env.spec_id()))
+    );
+
+    // The wrapper installs the post-transaction hook.
     let transaction = &fire_block.transaction_traces[0];
     assert!(
         transaction.calls[0]
@@ -91,7 +181,7 @@ fn post_block_changes_follow_the_withdrawals() {
         changes,
         vec![
             (RECIPIENT, U256::ZERO, gwei, Reason::Withdrawal),
-            (RECIPIENT, U256::ZERO, gwei, POST_BLOCK_REASON),
+            (POST_BLOCK_MARKER, U256::ZERO, gwei, POST_BLOCK_REASON),
         ]
     );
     assert!(fire_block.balance_changes[0].ordinal < fire_block.balance_changes[1].ordinal);
@@ -102,8 +192,8 @@ fn value(value: Option<&BigInt>) -> U256 {
     value.map(|value| U256::from_be_slice(&value.bytes)).unwrap_or_default()
 }
 
-/// Chain hooks that mark each transaction and report [`RECIPIENT`]'s change across the inner
-/// finish.
+/// Chain hooks that mark each transaction and report [`RECIPIENT`]'s balance across the inner
+/// finish as a change of [`POST_BLOCK_MARKER`].
 #[derive(Debug, Default, Clone, Copy)]
 struct TestHooks;
 
@@ -126,13 +216,17 @@ impl<E: reth_evm::Evm> PostTxExtras<E> for TestHooks {
     fn capture_post_block(
         &self,
         evm: &mut E,
-        _block_number: u64,
-        _chain_id: u64,
+        block: &BlockFees,
     ) -> Option<Box<dyn PostBlockChanges>> {
+        CAPTURED_BLOCK.set(Some((
+            block.block_number(),
+            block.coinbase(),
+            block.chain_id(),
+            block.spec(),
+        )));
         let balance = evm
             .account_info(&RECIPIENT)
-            .ok()
-            .flatten()
+            .expect("reading the recipient")
             .map(|info| info.balance)
             .unwrap_or_default();
         Some(Box::new(RecipientChange { balance }))
@@ -152,7 +246,7 @@ impl PostBlockChanges for RecipientChange {
             .and_then(|account| account.info.as_ref())
             .map(|info| info.balance)
             .unwrap_or_default();
-        tracer.on_balance_change(RECIPIENT, self.balance, balance, POST_BLOCK_REASON);
+        tracer.on_balance_change(POST_BLOCK_MARKER, self.balance, balance, POST_BLOCK_REASON);
     }
 }
 

@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 firehose-tracer.workspace = true
+firehose-tracer-test.workspace = true
 reth-firehose.workspace = true
 
 # reth

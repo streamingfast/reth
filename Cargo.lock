@@ -9543,6 +9543,7 @@ dependencies = [
  "evm2",
  "eyre",
  "firehose-tracer",
+ "firehose-tracer-test",
  "hex",
  "prost",
  "reth-chainspec",
