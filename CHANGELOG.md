@@ -7,6 +7,22 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Added
+
+- `PostTxExtras::capture_post_block` lets a chain report the state changes its block executor
+  makes in `finish`, outside the EVM. It reads the state after the last transaction and receives
+  the block's `BlockFees`, which now exposes the block number, coinbase, chain id and spec. The
+  returned `PostBlockChanges` is emitted after the withdrawal balance changes. The default
+  captures nothing, so Ethereum output does not change.
+
+### Fixed
+
+- `FirehoseEvmConfig<F>` now installs `F`'s Firehose hooks on both the engine and the pipeline
+  paths, instead of the no-op ones. `ConfigureEvm for FirehoseEvmConfig<F>` now requires
+  `F: FirehoseLiveHooks`.
+
 ## reth-v2.11.0-fh3.1-1
 
 ### Fixed

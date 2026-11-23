@@ -4,8 +4,8 @@
 //!
 //! * [`FirehoseWrappedExecutor`] — a thin [`BlockExecutor`] wrapper that fires Firehose tracer
 //!   hooks (`on_system_call_start/end`, `on_tx_start/end`, post-tx balance changes, withdrawal
-//!   balance changes) around a delegate executor, and installs a [`FirehoseInspector`] on the
-//!   delegate's EVM for everything that happens inside the EVM.
+//!   balance changes, chain post-block changes) around a delegate executor, and installs a
+//!   [`FirehoseInspector`] on the delegate's EVM for everything that happens inside the EVM.
 //!
 //! * [`FirehoseBlockExecutor`] — the pipeline [`Executor`] used by staged sync. It constructs a
 //!   [`FirehoseWrappedExecutor`] per block and defers the end-of-block flush until the caller
@@ -13,7 +13,8 @@
 //!
 //! * [`FirehoseEvmConfig`] — a [`ConfigureEvm`] wrapper that routes `batch_executor` through
 //!   [`FirehoseBlockExecutor`] while leaving every other method untouched (live path wraps the
-//!   executor explicitly at its call site).
+//!   executor explicitly at its call site). Both paths install the wrapped configuration's
+//!   [`FirehoseLiveHooks`].
 //!
 //! ## Post-validation flush deferral (pipeline path)
 //!
@@ -92,6 +93,36 @@ pub trait PostTxExtras<E: reth_evm::Evm> {
     fn gas_accounting(&self, _evm: &mut E, ethereum: PostTxGasAccounting) -> PostTxGasAccounting {
         ethereum
     }
+
+    /// Snapshots, before the inner executor's `finish`, what the chain's own post-block changes
+    /// will write outside the EVM, where the inspector cannot see them.
+    ///
+    /// `evm` reads the state after the block's last transaction. Only read from it, through
+    /// [`reth_evm::Evm::account_info`], which records nothing in the block access list. `block`
+    /// holds the block's number, coinbase, spec and chain id. The default captures nothing, so
+    /// Ethereum emits nothing extra.
+    ///
+    /// The wrapper calls [`PostBlockChanges::emit`] on the result after `finish`, as the block's
+    /// last changes: after the post-execution system calls and the withdrawal balance changes,
+    /// whatever order the chain's `finish` applies them in. The withdrawal changes are rebuilt
+    /// backwards from the final balances, as if the withdrawals were the last change to their
+    /// recipients, so these changes must not touch a withdrawal recipient's balance.
+    fn capture_post_block(
+        &self,
+        _evm: &mut E,
+        _block: &BlockFees,
+    ) -> Option<Box<dyn PostBlockChanges>> {
+        None
+    }
+}
+
+/// Chain-specific state changes that a block executor's `finish` makes outside the EVM, captured
+/// by [`PostTxExtras::capture_post_block`].
+pub trait PostBlockChanges: Debug + Send {
+    /// Emits the changes to `tracer`, given the block's final state. `state` holds only the
+    /// accounts the block changed: an account missing from it kept its balance from before the
+    /// block.
+    fn emit(&self, tracer: &mut firehose_tracer::Tracer, state: &BundleState);
 }
 
 /// No-op [`PostTxExtras`] used on Ethereum mainnet (and any chain whose fee distribution is
@@ -150,15 +181,18 @@ impl<E: reth_evm::Evm> PreTxAdjust<E> for NoPreTxAdjust {
     }
 }
 
-/// Block-level values the per-transaction accounting needs, read once from the EVM environment.
+/// Block-level values the per-transaction accounting and [`PostTxExtras::capture_post_block`]
+/// need, read once from the EVM environment.
 #[derive(Debug, Clone)]
 pub struct BlockFees {
     coinbase: Address,
+    block_number: u64,
     base_fee: u64,
     /// EIP-4844 blob gas price, `None` before Cancun, matching Geth's omission of the field on
     /// pre-Cancun receipts.
     blob_gas_price: Option<U256>,
     version: evm2::Version,
+    spec: evm2::SpecId,
 }
 
 impl BlockFees {
@@ -170,10 +204,32 @@ impl BlockFees {
         let blob_gas_price = spec.enables(evm2::SpecId::CANCUN).then_some(block.blob_basefee);
         Self {
             coinbase: block.beneficiary,
+            block_number: block.number.saturating_to(),
             base_fee: evm_env.block_base_fee(),
             blob_gas_price,
             version,
+            spec,
         }
+    }
+
+    /// The block's beneficiary.
+    pub const fn coinbase(&self) -> Address {
+        self.coinbase
+    }
+
+    /// The block's number.
+    pub const fn block_number(&self) -> u64 {
+        self.block_number
+    }
+
+    /// The chain id the block executes on.
+    pub const fn chain_id(&self) -> u64 {
+        self.version.chain_id
+    }
+
+    /// The spec the block executes under.
+    pub const fn spec(&self) -> evm2::SpecId {
+        self.spec
     }
 }
 
@@ -195,6 +251,9 @@ impl BlockFees {
 /// | `on_tx_end(Some(receipt_data))`    | After `commit_transaction`.                        |
 /// | withdrawal balance changes         | After the inner finish, so they land in            |
 /// |                                    | `block.balance_changes`.                           |
+/// | chain post-block changes           | Captured before the inner finish, emitted after    |
+/// |                                    | the withdrawal balance changes. See                |
+/// |                                    | [`PostTxExtras::capture_post_block`].              |
 ///
 /// The wrapper does **not** emit `on_block_start` / `on_block_end`; those are owned by the caller
 /// via [`FirehoseBlockTracer::start`] / [`FirehoseBlockTracer::mark_verified`] /
@@ -455,6 +514,12 @@ where
             self.fees.blob_gas_price,
         )
     }
+
+    /// Runs the chain's [`PostTxExtras::capture_post_block`] against the state after the block's
+    /// last transaction.
+    fn capture_post_block(&mut self) -> Option<Box<dyn PostBlockChanges>> {
+        self.extras.capture_post_block(self.inner.evm_mut(), &self.fees)
+    }
 }
 
 impl<Inner, G, Extras, Adjust> BlockExecutor for FirehoseWrappedExecutor<Inner, G, Extras, Adjust>
@@ -569,9 +634,10 @@ where
     }
 
     fn finish_with_block_access_list(
-        self,
+        mut self,
     ) -> Result<(BlockExecutionOutput<Self::Receipt>, Option<BlockAccessList>), BlockExecutionError>
     {
+        let post_block = self.capture_post_block();
         let Self { inner, inspector, withdrawals, .. } = self;
         // The post-execution system calls (EIP-7002 withdrawal requests, EIP-7251 consolidation
         // requests) run inside the window; withdrawals are emitted after it closes.
@@ -579,21 +645,37 @@ where
         let finished = inner.finish_with_block_access_list();
         inspector.tracer_mut().on_system_call_end();
         let (output, bal) = finished?;
-        emit_withdrawal_balance_changes(&inspector, withdrawals.as_ref(), &output.state);
+        emit_post_finish_changes(&inspector, withdrawals.as_ref(), post_block, &output.state);
         Ok((output, bal))
     }
 
     fn finish_with_prepared_block_access_list(
-        self,
+        mut self,
     ) -> Result<(BlockExecutionOutput<Self::Receipt>, Option<evm2::evm::Bal>), BlockExecutionError>
     {
+        let post_block = self.capture_post_block();
         let Self { inner, inspector, withdrawals, .. } = self;
         inspector.tracer_mut().on_system_call_start();
         let finished = inner.finish_with_prepared_block_access_list();
         inspector.tracer_mut().on_system_call_end();
         let (output, bal) = finished?;
-        emit_withdrawal_balance_changes(&inspector, withdrawals.as_ref(), &output.state);
+        emit_post_finish_changes(&inspector, withdrawals.as_ref(), post_block, &output.state);
         Ok((output, bal))
+    }
+}
+
+/// Emits the block-level changes the inner finish made outside the EVM, once the post-execution
+/// system-call window has closed: the withdrawal balance changes, then the chain's post-block
+/// changes.
+fn emit_post_finish_changes<G: DerefMut<Target = firehose_tracer::Tracer>>(
+    inspector: &FirehoseInspector<G>,
+    withdrawals: Option<&Withdrawals>,
+    post_block: Option<Box<dyn PostBlockChanges>>,
+    state: &BundleState,
+) {
+    emit_withdrawal_balance_changes(inspector, withdrawals, state);
+    if let Some(post_block) = post_block {
+        post_block.emit(&mut inspector.tracer_mut(), state);
     }
 }
 
@@ -681,6 +763,39 @@ where
     }
 }
 
+/// [`ChainHooks`] that installs the hooks the EVM configuration selects for the live path
+/// ([`FirehoseLiveHooks`]), so the pipeline traces a block the same way the engine does.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct LiveChainHooks;
+
+impl<F> ChainHooks<F> for LiveChainHooks
+where
+    F: FirehoseLiveHooks,
+    BlockTy<F::Primitives>: BlockTrait,
+    TxTy<F::Primitives>: Transaction + TxHashRef + SignatureFields,
+    <F::Primitives as NodePrimitives>::Receipt: TxReceipt<Log = Log>,
+{
+    fn execute_one_traced(
+        &self,
+        evm_config: &F,
+        database: impl DynDatabase,
+        block: &RecoveredBlock<<F::Primitives as NodePrimitives>::Block>,
+        tracer: &mut FirehoseBlockTracer,
+    ) -> Result<
+        (BlockExecutionOutput<<F::Primitives as NodePrimitives>::Receipt>, Option<BlockAccessList>),
+        BlockExecutionError,
+    > {
+        run_wrapped_block(
+            evm_config,
+            database,
+            block,
+            tracer,
+            F::PreTxAdjust::default(),
+            F::PostTxExtras::default(),
+        )
+    }
+}
+
 /// Chain-specific hooks the live engine-API path installs on its traced block executor.
 ///
 /// The engine tree's block validator wraps the traced executor in
@@ -698,10 +813,11 @@ pub trait FirehoseLiveHooks: ConfigureEvm {
 
 impl<F> FirehoseLiveHooks for FirehoseEvmConfig<F>
 where
-    Self: ConfigureEvm,
+    F: FirehoseLiveHooks,
+    Self: ConfigureEvm<BlockExecutorFactory = F::BlockExecutorFactory>,
 {
-    type PreTxAdjust = NoPreTxAdjust;
-    type PostTxExtras = NoPostTxExtras;
+    type PreTxAdjust = F::PreTxAdjust;
+    type PostTxExtras = F::PostTxExtras;
 }
 
 impl<ChainSpec, EvmF> FirehoseLiveHooks for reth_evm_ethereum::EthEvmConfig<ChainSpec, EvmF>
@@ -1112,6 +1228,9 @@ fn withdrawal_balance_events(
 
 /// A [`ConfigureEvm`] wrapper that routes `batch_executor` through [`FirehoseBlockExecutor`].
 ///
+/// The wrapped configuration's [`FirehoseLiveHooks`] drive both paths: the engine path through
+/// this type's own [`FirehoseLiveHooks`] impl, and the pipeline through [`LiveChainHooks`].
+///
 /// Every other method forwards to the wrapped config, except
 /// [`ConfigureEvm::reuses_prewarm_results`], which keeps its `false` default: committing a
 /// prewarmed result skips execution, so the tracer would not see that transaction.
@@ -1130,7 +1249,7 @@ impl<F: ConfigureEvm> FirehoseEvmConfig<F> {
 
 impl<F> ConfigureEvm for FirehoseEvmConfig<F>
 where
-    F: ConfigureEvm,
+    F: FirehoseLiveHooks,
     BlockTy<F::Primitives>: BlockTrait,
     <BlockTy<F::Primitives> as BlockTrait>::Header: BlockHeader + Sealable,
     <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,
@@ -1213,7 +1332,7 @@ where
         &self,
         db: DB,
     ) -> impl Executor<DB, Primitives = Self::Primitives, Error = BlockExecutionError> {
-        FirehoseBlockExecutor::new(self.inner.clone(), db)
+        FirehoseBlockExecutor::new_with_chain_hooks(self.inner.clone(), db, LiveChainHooks)
     }
 }
 
