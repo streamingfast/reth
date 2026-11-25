@@ -43,7 +43,7 @@ fn only_execute_and_trace_one_emits_the_block() {
     assert_eq!(fire_blocks(&buffer.get_bytes()), 0, "execute emitted the block");
 
     let mut executor = FirehoseBlockExecutor::new(evm_config, EmptyDB::default());
-    executor.execute_and_trace_one(&block).expect("execute_and_trace_one succeeds");
+    executor.execute_and_trace_one(&block, None).expect("execute_and_trace_one succeeds");
     // Reaching `into_state` confirms the last block passed validation, which flushes it.
     let _ = executor.into_state();
     assert_eq!(fire_blocks(&buffer.get_bytes()), 1, "execute_and_trace_one did not emit the block");

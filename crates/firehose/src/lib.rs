@@ -23,7 +23,7 @@ pub use executor::{
     FirehoseEvmConfig, FirehoseLiveHooks, FirehoseWrappedExecutor, LiveChainHooks, NoChainHooks,
     NoPostTxExtras, NoPreTxAdjust, PostBlockChanges, PostTxExtras, PreTxAdjust, TracedTransaction,
 };
-pub use finality::finalized_ref_for_block;
+pub use finality::{finalized_ref_for_block, finalized_ref_for_canonical_block};
 pub use firehose_tracer::types::FinalizedBlockRef;
 pub use init::{emit_genesis_block_on_empty_chain, init_blockchain};
 pub use inspector::{FirehoseInspector, FramelessTx, PostTxGasAccounting};

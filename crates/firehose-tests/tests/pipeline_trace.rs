@@ -30,7 +30,7 @@ fn pipeline_executor_matches_the_golden() {
         config.prague_time,
     );
     let mut executor = FirehoseBlockExecutor::new(EthEvmConfig::new(chain_spec), db);
-    executor.execute_and_trace_one(&block).expect("execute_and_trace_one succeeds");
+    executor.execute_and_trace_one(&block, None).expect("execute_and_trace_one succeeds");
     // Reaching `into_state` confirms the last block passed validation, which flushes it.
     let _ = executor.into_state();
 

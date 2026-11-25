@@ -19,6 +19,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Stop the staged-sync (pipeline) path from advertising every replayed block as final
+  ([streamingfast/reth#110](https://github.com/streamingfast/reth/pull/110)). It stamped each
+  block with its own number as the finalized block, but the pipeline also replays unsafe blocks
+  (on L1 it does so under optimistic sync), so Firehose LIB could run past real finality. The
+  Execution stage now reads the node's finalized head and passes it to
+  `Executor::execute_and_trace_one` (new `finalized` argument, ignored by non-Firehose
+  executors). Each block advertises that head, or itself when it is at or below it, and nothing
+  when the node has no finalized head.
 - `FirehoseEvmConfig<F>` now installs `F`'s Firehose hooks on both the engine and the pipeline
   paths, instead of the no-op ones. `ConfigureEvm for FirehoseEvmConfig<F>` now requires
   `F: FirehoseLiveHooks`.
