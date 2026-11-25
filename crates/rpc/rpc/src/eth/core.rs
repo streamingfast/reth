@@ -558,6 +558,7 @@ mod tests {
         state::{AccountOverride, EvmOverrides, StateOverride},
         Bundle, TransactionRequest,
     };
+    use alloy_rpc_types_trace::parity::TraceType;
     use jsonrpsee_types::error::INVALID_PARAMS_CODE;
     use rand::Rng;
     use reth_chain_state::CanonStateSubscriptions;
@@ -570,16 +571,19 @@ mod tests {
         PruneCheckpointReader, StageCheckpointReader,
     };
     use reth_rpc_eth_api::{
-        helpers::{EthBlocks, EthCall},
+        helpers::{EthBlocks, EthCall, SpawnBlocking},
         node::RpcNodeCoreAdapter,
         EthApiServer,
     };
-    use reth_rpc_eth_types::RpcInvalidTransactionError;
+    use reth_rpc_eth_types::{EthConfig, RpcInvalidTransactionError};
+    use reth_rpc_server_types::constants::DEFAULT_MAX_CALL_MANY_CALLS;
     use reth_storage_api::{
         BalProvider, BlockReader, BlockReaderIdExt, NodePrimitivesProvider, StateProviderFactory,
     };
+    use reth_tasks::{cancel::is_cancelled, pool::BlockingTaskGuard, Runtime};
     use reth_testing_utils::generators;
     use reth_transaction_pool::test_utils::{testing_pool, TestPool};
+    use std::time::{Duration, Instant};
 
     type FakeEthApi<P = MockEthProvider> = EthApi<
         RpcNodeCoreAdapter<P, TestPool, NoopNetwork, EthEvmConfig>,
@@ -624,6 +628,30 @@ mod tests {
         )
         .gas_cap(gas_cap.into())
         .build()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocking_task_observes_dropped_request() {
+        let api = build_test_eth_api(MockEthProvider::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+
+        let request = api.spawn_blocking_io(move |_| {
+            let _ = started_tx.send(());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !is_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = cancelled_tx.send(is_cancelled());
+            Ok(())
+        });
+        // drop the request while its blocking task is running
+        tokio::select! {
+            _ = request => panic!("blocking task completed before the request was dropped"),
+            _ = started_rx => {}
+        }
+
+        assert!(cancelled_rx.await.unwrap());
     }
 
     #[tokio::test]
@@ -1011,6 +1039,109 @@ mod tests {
         assert!(
             message.contains("block not found"),
             "missing block hash should still map to block-not-found: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_many_methods_limit_calls_and_share_gas_cap() {
+        let provider = MockEthProvider::default();
+        let header = Header { number: 1, gas_limit: 30_000_000, ..Default::default() };
+        provider.add_block(header.hash_slow(), Block { header, body: BlockBody::default() });
+        // Loops until it runs out of gas.
+        let looping = Address::with_last_byte(0x43);
+        provider.add_account(
+            looping,
+            ExtendedAccount::new(0, U256::ZERO).with_bytecode(alloy_primitives::bytes!("5b600056")),
+        );
+        // A transfer to an empty account uses 21_000 gas, so a third one only gets 8_000 and a
+        // loop after one transfer runs out of the 29_000 left.
+        let api = build_test_eth_api_with_gas_cap(provider, 50_000);
+        let trace_api =
+            crate::TraceApi::new(api.clone(), BlockingTaskGuard::new(1), EthConfig::default());
+        let debug_api = crate::DebugApi::new(
+            api.clone(),
+            BlockingTaskGuard::new(1),
+            &Runtime::test(),
+            futures::stream::empty(),
+        );
+        let transfer = TransactionRequest::default().to(Address::with_last_byte(0x42));
+        let transfers = |calls| vec![transfer.clone(); calls];
+        let transfer_and_loop = vec![transfer.clone(), TransactionRequest::default().to(looping)];
+        let bundles = |calls: Vec<TransactionRequest>| {
+            vec![Bundle { transactions: calls, block_override: None }]
+        };
+        let trace_calls = |calls: Vec<TransactionRequest>| {
+            calls
+                .into_iter()
+                .map(|call| (call, std::iter::once(TraceType::Trace).collect()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            EthCall::call_many(&api, bundles(transfers(2)), None, None).await.unwrap()[0].len(),
+            2
+        );
+        assert_eq!(
+            trace_api.trace_call_many(trace_calls(transfers(2)), None).await.unwrap().len(),
+            2
+        );
+        assert_eq!(
+            debug_api.debug_trace_call_many(bundles(transfers(2)), None, None).await.unwrap()[0]
+                .len(),
+            2
+        );
+
+        let gas_cap_err = "the request's calls exceed the RPC gas cap of 50000";
+        for (calls, tx_index) in [(transfers(3), 2), (transfer_and_loop, 1)] {
+            assert_eq!(
+                EthCall::call_many(&api, bundles(calls.clone()), None, None)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                format!("call_many error in bundle 0 and transaction {tx_index}: {gas_cap_err}")
+            );
+            assert_eq!(
+                trace_api
+                    .trace_call_many(trace_calls(calls.clone()), None)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                gas_cap_err
+            );
+            assert_eq!(
+                debug_api
+                    .debug_trace_call_many(bundles(calls), None, None)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                gas_cap_err
+            );
+        }
+
+        let too_many = transfers(DEFAULT_MAX_CALL_MANY_CALLS + 1);
+        let limit_err = "call count 1025 exceeds limit 1024";
+        assert_eq!(
+            EthCall::call_many(&api, bundles(too_many.clone()), None, None)
+                .await
+                .unwrap_err()
+                .to_string(),
+            limit_err
+        );
+        assert_eq!(
+            trace_api
+                .trace_call_many(trace_calls(too_many.clone()), None)
+                .await
+                .unwrap_err()
+                .to_string(),
+            limit_err
+        );
+        assert_eq!(
+            debug_api
+                .debug_trace_call_many(bundles(too_many), None, None)
+                .await
+                .unwrap_err()
+                .to_string(),
+            limit_err
         );
     }
 

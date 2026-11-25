@@ -22,6 +22,10 @@ ignore = [
     # https://rustsec.org/advisories/RUSTSEC-2026-0441 pin-utils is unmaintained, no safe upgrade;
     # only reachable on wasm targets through alloy-provider's wasmtimer
     "RUSTSEC-2026-0441",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0542 humantime is unmaintained, no safe upgrade
+    "RUSTSEC-2026-0542",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0543 chrono is unmaintained, no safe upgrade
+    "RUSTSEC-2026-0543",
 ]
 
 # This section is considered when running `cargo deny check bans`.
