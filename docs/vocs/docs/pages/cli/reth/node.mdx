@@ -486,7 +486,9 @@ RPC:
           [default: 20000]
 
       --rpc.gascap <GAS_CAP>
-          Maximum gas limit for `eth_call`, `eth_estimateGas`, and call tracing RPC methods
+          Maximum gas limit for `eth_call`, `eth_estimateGas`, and call tracing RPC methods.
+
+          The calls of an `eth_callMany`, `trace_callMany` or `debug_traceCallMany` request share it.
 
           [default: 50000000]
 
@@ -758,6 +760,11 @@ TxPool:
           Max batch size for transaction pool insertions
 
           [default: 1]
+
+      --txpool.enforce-tracked-nonce
+          Reject transactions whose nonce is below the sender nonce tracked from canonical updates.
+
+          Closes the window in which a validation result that predates a block inserts an already mined nonce as pending. Assumes sender nonces only move forward, so this is meant for chains without reorgs and very low block times.
 
 Builder:
       --builder.extradata <EXTRA_DATA>

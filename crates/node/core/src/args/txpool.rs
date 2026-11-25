@@ -58,6 +58,7 @@ pub struct DefaultTxPoolValues {
     transactions_backup_path: Option<PathBuf>,
     disable_transactions_backup: bool,
     max_batch_size: usize,
+    enforce_tracked_nonce: bool,
 }
 
 impl DefaultTxPoolValues {
@@ -250,6 +251,12 @@ impl DefaultTxPoolValues {
         self.max_batch_size = v;
         self
     }
+
+    /// Set whether to enforce the sender nonce tracked from canonical updates by default
+    pub const fn with_enforce_tracked_nonce(mut self, v: bool) -> Self {
+        self.enforce_tracked_nonce = v;
+        self
+    }
 }
 
 impl Default for DefaultTxPoolValues {
@@ -285,6 +292,7 @@ impl Default for DefaultTxPoolValues {
             transactions_backup_path: None,
             disable_transactions_backup: false,
             max_batch_size: 1,
+            enforce_tracked_nonce: false,
         }
     }
 }
@@ -414,6 +422,14 @@ pub struct TxPoolArgs {
     /// Max batch size for transaction pool insertions
     #[arg(long = "txpool.max-batch-size", value_parser = RangedU64ValueParser::<usize>::new().range(1..), default_value_t = DefaultTxPoolValues::get_global().max_batch_size)]
     pub max_batch_size: usize,
+
+    /// Reject transactions whose nonce is below the sender nonce tracked from canonical updates.
+    ///
+    /// Closes the window in which a validation result that predates a block inserts an already
+    /// mined nonce as pending. Assumes sender nonces only move forward, so this is meant for
+    /// chains without reorgs and very low block times.
+    #[arg(long = "txpool.enforce-tracked-nonce", default_value_t = DefaultTxPoolValues::get_global().enforce_tracked_nonce)]
+    pub enforce_tracked_nonce: bool,
 }
 
 impl TxPoolArgs {
@@ -467,6 +483,7 @@ impl Default for TxPoolArgs {
             transactions_backup_path,
             disable_transactions_backup,
             max_batch_size,
+            enforce_tracked_nonce,
         } = DefaultTxPoolValues::get_global().clone();
         Self {
             pending_max_count,
@@ -499,6 +516,7 @@ impl Default for TxPoolArgs {
             transactions_backup_path,
             disable_transactions_backup,
             max_batch_size,
+            enforce_tracked_nonce,
         }
     }
 }
@@ -543,7 +561,7 @@ impl RethTransactionPoolConfig for TxPoolArgs {
             max_new_pending_txs_notifications: self.max_new_pending_txs_notifications,
             max_queued_lifetime: self.max_queued_lifetime,
             max_inflight_delegated_slot_limit: default_config.max_inflight_delegated_slot_limit,
-            enforce_tracked_nonce: default_config.enforce_tracked_nonce,
+            enforce_tracked_nonce: self.enforce_tracked_nonce,
         }
     }
 
@@ -605,6 +623,17 @@ mod tests {
     }
 
     #[test]
+    fn txpool_enforce_tracked_nonce_reaches_the_pool_config() {
+        let args = CommandParser::<TxPoolArgs>::parse_from(["reth"]).args;
+        assert!(!args.pool_config().enforce_tracked_nonce);
+
+        let args =
+            CommandParser::<TxPoolArgs>::parse_from(["reth", "--txpool.enforce-tracked-nonce"])
+                .args;
+        assert!(args.pool_config().enforce_tracked_nonce);
+    }
+
+    #[test]
     fn txpool_args() {
         let args = TxPoolArgs {
             pending_max_count: 1000,
@@ -640,6 +669,7 @@ mod tests {
             transactions_backup_path: Some(PathBuf::from("/tmp/txpool-backup")),
             disable_transactions_backup: false,
             max_batch_size: 10,
+            enforce_tracked_nonce: true,
         };
 
         let parsed_args = CommandParser::<TxPoolArgs>::parse_from([
@@ -700,6 +730,7 @@ mod tests {
             "/tmp/txpool-backup",
             "--txpool.max-batch-size",
             "10",
+            "--txpool.enforce-tracked-nonce",
         ])
         .args;
 

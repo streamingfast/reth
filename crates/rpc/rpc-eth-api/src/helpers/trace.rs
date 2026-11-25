@@ -18,6 +18,7 @@ use reth_rpc_eth_types::{
     EthApiError,
 };
 use reth_storage_api::ProviderBlock;
+use reth_tasks::cancel::is_cancelled;
 use revm::{context::Block, context_interface::result::ResultAndState, state::bal::Bal as RevmBal};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::sync::Arc;
@@ -366,6 +367,9 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
                 let mut transactions =
                     block.transactions_recovered().take(max_transactions).enumerate().peekable();
                 while let Some((idx, tx)) = transactions.next() {
+                    if is_cancelled() {
+                        return Err(EthApiError::InternalEthError.into())
+                    }
                     let output = executor
                         .execute_transaction_without_commit(tx)
                         .map_err(Self::Error::from_eth_err)?;

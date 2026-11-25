@@ -7,6 +7,16 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## op-reth-v2.10.0-fh3.1
+
+### Changed
+
+- Merged ethereum-optimism/reth `op-v2.7.0-2`, the reth pin of op-reth v2.10.0. The previous pin
+  was `op-v2.7.0-0`. It adds RPC work limits (`eth_getProof` and `eth_getMultiProof` key caps,
+  bounded `eth_callMany`, `trace_callMany`, `debug_traceCallMany` and `eth_callBundle`), the
+  `--txpool.enforce-tracked-nonce` flag, and execution cache and static file fixes. No Firehose
+  code changed.
+
 ## op-reth-v2.9.0-fh3.1
 
 ### Changed

@@ -35,14 +35,14 @@ use reth_rpc_eth_api::{
     helpers::{EthTransactions, TraceExt},
     AsEthApiError, FromEthApiError, RpcConvert, RpcNodeCore,
 };
-use reth_rpc_eth_types::{EthApiError, StateCacheDb};
+use reth_rpc_eth_types::{utils::CallManyBudget, EthApiError, StateCacheDb};
 use reth_rpc_server_types::{result::internal_rpc_err, ToRpcResult};
 use reth_storage_api::{
     BlockIdReader, BlockReaderIdExt, HashedPostStateProvider, HeaderProvider, ProviderBlock,
     ReceiptProviderIdExt, StateProviderBox, StateProviderFactory, StateRootProvider,
     StorageRootProvider, TransactionVariant,
 };
-use reth_tasks::{pool::BlockingTaskGuard, Runtime};
+use reth_tasks::{cancel::is_cancelled, pool::BlockingTaskGuard, Runtime};
 use reth_transaction_pool::TransactionPool;
 use reth_trie_common::{
     root::storage_root_unsorted, updates::TrieUpdates, ExecutionWitnessMode, HashedPostState,
@@ -139,6 +139,9 @@ where
 
                 let mut transactions = block.transactions_recovered().enumerate().peekable();
                 while let Some((index, tx)) = transactions.next() {
+                    if is_cancelled() {
+                        return Err(EthApiError::InternalEthError.into())
+                    }
                     let tx_env = eth_api.evm_config().tx_env(tx);
 
                     let output = executor
@@ -494,6 +497,7 @@ where
         if bundles.is_empty() {
             return Err(EthApiError::InvalidParams(String::from("bundles are empty.")).into())
         }
+        let mut budget = CallManyBudget::for_bundles(&bundles, self.eth_api().call_gas_limit())?;
 
         let StateContext { transaction_index, block_number } = state_context.unwrap_or_default();
         let transaction_index = transaction_index.unwrap_or_default();
@@ -552,19 +556,21 @@ where
 
                     let mut transactions = transactions.into_iter().peekable();
                     while let Some(tx) = transactions.next() {
+                        if is_cancelled() {
+                            return Err(EthApiError::InternalEthError.into())
+                        }
                         // apply state overrides only once, before the first transaction
                         let state_overrides = state_overrides.take();
                         let overrides = EvmOverrides::new(state_overrides, block_overrides.clone());
 
-                        let (evm_env, tx_env) =
+                        let (evm_env, mut tx_env) =
                             eth_api.prepare_call_env(evm_env.clone(), tx, &mut db, overrides)?;
+                        budget.admit(&mut tx_env)?;
 
-                        let res = eth_api.inspect(
-                            &mut db,
-                            evm_env.clone(),
-                            tx_env.clone(),
-                            &mut inspector,
-                        )?;
+                        let res = eth_api
+                            .inspect(&mut db, evm_env.clone(), tx_env.clone(), &mut inspector)
+                            .map_err(|err| budget.map_call_err(err))?;
+                        budget.charge(&res.result)?;
                         let trace = inspector
                             .get_result(None, &tx_env, &evm_env.block_env, &res, &mut db)
                             .map_err(Eth::Error::from_eth_err)?;
@@ -824,6 +830,9 @@ where
 
                 let mut roots = Vec::with_capacity(block.body().transactions().len());
                 for tx in block.transactions_recovered() {
+                    if is_cancelled() {
+                        return Err(EthApiError::InternalEthError.into())
+                    }
                     executor.execute_transaction(tx).map_err(Eth::Error::from_eth_err)?;
 
                     let state = executor.evm_mut().db_mut();
