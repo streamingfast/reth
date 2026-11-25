@@ -89,6 +89,33 @@ where
     Some(FinalizedBlockRef::minimal(0))
 }
 
+/// Returns the finalized block to advertise for a block replayed from the canonical chain, as the
+/// staged-sync pipeline does.
+///
+/// `finalized` is the node's finalized head (`None` when it has none, in which case there is
+/// nothing to advertise). Pipeline blocks are canonical, so a finalized head at or above the block
+/// means the block itself is final and is advertised as such; otherwise the finalized head is an
+/// ancestor and is advertised as is.
+///
+/// How the result reaches consumers: the Firehose tracer prints the advertised number as `libNum`
+/// on the `FIRE BLOCK` line and keeps nothing across blocks. `None` makes it fall back to
+/// `block_number - 200` (floored at 0), as does a finalized head of 0. The returned number never
+/// exceeds `block_number`, the invariant firehose-core (`ClampLibNum`) and bstream's forkable
+/// enforce, and since it is clamped to the node's real finalized head the consumer's LIB cannot
+/// move past L1-derived finality.
+pub fn finalized_ref_for_canonical_block(
+    block_number: u64,
+    block_hash: B256,
+    finalized: Option<BlockNumHash>,
+) -> Option<FinalizedBlockRef> {
+    let finalized = finalized?;
+    Some(if finalized.number >= block_number {
+        FinalizedBlockRef::new(block_number, block_hash)
+    } else {
+        FinalizedBlockRef::new(finalized.number, finalized.hash)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +324,40 @@ mod tests {
             .resolve_with(0, B256::ZERO, Some(BlockNumHash::new(0, hash(0x01))))
             .expect("finalized head is known");
         assert_eq!(advertised.number, 0);
+    }
+
+    #[test]
+    fn canonical_replay_clamps_to_the_finalized_head() {
+        let finalized = Some(BlockNumHash::new(11, hash(0x11)));
+
+        // Finalized below the replayed block: the finalized head, not the block itself.
+        let advertised = finalized_ref_for_canonical_block(12, hash(0x12), finalized)
+            .expect("finalized head is known");
+        assert_eq!(advertised.number, 11);
+        assert_eq!(advertised.hash, Some(hash(0x11)));
+
+        let advertised = finalized_ref_for_canonical_block(102, hash(0x66), finalized)
+            .expect("finalized head is known");
+        assert_eq!(advertised.number, 11);
+    }
+
+    #[test]
+    fn canonical_replay_at_or_above_finalized_advertises_the_block() {
+        let finalized = Some(BlockNumHash::new(11, hash(0x11)));
+
+        // The block is the finalized head.
+        let advertised = finalized_ref_for_canonical_block(11, hash(0x11), finalized)
+            .expect("finalized head is known");
+        assert_eq!((advertised.number, advertised.hash), (11, Some(hash(0x11))));
+
+        // The block is below the finalized head: it is final itself.
+        let advertised = finalized_ref_for_canonical_block(5, hash(0x05), finalized)
+            .expect("finalized head is known");
+        assert_eq!((advertised.number, advertised.hash), (5, Some(hash(0x05))));
+    }
+
+    #[test]
+    fn canonical_replay_without_finalized_head_advertises_nothing() {
+        assert!(finalized_ref_for_canonical_block(12, hash(0x12), None).is_none());
     }
 }

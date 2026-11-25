@@ -12,10 +12,10 @@ use reth_exex::{ExExManagerHandle, ExExNotification, ExExNotificationSource};
 use reth_primitives_traits::{format_gas_throughput, BlockBody, NodePrimitives};
 use reth_provider::{
     providers::{StaticFileProvider, StaticFileWriter},
-    BlockHashReader, BlockReader, DBProvider, EitherWriter, ExecutionOutcome,
-    HashedPostStateProvider, HeaderProvider, LatestStateProviderRef, OriginalValuesKnown,
-    ProviderError, StateWriteConfig, StateWriter, StaticFileProviderFactory, StatsReader,
-    StoragePath, StorageSettingsCache, TransactionVariant,
+    BlockHashReader, BlockReader, ChainStateBlockReader, DBProvider, EitherWriter,
+    ExecutionOutcome, HashedPostStateProvider, HeaderProvider, LatestStateProviderRef,
+    OriginalValuesKnown, ProviderError, StateWriteConfig, StateWriter, StaticFileProviderFactory,
+    StatsReader, StoragePath, StorageSettingsCache, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages_api::{
@@ -272,6 +272,7 @@ where
             Primitives: NodePrimitives<BlockHeader: reth_db_api::table::Value>,
         > + StatsReader
         + BlockHashReader
+        + ChainStateBlockReader
         + StateWriter<Receipt = <E::Primitives as NodePrimitives>::Receipt>
         + StorageSettingsCache
         + StoragePath
@@ -306,6 +307,18 @@ where
 
         let db = StateProviderDatabase(LatestStateProviderRef::new(provider));
         let mut executor = self.evm_config.batch_executor(db);
+
+        // The node's real finalized head, for executors that advertise finality (Firehose). The
+        // blocks replayed here are not necessarily finalized themselves.
+        let finalized = provider
+            .last_finalized_block_number()?
+            .map(|number| {
+                provider
+                    .block_hash(number)
+                    .map(|hash| hash.map(|hash| alloy_eips::BlockNumHash::new(number, hash)))
+            })
+            .transpose()?
+            .flatten();
 
         // Progress tracking
         let mut stage_progress = start_block;
@@ -353,9 +366,11 @@ where
             let execute_start = Instant::now();
 
             let result = self.metrics.metered_one(&block, |input| {
-                executor.execute_and_trace_one(input).map_err(|error| StageError::Block {
-                    block: Box::new(block.block_with_parent()),
-                    error: BlockErrorKind::Execution(error),
+                executor.execute_and_trace_one(input, finalized).map_err(|error| {
+                    StageError::Block {
+                        block: Box::new(block.block_with_parent()),
+                        error: BlockErrorKind::Execution(error),
+                    }
                 })
             })?;
 

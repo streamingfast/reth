@@ -695,9 +695,13 @@ where
 
     /// Traces a block with Firehose hooks and defers `on_block_end(None)` until the caller has
     /// validated the result. See the module-level docs for the deferral contract.
+    ///
+    /// `finalized` is the node's real finalized head, clamped per block by
+    /// [`finalized_ref_for_canonical_block`].
     fn execute_and_trace_one(
         &mut self,
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
+        finalized: Option<alloy_eips::BlockNumHash>,
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
         if !crate::is_tracer_initialized() {
@@ -712,13 +716,14 @@ where
             prev.mark_verified();
         }
 
-        // In the pipeline / staged sync path, the block we're about to trace is by definition
-        // already finalized — staged sync only replays blocks up to the finalized head — so
-        // advertise it as the finalized ref in the block event.
-        let finalized = Some(firehose_tracer::types::FinalizedBlockRef {
-            number: block.header().number(),
-            hash: Some(block.hash()),
-        });
+        // The pipeline can replay unsafe blocks (OP Stack backfills to the unsafe head, and L1
+        // does too under optimistic sync), so the block being traced is not necessarily final:
+        // advertise the node's real finalized head instead.
+        let finalized = crate::finalized_ref_for_canonical_block(
+            block.header().number(),
+            block.hash(),
+            finalized,
+        );
         let mut tracer =
             FirehoseBlockTracer::start::<F::Primitives>(block.sealed_block(), finalized);
 
@@ -750,7 +755,7 @@ where
     ) -> Result<BlockExecutionOutput<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
         let result = if crate::is_tracer_initialized() {
-            self.execute_and_trace_one(block)?
+            self.execute_and_trace_one(block, None)?
         } else {
             self.execute_one(block)?
         };
