@@ -23,7 +23,7 @@ pub use executor::{
     FirehoseWrappedExecutor, LiveTracedEvm, NoChainHooks, NoPostTxExtras, NoPreExecutionWrites,
     NoPreTxAdjust, PostTxExtras, PreExecutionWrites, PreTxAdjust,
 };
-pub use finality::finalized_ref_for_block;
+pub use finality::{finalized_ref_for_block, finalized_ref_for_canonical_block};
 pub use firehose_tracer::types::FinalizedBlockRef;
 pub use runner::{emit_genesis_block_if_empty, emit_genesis_block_on_empty_chain, run_exex};
 
