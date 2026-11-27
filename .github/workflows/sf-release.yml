@@ -210,9 +210,11 @@ jobs:
           # silences the buildx warning.
           docker cp $(docker create --platform=linux/amd64 ${{ steps.image.outputs.ID }}):/usr/local/bin/reth ./reth_linux_amd64
 
-      - name: Release
-        uses: softprops/action-gh-release@v2
-        with:
-          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
-          files: |
-            ./reth_linux_amd64
+      # The release itself (notes, pre-release flag) is drafted by sf-draft-release.yml and published
+      # by sf-publish-release.yml (`kind: application` in .sfreleaser), this only adds the binary to
+      # it. It fails when the release does not exist so there is a single way to release.
+      - name: Upload assets to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF#refs/tags/}" ./reth_linux_amd64 --clobber --repo "${{ github.repository }}"
