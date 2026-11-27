@@ -67,7 +67,7 @@ fn post_block_changes_follow_the_withdrawals_on_the_pipeline() {
     );
     let evm_config = FirehoseEvmConfig::new(TestEvmConfig(EthEvmConfig::new(case.chain_spec)));
     let mut executor = evm_config.batch_executor(case.db);
-    executor.execute_and_trace_one(&case.block).expect("execute_and_trace_one succeeds");
+    executor.execute_and_trace_one(&case.block, None).expect("execute_and_trace_one succeeds");
     // Reaching `into_state` confirms the last block passed validation, which flushes it.
     let _ = executor.into_state();
     let fire_block = parse_fire_block_for(&buffer.get_bytes(), case.block.header().number)

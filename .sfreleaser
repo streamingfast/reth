@@ -1,3 +1,4 @@
 global:
   language: rust
-  variant: application
+  kind: application
+  variant: chain

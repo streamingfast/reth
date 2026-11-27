@@ -43,7 +43,7 @@ fn staged_sync_rebuilds_the_block_access_list() {
         config.prague_time,
     );
     let mut executor = FirehoseBlockExecutor::new(evm_config, db);
-    executor.execute_and_trace_one(&block).expect("execute_and_trace_one succeeds");
+    executor.execute_and_trace_one(&block, None).expect("execute_and_trace_one succeeds");
     let bal = executor.take_bal().expect("execute_and_trace_one rebuilds the block access list");
     assert_eq!(keccak256(alloy_rlp::encode(&bal)), expected_hash);
 
