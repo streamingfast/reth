@@ -7,6 +7,17 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## world-chain-v2.8.1-fh3.1-2
+
+### Fixed
+
+- Stop the staged-sync (pipeline) path from advertising every replayed block as final
+  ([streamingfast/reth#110](https://github.com/streamingfast/reth/pull/110)). It stamped each block
+  with its own number as the finalized block, but the pipeline also replays unsafe blocks (on OP
+  Stack it backfills to the unsafe head), so Firehose LIB could run past real finality. The
+  Execution stage now reads the node's finalized head and each block advertises it, or itself when
+  the finalized head is at or above it, and nothing when the node has no finalized head.
+
 ## world-chain-v2.8.1-fh3.1-1
 
 ### Fixed
