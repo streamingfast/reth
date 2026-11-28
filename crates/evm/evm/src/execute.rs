@@ -45,9 +45,13 @@ pub trait Executor<DB: Database>: Sized {
     ///
     /// The default implementation delegates to [`Self::execute_one`]. Implementors can override
     /// this to inject an inspector without changing call sites.
+    ///
+    /// `finalized` is the node's finalized head at the time of the call (`None` when the node has
+    /// none). Tracing implementors use it to advertise finality; the default ignores it.
     fn execute_and_trace_one(
         &mut self,
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
+        _finalized: Option<alloy_eips::BlockNumHash>,
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
         self.execute_one(block)

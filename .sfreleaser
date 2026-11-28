@@ -1,4 +1,5 @@
 global:
+  kind: library
   language: rust
   variant: chain
 release:

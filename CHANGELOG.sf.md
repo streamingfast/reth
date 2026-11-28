@@ -7,6 +7,18 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## op-reth-v2.9.0-fh3.1-1
+
+### Fixed
+
+- Stop the staged-sync (pipeline) path from advertising every replayed block as final. It stamped
+  each block with its own number as the finalized block, but the pipeline also replays unsafe
+  blocks (on OP Stack it backfills to the unsafe head, and on L1 it does so when the consensus
+  client reports no finalized block), so Firehose LIB could run past real finality. The Execution
+  stage now reads the node's finalized head and each block advertises it, or itself when the
+  finalized head is at or above it, and nothing when the node has no finalized head. Ported from
+  [streamingfast/reth#110](https://github.com/streamingfast/reth/pull/110).
+
 ## op-reth-v2.9.0-fh3.1
 
 ### Changed
