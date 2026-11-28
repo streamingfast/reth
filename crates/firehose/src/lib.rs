@@ -31,7 +31,7 @@ pub use executor::{
     FirehoseWrappedExecutor, NoChainHooks, NoPostTxExtras, NoPreTxAdjust, PostTxExtras,
     PreTxAdjust,
 };
-pub use finality::finalized_ref_for_block;
+pub use finality::{finalized_ref_for_block, finalized_ref_for_canonical_block};
 pub use firehose_tracer::types::FinalizedBlockRef;
 pub use init::{emit_genesis_block_on_empty_chain, init_blockchain};
 

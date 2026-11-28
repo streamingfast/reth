@@ -7,6 +7,19 @@ This changelog covers Firehose-specific changes only. For upstream changes, see 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## bnb-v0.1.4-fh3.1-1
+
+### Fixed
+
+- Stop the staged-sync (pipeline) path from advertising every replayed block as final
+  ([streamingfast/reth#110](https://github.com/streamingfast/reth/pull/110)). It stamped each
+  block with its own number as the finalized block, so Firehose LIB could run past the chain's
+  real finalized head. The Execution stage now reads the node's finalized head and each block
+  advertises it, or itself when the finalized head is at or above it, and nothing when the node
+  has no finalized head. `Executor::execute_and_trace_one` takes a new `finalized` argument
+  (ignored by non-Firehose executors), and `reth-firehose` exports
+  `finalized_ref_for_canonical_block`.
+
 ## bnb-v0.1.4-fh3.1
 
 Merged bnb-chain/reth `v0.1.4` (`3b2bd020`), the reth release that bnb-chain/reth-bsc
@@ -93,7 +106,7 @@ unchanged.
   BSC mainnet at block 120653740, where a four-block side branch was published with LIB
   120653741 — one of those blocks naming a height above its own number.
 
-## Unreleased
+## bnb-v0.1.4-fh3.1-1
 
 This fork is consumed as a library by
 [streamingfast/reth-bsc](https://github.com/streamingfast/reth-bsc), which builds the
